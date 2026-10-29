@@ -1,0 +1,11 @@
+[package]
+name = "rllm-gguf"
+description = "GGUF file parser: metadata and memory-mapped tensor index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+memmap2.workspace = true
+thiserror.workspace = true
+rllm-core.workspace = true

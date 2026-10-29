@@ -1,0 +1,21 @@
+[package]
+name = "rllm-cli"
+description = "rllm command line: inspect, run, bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rllm"
+path = "src/main.rs"
+
+[dependencies]
+rllm-core.workspace = true
+rllm-gguf.workspace = true
+rllm-cpu.workspace = true
+rllm-cuda.workspace = true
+rllm-model.workspace = true
+rllm-tokenizer.workspace = true
+rllm-server.workspace = true
+anyhow.workspace = true
+clap.workspace = true

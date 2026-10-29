@@ -1,0 +1,12 @@
+[package]
+name = "rllm-model"
+description = "Model definitions, weight loading, sampling and a single-request generation loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rllm-core.workspace = true
+rllm-gguf.workspace = true
+rllm-kv.workspace = true
+anyhow.workspace = true

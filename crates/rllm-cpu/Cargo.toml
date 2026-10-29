@@ -1,0 +1,11 @@
+[package]
+name = "rllm-cpu"
+description = "CPU reference backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rllm-core.workspace = true
+rayon.workspace = true
+half.workspace = true

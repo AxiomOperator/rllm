@@ -1,0 +1,26 @@
+[package]
+name = "rllm-server"
+description = "OpenAI-compatible HTTP API (chat completions, completions, responses, embeddings, models)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rllm-core.workspace = true
+rllm-gguf.workspace = true
+rllm-cpu.workspace = true
+rllm-cuda.workspace = true
+rllm-model.workspace = true
+rllm-kv.workspace = true
+rllm-tokenizer.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tower-http.workspace = true
+base64.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true

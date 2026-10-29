@@ -1,0 +1,10 @@
+[package]
+name = "rllm-core"
+description = "Backend-independent types: dtypes, quantization formats, the Backend trait"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+half.workspace = true
+thiserror.workspace = true

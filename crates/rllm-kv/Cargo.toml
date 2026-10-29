@@ -1,0 +1,9 @@
+[package]
+name = "rllm-kv"
+description = "Paged KV cache bookkeeping: block allocator and per-sequence block tables"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

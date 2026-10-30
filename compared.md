@@ -121,8 +121,11 @@ Ordered roughly by how much each one limits what rllm can serve.
 | Grammars and regex (GBNF, regex, full JSON Schema) | ✓ GBNF | ✓ xgrammar, guidance | rllm enforces JSON structure only, not value constraints. |
 | Tool-call formats | ✓ many templates | ✓ many parsers | rllm parses Hermes/Qwen and Gemma 4 only. |
 | Sampling options | ✓ min_p, repeat penalty, typical, mirostat, DRY, … | ✓ min_p, repetition penalty, … | rllm has temperature, top_p, top_k, frequency and presence penalties and `logit_bias`. |
-| Web UI | ✓ | ✗ | |
 | Fill-in-the-middle (`suffix`) | ✓ `/infill` | ◐ | Rejected with 400. |
+
+### Out of scope
+
+- **Web UI.** llama-server has a built-in chat page; vLLM and rllm don't. rllm is meant to sit behind AegisLLM (`docs/plan.md`), and chat front ends such as Open WebUI and LibreChat already work with any OpenAI-compatible server, rllm included. For quick manual tests, `test.py` gives an interactive chat with reasoning and timings.
 
 ### Performance gaps measured against llama.cpp
 

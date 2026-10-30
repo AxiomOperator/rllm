@@ -11,6 +11,8 @@ use rllm_gguf::Gguf;
 use rllm_model::{AnyModel, Generator, Model, Sampler, SamplerConfig};
 use rllm_tokenizer::{ChatMessage, Tokenizer};
 
+mod tune;
+
 #[derive(Parser)]
 #[command(name = "rllm", about = "Rust LLM inference engine")]
 struct Cli {
@@ -92,6 +94,10 @@ enum Cmd {
         #[arg(long, short)]
         quiet: bool,
     },
+    /// Recommend `rllm serve` settings for this machine and model: GPU and
+    /// system memory, KV cache size and type, parallel requests, draft
+    /// model, host cache. `--measure` loads the model to confirm them.
+    Tune(tune::TuneArgs),
     /// Perplexity over a text file, same method as llama.cpp's llama-perplexity:
     /// the text is tokenized once and cut into `ctx`-token chunks; each chunk
     /// starts with BOS (if the model uses one) and is scored on its second half.
@@ -213,6 +219,7 @@ struct RunArgs {
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Inspect { model, tensors } => inspect(&model, tensors),
+        Cmd::Tune(args) => tune::tune(args),
         Cmd::Tokenize { model, text } => tokenize(&model, &text),
         Cmd::Run(args) => match args.device.as_str() {
             "cpu" => run(&CpuBackend::new(), args),

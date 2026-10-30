@@ -921,9 +921,11 @@ dependencies = [
  "rllm-cpu",
  "rllm-cuda",
  "rllm-gguf",
+ "rllm-kv",
  "rllm-model",
  "rllm-server",
  "rllm-tokenizer",
+ "serde_json",
 ]
 
 [[package]]

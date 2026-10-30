@@ -94,6 +94,12 @@ impl Gemma4Config {
         })
     }
 
+    /// Layers with their own sliding-window and global KV cache.
+    pub fn kv_layer_counts(&self) -> (usize, usize) {
+        let swa = self.is_swa[..self.n_kv_layers].iter().filter(|&&s| s).count();
+        (swa, self.n_kv_layers - swa)
+    }
+
     fn head_dim(&self, layer: usize) -> usize {
         if self.is_swa[layer] { self.head_dim_swa } else { self.head_dim_global }
     }

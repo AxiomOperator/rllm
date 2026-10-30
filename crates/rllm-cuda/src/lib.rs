@@ -468,6 +468,34 @@ pub struct CudaHostKv {
     block_bytes: usize,
 }
 
+/// What [`probe_devices`] reports about one GPU.
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub ordinal: usize,
+    pub name: String,
+    /// `sm_XY`.
+    pub arch: String,
+    pub sms: usize,
+    pub total_bytes: usize,
+    /// Free right now (other processes' allocations excluded).
+    pub free_bytes: usize,
+}
+
+/// The CUDA devices and their free memory, without loading any kernels.
+/// Empty if there is no driver or no device.
+pub fn probe_devices() -> Vec<DeviceInfo> {
+    let n = CudaContext::device_count().unwrap_or(0).max(0) as usize;
+    (0..n)
+        .filter_map(|i| {
+            let ctx = CudaContext::new(i).ok()?;
+            let (major, minor) = ctx.compute_capability().ok()?;
+            let sms = ctx.attribute(drv_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).ok()? as usize;
+            let (free_bytes, total_bytes) = ctx.mem_get_info().ok()?;
+            Some(DeviceInfo { ordinal: i, name: ctx.name().ok()?, arch: format!("sm_{major}{minor}"), sms, total_bytes, free_bytes })
+        })
+        .collect()
+}
+
 impl CudaBackend {
     pub fn new(ordinal: usize) -> Result<Self> {
         libs::preload();
@@ -692,6 +720,29 @@ impl CudaBackend {
     /// Graph modes: while capturing, every call records a copy from the key's
     /// pinned buffer (so replays pick up new contents); while replaying, only
     /// the pinned buffer is updated and the graph's copy does the rest.
+    /// Device memory (free, total) in bytes.
+    pub fn mem_info(&self) -> Result<(usize, usize)> {
+        self.stream.context().mem_get_info().map_err(err)
+    }
+
+    /// Keep memory freed by stream-ordered allocations in the device's pool
+    /// instead of returning it at each synchronization, so [`Self::mem_info`]
+    /// shows the peak of temporary buffers (for `rllm tune --measure`).
+    pub fn hold_freed_memory(&self) -> Result<()> {
+        let ctx = self.stream.context();
+        ctx.bind_to_thread().map_err(err)?;
+        let mut pool: drv_sys::CUmemoryPool = std::ptr::null_mut();
+        let mut threshold = u64::MAX;
+        // SAFETY: plain driver calls on this context's device, with valid out-pointers.
+        unsafe {
+            drv_sys::cuDeviceGetDefaultMemPool(&mut pool, ctx.cu_device()).result().map_err(err)?;
+            drv_sys::cuMemPoolSetAttribute(pool, drv_sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, (&mut threshold as *mut u64).cast())
+                .result()
+                .map_err(err)?;
+        }
+        Ok(())
+    }
+
     /// Copy KV blocks between a cache and its host store, every layer:
     /// `from[i]` -> `to[i]`, device to host if `to_host`. One launch per layer
     /// and part (K, V, their scales).

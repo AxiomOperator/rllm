@@ -184,6 +184,20 @@ const SPEC_STEP_TOKENS: usize = 8;
 /// sequence decodes without drafts for SPEC_PAUSE_STEPS steps.
 const SPEC_MAX_MISSES: u32 = 3;
 const SPEC_PAUSE_STEPS: u32 = 8;
+/// The draft model drafts only for sequences up to this many tokens. Beyond
+/// it the draft's own attention and its catch-up over the prompt (it has no
+/// prefix cache) cost more than it saves: Qwen3-8B with a Qwen3-0.6B draft
+/// on the RTX 6000 Ada decoded +30% at 900 tokens, +22% at 4k, -2% at 8k
+/// and -24% at 17k. Prompt lookup has no such cost and keeps going.
+pub const DRAFT_MAX_CONTEXT: usize = 6144;
+
+/// Size of the draft model's KV pool for a main pool of `kv_tokens`: enough
+/// for every sequence that can draft at once (at most 4 decode together
+/// while speculating). If it runs out, that step goes without drafts.
+pub fn draft_pool_tokens(kv_tokens: usize) -> usize {
+    kv_tokens.min(4 * DRAFT_MAX_CONTEXT)
+}
+
 /// Prompt lookup matches the last LOOKUP_MAX_NGRAM tokens earlier in the
 /// sequence, then shorter tails down to LOOKUP_MIN_NGRAM.
 const LOOKUP_MAX_NGRAM: usize = 4;
@@ -236,7 +250,7 @@ where
                     pool.add_host_tier(cfg.host_cache_bytes, cfg.kv_type).context("allocating the host cache")?;
                 }
                 let draft = match &draft_model {
-                    Some(d) => Some(KvPool::new(&backend, d, kv_tokens, BLOCK_SIZE, cfg.kv_type).context("draft model KV cache")?),
+                    Some(d) => Some(KvPool::new(&backend, d, draft_pool_tokens(kv_tokens), BLOCK_SIZE, cfg.kv_type).context("draft model KV cache")?),
                     None => None,
                 };
                 Ok((pool, draft))
@@ -717,6 +731,16 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                             model_spec[i] = 0;
                             proposals[i] = p;
                         }
+                    }
+                }
+            }
+            // Long sequences don't use the draft model (see DRAFT_MAX_CONTEXT);
+            // their draft cache is released once they grow past it.
+            for (i, s) in self.running.iter_mut().enumerate() {
+                if s.tokens.len() > DRAFT_MAX_CONTEXT {
+                    model_spec[i] = 0;
+                    if let Some(d) = &mut self.draft {
+                        s.draft_kv.free(&mut d.alloc);
                     }
                 }
             }

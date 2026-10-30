@@ -47,6 +47,39 @@ Environment: `RLLM_API_KEY` (as `--api-key`), `RLLM_ENGINE_TIMING=1` (print
 where engine step time goes every 256 steps, draft model included), `RLLM_NO_PIN=1` (see
 [Performance](#performance)).
 
+## Choosing settings: `rllm tune`
+
+`rllm tune model.gguf` reads the model's metadata and the machine (free GPU
+memory, system RAM, CPU) and prints a ready-to-run `rllm serve` command with
+the reason for each setting:
+- **`--kv-type`:** q8 for contexts of 8k or more (half the memory, faster decoding at depth), or when f16 wouldn't fit two full contexts.
+- **`--kv-tokens`:** all GPU memory left after weights, runtime buffers, the draft model and a margin (4% of free memory, at least 0.5 GiB).
+- **`--ctx`:** the model's trained context, up to 32768; less if memory doesn't allow it.
+- **`--parallel`:** 8, or fewer if the pool holds less than about 2k tokens per request.
+- **`--draft`:** the smallest GGUF next to the model with the same tokenizer, if it is at least 4× smaller and memory allows. Skipped with `--parallel 5` or more: speculation pauses with that many requests decoding.
+- **`--prompt-lookup`:** on.
+- **`--host-cache-gb`:** a quarter of available RAM, at most 4× the KV pool and 64 GiB, as long as 8 GiB stays available.
+
+It picks the GPU with the most free memory, so it accounts for other
+processes on a shared GPU. `--ctx`, `--parallel`, `--draft`, `--no-draft`
+and `-d` constrain the plan, and `--json` prints it for scripts.
+
+The estimate never touches the GPU beyond asking for its free memory.
+`--measure` loads the model and runs the plan for real (one request
+prefilled to the full context, then 8 decoding together, about 10–20 s on
+the RTX 6000 Ada). Freed memory stays reserved during the run, so the
+lowest free memory it sees includes every temporary buffer's peak. It then:
+- replaces the estimated weights and runtime memory with measured ones, resizing the KV pool to leave exactly the margin;
+- shrinks the pool if the run runs out of memory;
+- drops the draft if its decode step takes more than 30% of the model's.
+
+The estimates are calibrated against `--measure` on the RTX 6000 Ada.
+Weights came within 2% for Qwen3-0.6B Q8_0/BF16, Qwen3-8B Q4_K_M and
+Nemotron E4B Q8_K_XL; K-quants take about 11% more on the GPU than in the
+file. On the same box, the recommended commands for Qwen3-8B (with a draft)
+and Nemotron served a 30k-token prompt plus 7 concurrent requests with no
+errors and 1.3 GiB to spare.
+
 ## Endpoints
 
 All under `/v1`. Unknown paths, and OpenAI resources this server doesn't
@@ -192,7 +225,15 @@ is a main-model step saved.
 - **Request features.** Logit bias, frequency and presence penalties, logprobs, stop sequences and `n` all apply as usual (the draft sees the bias and penalties too). Requests with a JSON constraint (`json_object`, `json_schema`, forced tool calls) decode without drafts.
 - **Adaptive.** Each request proposes one token more than it last had accepted, up to `--draft-tokens`, so drafts stay short where the text is hard to predict. After three verifications in a row that accept nothing, the request decodes without drafts for 8 steps.
 - **Batching.** Drafts are shortened so a step stays within 8 tokens (one request: up to 7 drafts; two: 3 each; three or four: 1 each). With 5 or more requests decoding, the batch alone keeps the GPU busy and speculation pauses.
-- **Draft cache.** The draft model has its own KV pool (the same size as the main one). Each request's draft cache catches up lazily (its whole prompt at the first decode step) and is cut back to the accepted tokens after each verification. It has no prefix cache.
+- **Short sequences only.** The draft model drafts for sequences up to 6144 tokens; longer ones decode with prompt lookup only (if on) and release their draft cache. Beyond that length the draft's attention and its catch-up over the prompt cost more than it saves:
+
+| Qwen3-8B + 0.6B draft, RTX 6000 Ada | 901 tokens | 4111 | 8331 | 16751 |
+|---|---:|---:|---:|---:|
+| No draft | 137.7 tok/s | 132.1 | 124.0 | 111.2 |
+| Draft at every length (before) | 178.9 | 161.3 | 121.6 | 84.0 |
+| Draft up to 6144 tokens (now) | 179.1 | 161.6 | 124.0 | 111.8 |
+
+- **Draft cache.** The draft model has its own KV pool of 4 × 6144 tokens (or the main pool's size, if smaller): enough for every sequence that can draft at once. Each request's draft cache catches up lazily (its whole prompt at the first decode step) and is cut back to the accepted tokens after each verification. It has no prefix cache. If the pool runs out, that step goes without drafts.
 - **Pairs need the same vocabulary.** The server checks the logits width and every token string at startup.
 
 | Qwen3-8B Q4_K_M, RTX 6000 Ada | rllm | rllm + Qwen3-0.6B draft | llama-server | llama-server + draft |

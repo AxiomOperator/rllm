@@ -531,8 +531,9 @@ token 381 ms recomputed, 39 ms restored (375 MB copied back).
   the multi-token verification step doesn't, so greedy output with a draft
   matches as closely as batched requests do rather than bit for bit (Qwen3
   matches exactly). The draft model has no prefix cache: each request's
-  draft cache reads its whole prompt at the first decode step. `rllm run`
-  has no `--draft`; the server does.
+  draft cache reads its whole prompt at the first decode step, one reason
+  the draft only runs for sequences up to 6144 tokens (at 17k tokens it
+  had cut decode speed by 24%). `rllm run` has no `--draft`; the server does.
 - **Several backends in one process:** two `CudaBackend`s recording CUDA
   graphs at once (only possible in tests) disturb each other's decode
   steps, so the GPU tests take a lock. The binaries create one backend.

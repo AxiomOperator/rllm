@@ -22,6 +22,8 @@ mod chat;
 mod completions;
 mod embeddings;
 mod engine;
+
+pub use engine::{DRAFT_MAX_CONTEXT, draft_pool_tokens};
 mod error;
 mod extras;
 mod generation;

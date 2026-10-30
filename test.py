@@ -39,6 +39,8 @@ def chat(session, base, model, messages, args):
         'max_tokens': args.max_tokens,
         'stream': args.stream,
     }
+    if args.reasoning_effort:
+        payload['reasoning_effort'] = args.reasoning_effort
     if args.stream:
         payload['stream_options'] = {'include_usage': True}
 
@@ -150,6 +152,10 @@ def main():
     parser.add_argument('--max-tokens', type=int, default=256)
     parser.add_argument('--temperature', type=float, default=0.7)
     parser.add_argument('--stream', action='store_true', help='Stream output token chunks')
+    parser.add_argument('--reasoning-effort', choices=['none', 'minimal', 'low', 'medium', 'high'],
+                        help="Ask the model to think (low/medium/high) or not (none/minimal); default: the model's own")
+    parser.add_argument('--think', dest='reasoning_effort', action='store_const', const='medium',
+                        help='Shorthand for --reasoning-effort medium')
     parser.add_argument('--api-key', default=None, help='Optional bearer token for authenticated servers')
     parser.add_argument('--timeout', type=float, default=120, help='Read timeout in seconds')
     args = parser.parse_args()
@@ -184,6 +190,7 @@ def main():
 
     print(f'Using model: {model}')
     print(f'Mode: {"streaming" if args.stream else "standard"}')
+    print(f'Reasoning effort: {args.reasoning_effort or "model default"}')
     system = [{'role': 'system', 'content': args.system}] if args.system else []
 
     if args.prompt is not None:

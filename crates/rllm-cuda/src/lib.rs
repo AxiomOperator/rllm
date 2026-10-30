@@ -446,6 +446,28 @@ pub struct CudaKvCache {
     vs: Vec<CudaSlice<u16>>,
 }
 
+impl CudaKvCache {
+    /// Bytes of one block in a layer's K (or V) pool, and in its scales
+    /// (0 for f16).
+    fn block_parts(&self) -> (usize, usize) {
+        let n = self.layout.block_size * self.layout.slot_width();
+        match self.layout.dtype {
+            KvType::F16 => (2 * n, 0),
+            KvType::Q8 => (n, n / 32 * 2),
+        }
+    }
+}
+
+/// Host blocks for a [`CudaKvCache`]: pinned and mapped into the device's
+/// address space, so a kernel copies blocks straight over PCIe. Host block
+/// `h` holds, layer by layer, the K block, the V block and (q8) their scales.
+pub struct CudaHostKv {
+    buf: cudarc::driver::PinnedHostSlice<u8>,
+    /// Device address of `buf`.
+    dev: u64,
+    block_bytes: usize,
+}
+
 impl CudaBackend {
     pub fn new(ordinal: usize) -> Result<Self> {
         libs::preload();
@@ -462,7 +484,7 @@ impl CudaBackend {
 
         let mut names: Vec<String> = [
             "f32_to_f16", "f32_to_bf16", "rms_norm", "add_rms_norm", "rms_norm_add", "qkv_norm_rope_store", "rms_norm_rope", "rope_neox", "silu_mul", "gelu_mul", "gelu_mul_strided", "ple_gate_f32", "gelu", "mul_inplace", "scale_inplace", "softcap_inplace",
-            "add_inplace", "gather_rows", "gather_strided", "kv_store", "kv_store_q8", "kv_dequant_blocks", "kv_rotate_q", "attn_decode_combine", "paged_attention", "attn_prefill", "attn_prefill_tc", "quantize_q8", "repack_q8_0",
+            "add_inplace", "gather_rows", "gather_strided", "kv_store", "kv_store_q8", "kv_copy_blocks", "kv_dequant_blocks", "kv_rotate_q", "attn_decode_combine", "paged_attention", "attn_prefill", "attn_prefill_tc", "quantize_q8", "repack_q8_0",
             "repack_q4_k", "repack_q6_k", "mmq_q8", "mmq_q4", "mmq_q6", "mmq_sum_splits",
             "mmq_glu_silu_q8", "mmq_glu_silu_q4", "mmq_glu_silu_q6", "mmq_glu_gelu_q8", "mmq_glu_gelu_q4", "mmq_glu_gelu_q6",
             "matvec_glu_silu_q8", "matvec_glu_silu_q4", "matvec_glu_silu_q6", "matvec_glu_gelu_q8", "matvec_glu_gelu_q4", "matvec_glu_gelu_q6",
@@ -670,6 +692,50 @@ impl CudaBackend {
     /// Graph modes: while capturing, every call records a copy from the key's
     /// pinned buffer (so replays pick up new contents); while replaying, only
     /// the pinned buffer is updated and the graph's copy does the rest.
+    /// Copy KV blocks between a cache and its host store, every layer:
+    /// `from[i]` -> `to[i]`, device to host if `to_host`. One launch per layer
+    /// and part (K, V, their scales).
+    fn kv_copy(&self, kv: &CudaKvCache, store: &CudaHostKv, from: &[u32], to: &[u32], to_host: bool) -> Result<()> {
+        if from.len() != to.len() {
+            return Err(Error::Shape(format!("kv copy: {} source blocks, {} destinations", from.len(), to.len())));
+        }
+        if from.is_empty() {
+            return Ok(());
+        }
+        let (dev_blocks, host_blocks) = if to_host { (from, to) } else { (to, from) };
+        let n_host = store.buf.len() / store.block_bytes;
+        if dev_blocks.iter().any(|&b| b as usize >= kv.layout.n_blocks) || host_blocks.iter().any(|&b| b as usize >= n_host) {
+            return Err(Error::Shape("kv copy: block out of range".into()));
+        }
+        let (part, scales) = kv.block_parts();
+        if part % 16 != 0 || scales % 16 != 0 || store.block_bytes != kv.layout.block_bytes() {
+            return Err(Error::Shape(format!("kv copy: block parts {part}/{scales} bytes")));
+        }
+        let mut cache = self.index_cache.lock().unwrap();
+        self.sync_index(&mut cache, "kv_copy_from", from)?;
+        self.sync_index(&mut cache, "kv_copy_to", to)?;
+        let (fi, ti) = (&cache["kv_copy_from"].dev, &cache["kv_copy_to"].dev);
+        let cfg = LaunchConfig { grid_dim: (from.len() as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let host_stride = store.block_bytes as i64;
+        let mut off = 0u64;
+        for layer in 0..kv.layout.n_layers {
+            let mut parts: Vec<(u64, usize)> = vec![(kv.k[layer].device_ptr(&self.stream).0, part), (kv.v[layer].device_ptr(&self.stream).0, part)];
+            if scales > 0 {
+                parts.push((kv.ks[layer].device_ptr(&self.stream).0, scales));
+                parts.push((kv.vs[layer].device_ptr(&self.stream).0, scales));
+            }
+            for (pool, bytes) in parts {
+                let host = store.dev + off;
+                let (src, dst, src_stride, dst_stride) =
+                    if to_host { (pool, host, bytes as i64, host_stride) } else { (host, pool, host_stride, bytes as i64) };
+                let nb = bytes as i32;
+                launch!(self, "kv_copy_blocks", cfg, [&src, &dst, fi, ti, &src_stride, &dst_stride, &nb])?;
+                off += bytes as u64;
+            }
+        }
+        Ok(())
+    }
+
     fn sync_index(&self, cache: &mut HashMap<&'static str, IndexBuf>, key: &'static str, data: &[u32]) -> Result<()> {
         let mode = {
             let mut g = self.graph.lock().unwrap();
@@ -1158,6 +1224,7 @@ impl Backend for CudaBackend {
     type Buffer = CudaBuf;
     type Weight = CudaWeight;
     type KvCache = CudaKvCache;
+    type HostKv = CudaHostKv;
 
     fn name(&self) -> String {
         format!("cuda ({}, {})", self.device_name, self.arch)
@@ -1311,6 +1378,26 @@ impl Backend for CudaBackend {
         let mk = || (0..layout.n_layers).map(|_| self.stream.alloc_zeros::<u8>(bytes).map_err(err)).collect::<Result<Vec<_>>>();
         let mk_s = || (0..layout.n_layers).map(|_| self.stream.alloc_zeros::<u16>(scales).map_err(err)).collect::<Result<Vec<_>>>();
         Ok(CudaKvCache { layout, k: mk()?, v: mk()?, ks: mk_s()?, vs: mk_s()? })
+    }
+
+    fn alloc_host_kv(&self, layout: KvLayout, n_blocks: usize) -> Result<CudaHostKv> {
+        let block_bytes = layout.block_bytes();
+        let flags = drv_sys::CU_MEMHOSTALLOC_DEVICEMAP | drv_sys::CU_MEMHOSTALLOC_PORTABLE;
+        // SAFETY: the memory is only read back after kv_to_host wrote it.
+        let mut buf = unsafe { self.stream.context().alloc_pinned_with_flags::<u8>(n_blocks.max(1) * block_bytes, flags) }.map_err(err)?;
+        let host = buf.as_mut_ptr().map_err(err)?;
+        let mut dev: drv_sys::CUdeviceptr = 0;
+        // SAFETY: `host` is a live allocation made with DEVICEMAP.
+        unsafe { drv_sys::cuMemHostGetDevicePointer_v2(&mut dev, host.cast(), 0) }.result().map_err(err)?;
+        Ok(CudaHostKv { buf, dev, block_bytes })
+    }
+
+    fn kv_to_host(&self, kv: &CudaKvCache, store: &mut CudaHostKv, dev: &[u32], host: &[u32]) -> Result<()> {
+        self.kv_copy(kv, store, dev, host, true)
+    }
+
+    fn kv_from_host(&self, kv: &mut CudaKvCache, store: &CudaHostKv, host: &[u32], dev: &[u32]) -> Result<()> {
+        self.kv_copy(kv, store, host, dev, false)
     }
 
     fn to_host(&self, buf: &CudaBuf, out: &mut [f32]) -> Result<()> {

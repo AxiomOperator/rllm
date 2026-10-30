@@ -13,6 +13,8 @@ rllm serve model.gguf --host 0.0.0.0 --port 8080 --ctx 8192 --parallel 8 \
     --store-file store.json
 # A draft model for speculative decoding, and an 8-bit KV cache:
 rllm serve models/Qwen3-8B-Q4_K_M.gguf --draft models/Qwen3-0.6B-Q8_0.gguf --kv-type q8
+# Speculation without a draft model, and 16 GiB of system RAM for the prefix cache:
+rllm serve models/Qwen3-8B-Q4_K_M.gguf --prompt-lookup --host-cache-gb 16
 ```
 
 ```python
@@ -31,7 +33,9 @@ r = client.chat.completions.create(model="my-model", messages=[{"role": "user", 
 | `--no-prefix-cache` | off | Don't keep finished requests' KV for reuse. |
 | `--kv-type` | `f16` | KV cache storage: `f16`, or `q8` (8-bit, about half the memory; see [KV cache type](#kv-cache-type)). |
 | `--draft` | none | Draft model for speculative decoding: a small GGUF with the same tokenizer (see [Speculative decoding](#speculative-decoding)). |
-| `--draft-tokens` | 5 | Most tokens the draft proposes per step. |
+| `--draft-tokens` | 5 | Most tokens the draft (or prompt lookup) proposes per step. |
+| `--prompt-lookup` | off | Speculative decoding without a draft model: propose the tokens that followed the latest few tokens' earlier occurrence in the prompt or output (see [Prompt lookup](#prompt-lookup)). |
+| `--host-cache-gb` | 0 | Pinned system memory (GiB) for the prefix cache's host tier: evicted prefixes move there and come back on a hit (see [Host tier](#host-tier)). |
 | `--api-key` | `$RLLM_API_KEY`, else none | Require `Authorization: Bearer <key>`. |
 | `--model-name` | file name without `.gguf` | Model id reported by `/v1/models` and in responses. |
 | `--strict-model` | off | Answer requests naming another model with 404 `model_not_found`, as OpenAI does. Off by default: any model name is served by the loaded model, so clients that hard-code e.g. `gpt-4o` still work. |
@@ -165,7 +169,7 @@ retrieval-embedding model.
   - HTTP handling, tokenization, chat templating, stop sequences and output parsing run on the async runtime.
 - **Prefix cache.** When a request finishes, its KV blocks stay cached. A later request whose prompt starts with the same tokens reuses those blocks instead of recomputing them. That covers the next turn of a chat, a repeated system prompt, `n` choices or `previous_response_id`.
   - Only whole 16-token blocks are shared, so the last few tokens before the difference are recomputed.
-  - Least recently used entries are evicted when blocks run out.
+  - Least recently used entries are evicted when blocks run out: dropped, or with `--host-cache-gb` moved to system memory (see [Host tier](#host-tier)).
 - **When the KV cache is full.** Cached prefixes are evicted first. If that isn't enough, the newest running request is paused, and its blocks go into the prefix cache. It resumes later by recomputing (often reusing) its tokens. Clients only see a short stall.
 - **Sampling.** Each request's logits are processed on the host: logprobs, `logit_bias`, penalties, the JSON constraint, then sampling. With several requests in a step, this runs on one thread per request.
 - **Numerics.** A request batched with others runs through the multi-row int8 kernels (the ones prefill uses), and a lone request through the single-row decode kernels.
@@ -205,6 +209,50 @@ accepted. llama-server ran `-md` with `--spec-type draft-simple` and its
 default `--spec-draft-n-max 3` (8 was slower still); in this build its
 speculative mode lowered throughput.
 
+## Prompt lookup
+
+`--prompt-lookup` drafts without a second model. Before each decode step,
+the engine looks for the sequence's last 4 tokens (then 3, then 2) earlier in
+its prompt or output, and proposes the tokens that followed the most recent
+match. The main model verifies them in the same pass as a draft model's.
+- **Free when it misses.** The search is host-side (microseconds) and only proposes when it finds a match; free-form text rarely matches, and then the step is a plain decode step.
+- **Exact.** A copied token is a draft drawn with probability 1, so the speculative sampling rule (accept with probability p, else draw from p without that token) keeps output distributed exactly as without lookup. Greedy output is identical on Qwen3.
+- **Shares the draft machinery.** Proposals follow the same adaptive length (`--draft-tokens`), pause after repeated misses, stay within 8-token steps, and switch off with 5 or more requests decoding. JSON-constrained requests don't use it.
+- **With `--draft`,** lookup goes first and the draft model covers the steps where lookup finds nothing.
+
+| Qwen3-8B Q4_K_M, RTX 6000 Ada, greedy | rllm | `--prompt-lookup` | `--draft` 0.6B | both |
+|---|---:|---:|---:|---:|
+| Rename a variable in 20 lines of code | 136 tok/s | 360 tok/s (2.64×) | 271 tok/s (1.98×) | 363 tok/s (2.66×) |
+| Short story | 142 tok/s | 142 tok/s (1.00×) | 169 tok/s (1.19×) | 170 tok/s (1.19×) |
+| Copy a paragraph and add a sentence | 136 tok/s | 280 tok/s (2.06×) | 238 tok/s (1.75×) | 285 tok/s (2.10×) |
+
+All twelve outputs matched the plain run's word for word. On the server
+benchmark (8 clients) throughput was unchanged (772 vs 782 tok/s, within
+noise); with one client it rose 1.35×, since that benchmark's outputs repeat
+themselves. Metrics: `rllm_lookup_tokens_total` and
+`rllm_lookup_tokens_accepted_total`.
+
+## Host tier
+
+`--host-cache-gb N` gives the prefix cache a second tier in pinned system
+memory. When device blocks run out, the least recently used cached prefix
+is copied to the host instead of dropped; a later prompt that matches it
+further than anything on the GPU copies it back instead of recomputing it.
+- **How.** Host memory is pinned and mapped into the GPU's address space, and one kernel per layer and part (K, V, q8 scales) moves a list of blocks over PCIe. The copies run on the same stream as the forward passes, so there is no host synchronization: a freed device block can be reused by the very next step.
+- **Exact.** Blocks come back bit for bit (a GPU test overwrites every device block in between and compares logits, f16 and q8, Qwen3 and Gemma 4).
+- **Bookkeeping.** The host tier evicts least recently used entries in turn (at most 2048). A prefix already covered by a host entry isn't copied twice; a restored entry leaves the host when the device has all of it. Only the matched blocks are copied back.
+- **Sizing.** One block of 16 tokens takes `16 × layers × kv_heads × head_dim × 4` bytes in f16 (2.4 MB for Qwen3-8B; half with `--kv-type q8`). 16 GiB holds about 116k tokens of Qwen3-8B prefixes. The memory is allocated and locked at startup.
+
+| Qwen3-8B Q4_K_M, RTX 6000 Ada, 4096-token KV pool | no host tier | `--host-cache-gb 4` |
+|---|---:|---:|
+| Repeat of a 2546-token prompt after two others displaced it: cached tokens | 0 | 2544 |
+| Time to first token | 381 ms | 39 ms |
+
+The 39 ms includes copying 375 MB back (159 blocks). Metrics:
+`rllm_kv_host_blocks_total`, `rllm_kv_host_blocks_free`,
+`rllm_prefix_cache_host_entries`, `rllm_kv_offloaded_blocks_total`,
+`rllm_kv_restored_blocks_total`.
+
 ## KV cache type
 
 `--kv-type q8` stores keys and values as 8-bit integers with one f16 scale
@@ -237,7 +285,8 @@ the context or concurrent requests in the same `--kv-tokens` budget.
 `GET /metrics` serves Prometheus text, every series labelled with the model:
 - **Engine gauges:** `rllm_requests_running`, `rllm_requests_waiting`, `rllm_kv_blocks_total`, `rllm_kv_blocks_free`, `rllm_prefix_cache_entries`, `rllm_prefix_cache_blocks`.
 - **Engine counters:** `rllm_requests_finished_total`, `rllm_prompt_tokens_total`, `rllm_prompt_tokens_cached_total`, `rllm_generation_tokens_total`, `rllm_embedding_tokens_total`, `rllm_preemptions_total`, `rllm_engine_steps_total`, `rllm_engine_step_tokens_total`, `rllm_engine_busy_seconds_total`.
-- **Speculative decoding:** `rllm_draft_tokens_total` (proposed) and `rllm_draft_tokens_accepted_total`.
+- **Speculative decoding:** `rllm_draft_tokens_total` (proposed) and `rllm_draft_tokens_accepted_total`; for prompt lookup, `rllm_lookup_tokens_total` and `rllm_lookup_tokens_accepted_total`.
+- **Host tier:** `rllm_kv_host_blocks_total`, `rllm_kv_host_blocks_free`, `rllm_prefix_cache_host_entries`, `rllm_kv_offloaded_blocks_total`, `rllm_kv_restored_blocks_total`.
 - **HTTP:** `rllm_http_requests_total` and `rllm_http_request_seconds_total`, by method, route pattern (`/v1/responses/{id}`) and status.
 
 ## Performance
@@ -306,6 +355,12 @@ identical to the run without one, sampling at temperature 0.8 worked
 (1.37× faster), and the preemption test below passed again (2 preemptions,
 outputs identical to the requests run alone).
 
+Both suites passed again (47/47, 17/17) with `--prompt-lookup --host-cache-gb 2`
+on Qwen3-0.6B (RTX 6000 Ada), with the default pool and with a 4096-token
+pool. The preemption test below, on a 1024-token pool with a host tier,
+moved 148 blocks to the host and copied 294 back over 3 preemptions; every
+output matched the request run alone.
+
 Separately:
 - **Preemption:** a 1024-token pool with 4 concurrent 380-token completions preempted twice. Every output was identical to the same request run alone.
 - **Persistence:** stored completions survived a restart with `--store-file`.
@@ -315,14 +370,16 @@ Unit tests cover:
 - **The JSON validator:** schemas, `$ref` recursion, `anyOf`, the Gemma dialect, tool-call alternatives.
 - **The prefix cache:** block sharing, eviction, superseded entries.
 - **The sampler:** argmax and top-k against naive versions, `exp` accuracy, sampled frequencies against softmax for temperature, top-k and top-p, and speculative verification reproducing the target distribution (greedy, temperature, top-k, top-p).
-- **The KV cache:** truncation after rejected drafts.
+- **The KV cache:** truncation after rejected drafts; the host tier (offload on eviction, full and partial restores, LRU eviction on the host, device hits preferred).
+- **Prompt lookup:** latest match wins, shorter tails as fallback, proposals stop at the end of the sequence.
 
 GPU tests (`crates/rllm-model/tests/gpu.rs`) need a model file:
 `RLLM_TEST_MODEL=models/Qwen3-0.6B-Q8_0.gguf cargo test --release -p rllm-model --test gpu`
 (add `RLLM_MMQ=1` to send a small model's prefill through the int8 kernels).
 They check that the same tokens give bit-identical logits on every run,
-that a verification step matches one-token steps, and that a q8 cache tracks
-f16 on real text (97–99% same top token, mean KL ≤ 4e-3). They passed on
+that a verification step matches one-token steps, that a q8 cache tracks
+f16 on real text (97–99% same top token, mean KL ≤ 4e-3), and that blocks
+moved to the host tier and back give bit-identical logits. They passed on
 Qwen3-0.6B, Qwen3-8B and Nemotron on both GPUs. The CUDA parity tests
 (`crates/rllm-cuda/tests/parity.rs`) run every attention path on a q8 cache
 against the CPU backend, which emulates q8's rounding.

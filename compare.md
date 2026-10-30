@@ -486,6 +486,26 @@ Greedy output with the draft is token for token the same as without it
 (six prompts compared). llama-server used `--spec-type draft-simple` with its
 default 3 draft tokens; 8 was slower still.
 
+## Prompt lookup and the prefix cache's host tier
+
+Two ways to put the idle CPU and system memory to work, measured on the RTX
+6000 Ada with Qwen3-8B Q4_K_M (details in `docs/server.md`).
+
+**Prompt lookup** (`--prompt-lookup`): drafts copied from earlier in the
+sequence, verified like a draft model's, so output is unchanged (greedy
+output identical in all twelve comparisons).
+
+| Greedy, tok/s | rllm | lookup | draft model | both |
+|---|---:|---:|---:|---:|
+| Rename a variable in 20 lines of code | 136 | **360** | 271 | **363** |
+| Short story | 142 | 142 | 169 | 170 |
+| Copy a paragraph and add a sentence | 136 | **280** | 238 | **285** |
+
+**Host tier** (`--host-cache-gb`): evicted prefix-cache blocks move to
+pinned system memory and come back over PCIe on a hit. A 2546-token prompt
+repeated after two others displaced it from a 4096-token pool: time to first
+token 381 ms recomputed, 39 ms restored (375 MB copied back).
+
 ## Known gaps
 
 - **Prefill activation quantization on small GPUs:** on the RTX 6000 Ada no

@@ -49,6 +49,21 @@ pub struct CpuKvCache {
     v: Vec<Vec<f32>>,
 }
 
+/// Copy blocks `from[i]` of `src` to blocks `to[i]` of `dst` (every layer).
+fn copy_blocks(src: &CpuKvCache, dst: &mut CpuKvCache, from: &[u32], to: &[u32]) -> Result<()> {
+    let n = src.layout.block_size * src.layout.slot_width();
+    for (&f, &t) in from.iter().zip(to) {
+        let (f, t) = (f as usize * n, t as usize * n);
+        if f + n > src.k[0].len() || t + n > dst.k[0].len() {
+            return Err(Error::Shape(format!("kv block copy {f} -> {t} out of range")));
+        }
+        for (s, d) in src.k.iter().zip(&mut dst.k).chain(src.v.iter().zip(&mut dst.v)) {
+            d[t..t + n].copy_from_slice(&s[f..f + n]);
+        }
+    }
+    Ok(())
+}
+
 fn check_len(what: &str, have: usize, need: usize) -> Result<()> {
     if have < need {
         return Err(Error::Shape(format!("{what}: buffer has {have} elements, need {need}")));
@@ -134,6 +149,7 @@ impl Backend for CpuBackend {
     type Buffer = Vec<f32>;
     type Weight = CpuWeight;
     type KvCache = CpuKvCache;
+    type HostKv = CpuKvCache;
 
     fn name(&self) -> String {
         format!("cpu ({} threads)", rayon::current_num_threads())
@@ -325,6 +341,18 @@ impl Backend for CpuBackend {
             o.copy_from_slice(&x[r * width..(r + 1) * width]);
         }
         Ok(())
+    }
+
+    fn alloc_host_kv(&self, layout: KvLayout, n_blocks: usize) -> Result<CpuKvCache> {
+        self.alloc_kv(KvLayout { n_blocks, ..layout })
+    }
+
+    fn kv_to_host(&self, kv: &CpuKvCache, store: &mut CpuKvCache, dev: &[u32], host: &[u32]) -> Result<()> {
+        copy_blocks(kv, store, dev, host)
+    }
+
+    fn kv_from_host(&self, kv: &mut CpuKvCache, store: &CpuKvCache, host: &[u32], dev: &[u32]) -> Result<()> {
+        copy_blocks(store, kv, host, dev)
     }
 
     fn kv_store(&self, kv: &mut CpuKvCache, layer: usize, k: &Vec<f32>, v: &Vec<f32>, slots: &[u32]) -> Result<()> {

@@ -125,6 +125,16 @@ impl KvLayout {
     pub fn slot_width(&self) -> usize {
         self.n_kv_heads * self.head_dim
     }
+
+    /// Bytes one block takes across all layers, K and V (and q8 scales).
+    pub fn block_bytes(&self) -> usize {
+        let n = self.block_size * self.slot_width();
+        let per_layer = match self.dtype {
+            KvType::F16 => 2 * n,
+            KvType::Q8 => n + n / 32 * 2,
+        };
+        2 * per_layer * self.n_layers
+    }
 }
 
 /// Per-step attention metadata for a flattened batch of tokens.
@@ -163,6 +173,9 @@ pub trait Backend: Send + Sync {
     type Buffer: Send;
     type Weight: Send + Sync;
     type KvCache: Send;
+    /// Host memory holding KV blocks copied out of a cache (the prefix
+    /// cache's host tier).
+    type HostKv: Send;
 
     fn name(&self) -> String;
 
@@ -364,6 +377,18 @@ pub trait Backend: Send + Sync {
 
     /// `out[i, :] = x[rows[i], :]`, rows of `width`.
     fn gather_rows(&self, x: &Self::Buffer, rows: &[u32], width: usize, out: &mut Self::Buffer) -> Result<()>;
+
+    /// Host storage for `n_blocks` blocks of a cache with `layout`
+    /// (pinned memory on GPUs, so copies run at full PCIe speed).
+    fn alloc_host_kv(&self, layout: KvLayout, n_blocks: usize) -> Result<Self::HostKv>;
+
+    /// Copy cache blocks `dev[i]` (every layer) to host blocks `host[i]`.
+    /// Ordered with the backend's other work: later steps may overwrite the
+    /// device blocks right away.
+    fn kv_to_host(&self, kv: &Self::KvCache, store: &mut Self::HostKv, dev: &[u32], host: &[u32]) -> Result<()>;
+
+    /// Copy host blocks `host[i]` into cache blocks `dev[i]` (every layer).
+    fn kv_from_host(&self, kv: &mut Self::KvCache, store: &Self::HostKv, host: &[u32], dev: &[u32]) -> Result<()>;
 
     /// Write K and V (`[tokens, slot_width]`) for `layer` into `slots`.
     fn kv_store(&self, kv: &mut Self::KvCache, layer: usize, k: &Self::Buffer, v: &Self::Buffer, slots: &[u32]) -> Result<()>;

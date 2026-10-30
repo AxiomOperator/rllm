@@ -112,6 +112,8 @@ pub struct EngineInfo {
     pub vocab: usize,
     /// The draft model, when speculative decoding is on.
     pub draft: Option<String>,
+    /// Prefix cache host tier size, in blocks.
+    pub host_blocks: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -164,9 +166,14 @@ pub struct EngineConfig {
     pub draft: Option<Arc<Gguf>>,
     /// Most tokens the draft proposes per sequence and step.
     pub draft_tokens: usize,
+    /// Prompt lookup: propose drafts by finding the latest tokens earlier in
+    /// the sequence (no draft model needed; with one, lookup goes first).
+    pub prompt_lookup: bool,
+    /// Pinned system memory for the prefix cache's host tier, in bytes (0: none).
+    pub host_cache_bytes: usize,
 }
 
-const BLOCK_SIZE: usize = 16;
+pub const BLOCK_SIZE: usize = 16;
 
 /// Most tokens in a step that verifies drafts. Up to 8 tokens a step stays
 /// on the matvec kernels and in a CUDA graph; beyond that the main model's
@@ -177,6 +184,10 @@ const SPEC_STEP_TOKENS: usize = 8;
 /// sequence decodes without drafts for SPEC_PAUSE_STEPS steps.
 const SPEC_MAX_MISSES: u32 = 3;
 const SPEC_PAUSE_STEPS: u32 = 8;
+/// Prompt lookup matches the last LOOKUP_MAX_NGRAM tokens earlier in the
+/// sequence, then shorter tails down to LOOKUP_MIN_NGRAM.
+const LOOKUP_MAX_NGRAM: usize = 4;
+const LOOKUP_MIN_NGRAM: usize = 2;
 
 /// Start the engine thread. `make_backend` runs on that thread (CUDA
 /// contexts are tied to it). Returns once the model is loaded.
@@ -220,7 +231,10 @@ where
             };
             let kv_tokens = cfg.kv_tokens.max(cfg.ctx);
             let pools = (|| -> Result<_> {
-                let pool = KvPool::new(&backend, &model, kv_tokens, BLOCK_SIZE, cfg.kv_type)?;
+                let mut pool = KvPool::new(&backend, &model, kv_tokens, BLOCK_SIZE, cfg.kv_type)?;
+                if cfg.host_cache_bytes > 0 {
+                    pool.add_host_tier(cfg.host_cache_bytes, cfg.kv_type).context("allocating the host cache")?;
+                }
                 let draft = match &draft_model {
                     Some(d) => Some(KvPool::new(&backend, d, kv_tokens, BLOCK_SIZE, cfg.kv_type).context("draft model KV cache")?),
                     None => None,
@@ -239,6 +253,7 @@ where
                 summary: model.summary(),
                 vocab: model.vocab_size(),
                 draft: draft_model.as_ref().map(|d| d.summary()),
+                host_blocks: pool.host_blocks().map(|(n, _)| n),
             };
             let _ = ready_tx.send(Ok(info));
             Scheduler::new(pool, draft, &tok, &vocab, &cfg, &metrics).run(jobs_rx);
@@ -360,6 +375,29 @@ enum Next {
 struct Proposal {
     tokens: Vec<u32>,
     dists: Vec<Dist>,
+    /// Found by prompt lookup rather than the draft model.
+    lookup: bool,
+}
+
+impl Proposal {
+    /// Prompt lookup's proposal for a sequence: up to `k` tokens that
+    /// followed the most recent earlier occurrence of its last few tokens.
+    /// Copying is deterministic, so each token's draft distribution is a
+    /// point mass, which keeps verification exact.
+    fn lookup(tokens: &[u32], k: usize) -> Self {
+        let len = tokens.len();
+        for n in (LOOKUP_MIN_NGRAM..=LOOKUP_MAX_NGRAM).rev() {
+            if len <= n {
+                continue;
+            }
+            let tail = &tokens[len - n..];
+            if let Some(start) = (0..len - n).rev().find(|&i| tokens[i..i + n] == *tail) {
+                let next = &tokens[start + n..(start + n + k).min(len)];
+                return Self { tokens: next.to_vec(), dists: next.iter().map(|&t| Dist::Point(t)).collect(), lookup: true };
+            }
+        }
+        Self::default()
+    }
 }
 
 struct Scheduler<'a, 'm, B: Backend> {
@@ -557,7 +595,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         self.free_draft(s);
         let kv = std::mem::take(&mut s.kv);
         if self.cfg.prefix_cache {
-            self.cache.insert(&mut self.pool.alloc, &s.tokens[..kv.len], kv);
+            self.cache.insert(&mut self.pool, &s.tokens[..kv.len], kv);
         } else {
             let mut kv = kv;
             kv.free(&mut self.pool.alloc);
@@ -571,13 +609,13 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         while self.running.len() < self.cfg.parallel.max(1) {
             let Some(mut s) = self.waiting.pop_front() else { return };
             if self.cfg.prefix_cache && s.kv.len == 0 {
-                let (n, blocks) = self.cache.lookup(&mut self.pool.alloc, &s.tokens);
+                let (n, blocks) = self.cache.lookup(&mut self.pool, &s.tokens);
                 s.kv = SeqKv::with_prefix(blocks, n);
             }
             // The prompt's blocks, plus one block of headroom per running
             // sequence so they can keep decoding.
             let need = s.kv.blocks_needed(BLOCK_SIZE, s.todo().len()) + self.running.len();
-            if !self.cache.make_room(&mut self.pool.alloc, need) {
+            if !self.cache.make_room(&mut self.pool, need) {
                 s.kv.free(&mut self.pool.alloc);
                 self.waiting.push_front(s);
                 return;
@@ -598,6 +636,14 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         Metrics::set(&m.kv_blocks_free, self.pool.alloc.n_free());
         Metrics::set(&m.prefix_cache_entries, self.cache.len());
         Metrics::set(&m.prefix_cache_blocks, self.cache.n_blocks());
+        if let Some((total, free)) = self.pool.host_blocks() {
+            let stats = self.cache.stats();
+            Metrics::set(&m.host_blocks_total, total);
+            Metrics::set(&m.host_blocks_free, free);
+            Metrics::set(&m.host_cache_entries, self.cache.host_len());
+            Metrics::set(&m.host_offloaded_blocks, stats.offloaded);
+            Metrics::set(&m.host_restored_blocks, stats.restored);
+        }
     }
 
     /// Draft tokens to propose for a sequence this step (0: none). Only
@@ -605,7 +651,8 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
     /// remaining budget, and so that a step of `decoding` sequences stays
     /// within SPEC_STEP_TOKENS.
     fn spec_len(&self, s: &Seq, decoding: usize) -> usize {
-        if self.draft.is_none() || s.todo().len() != 1 || s.json.is_some() || s.spec_pause > 0 {
+        let any = self.draft.is_some() || self.cfg.prompt_lookup;
+        if !any || s.todo().len() != 1 || s.json.is_some() || s.spec_pause > 0 {
             return 0;
         }
         let fit = (SPEC_STEP_TOKENS / decoding.max(1)).saturating_sub(1);
@@ -640,7 +687,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                 })
                 .collect();
             let need: usize = self.running.iter().zip(&takes).map(|(s, &t)| s.kv.blocks_needed(BLOCK_SIZE, t)).sum();
-            if self.cache.make_room(&mut self.pool.alloc, need) {
+            if self.cache.make_room(&mut self.pool, need) {
                 break;
             }
             // Out of blocks: pause the newest generation and recompute it later.
@@ -655,18 +702,39 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             s.spec_pause = s.spec_pause.saturating_sub(1);
         }
 
-        // Draft proposals. If the draft can't run (its pool is full), this
-        // step goes without: drafts only ever save work.
+        // Draft proposals: prompt lookup first (free), then the draft model
+        // for the rest. If the draft can't run (its pool is full), this step
+        // goes without: drafts only ever save work.
         let mut proposals: Vec<Proposal> = (0..self.running.len()).map(|_| Proposal::default()).collect();
         if spec.iter().any(|&k| k > 0) {
             let t = Instant::now();
-            match self.propose(&spec) {
-                Ok(p) => proposals = p,
-                Err(_) => {
-                    for i in 0..self.running.len() {
-                        let mut s = std::mem::take(&mut self.running[i].draft_kv);
-                        if let Some(d) = &mut self.draft {
-                            s.free(&mut d.alloc);
+            let mut model_spec = spec.clone();
+            if self.cfg.prompt_lookup {
+                for (i, s) in self.running.iter().enumerate() {
+                    if spec[i] > 0 {
+                        let p = Proposal::lookup(&s.tokens, spec[i]);
+                        if !p.tokens.is_empty() {
+                            model_spec[i] = 0;
+                            proposals[i] = p;
+                        }
+                    }
+                }
+            }
+            if self.draft.is_some() && model_spec.iter().any(|&k| k > 0) {
+                match self.propose(&model_spec) {
+                    Ok(p) => {
+                        for (i, p) in p.into_iter().enumerate() {
+                            if model_spec[i] > 0 {
+                                proposals[i] = p;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        for i in 0..self.running.len() {
+                            let mut s = std::mem::take(&mut self.running[i].draft_kv);
+                            if let Some(d) = &mut self.draft {
+                                s.free(&mut d.alloc);
+                            }
                         }
                     }
                 }
@@ -674,7 +742,8 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             for (i, p) in proposals.iter().enumerate() {
                 if spec[i] > 0 {
                     takes[i] = 1 + p.tokens.len();
-                    Metrics::add(&self.metrics.draft_tokens, p.tokens.len());
+                    let c = if p.lookup { &self.metrics.lookup_tokens } else { &self.metrics.draft_tokens };
+                    Metrics::add(c, p.tokens.len());
                 }
             }
             self.timing.draft += t.elapsed();
@@ -726,6 +795,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         // Logits rows are processed in place (no copies: a fresh 1 MB
         // buffer per token costs more in page faults than the argmax).
         let mut rest: &mut [f32] = &mut out;
+        let lookup: Vec<bool> = proposals.iter().map(|p| p.lookup).collect();
         let mut jobs: Vec<(usize, &mut [f32], Proposal)> = Vec::new();
         for (&i, &n) in active.iter().zip(&rows_of) {
             if n > 0 {
@@ -768,7 +838,8 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             if spec[i] > 0 && takes[i] > 1 {
                 // Keep the KV of the pending token and the accepted drafts;
                 // the draft cache keeps what it shares with them.
-                Metrics::add(&self.metrics.draft_accepted, kept);
+                let c = if lookup[i] { &self.metrics.lookup_accepted } else { &self.metrics.draft_accepted };
+                Metrics::add(c, kept);
                 let keep = start_of[i] + 1 + kept;
                 let s = &mut self.running[i];
                 s.spec_k = (kept + 1).min(self.cfg.draft_tokens);
@@ -884,7 +955,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
     fn run_embeds(&mut self) {
         while let Some(Job::Embed { inputs, reply }) = self.embeds.pop_front() {
             let longest = inputs.iter().map(Vec::len).max().unwrap_or(0);
-            if !self.cache.make_room(&mut self.pool.alloc, longest.div_ceil(BLOCK_SIZE)) {
+            if !self.cache.make_room(&mut self.pool, longest.div_ceil(BLOCK_SIZE)) {
                 if self.running.is_empty() {
                     let _ = reply.send(Err(format!("input needs more KV cache than the pool has ({longest} tokens)")));
                     continue;
@@ -1119,3 +1190,30 @@ impl LogSoftmax {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_proposes_what_followed_the_latest_match() {
+        // "1 2 3" occurs twice; the latest earlier occurrence wins.
+        let t = [1, 2, 3, 7, 8, 9, 1, 2, 3, 4, 5, 6, 1, 2, 3];
+        let p = Proposal::lookup(&t, 3);
+        assert_eq!(p.tokens, vec![4, 5, 6]);
+        assert!(p.lookup);
+        assert!(p.dists.iter().zip(&p.tokens).all(|(d, &t)| d.prob(t) == 1.0));
+        // Proposals stop at the end of the sequence.
+        assert_eq!(Proposal::lookup(&[5, 6, 5, 6], 4).tokens, vec![5, 6]);
+    }
+
+    #[test]
+    fn lookup_falls_back_to_shorter_tails() {
+        // The 4- and 3-token tails never occurred before; the 2-token tail did.
+        let t = [9, 4, 5, 0, 1, 2, 3, 4, 5];
+        assert_eq!(Proposal::lookup(&t, 2).tokens, vec![0, 1]);
+        // A single repeated token is not enough.
+        assert!(Proposal::lookup(&[1, 2, 3, 9, 4, 9], 2).tokens.is_empty());
+        assert!(Proposal::lookup(&[1], 2).tokens.is_empty());
+    }
+}

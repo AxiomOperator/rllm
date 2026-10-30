@@ -5,7 +5,8 @@
 use rllm_cuda::CudaBackend;
 use rllm_gguf::Gguf;
 use rllm_core::KvType;
-use rllm_model::{AnyModel, Generator};
+use rllm_kv::{PrefixCache, SeqKv};
+use rllm_model::{AnyModel, Generator, KvPool, StepItem, Want};
 
 /// Held by each test: they run one at a time. (Two backends recording
 /// CUDA graphs at once in one process disturb each other's decode steps;
@@ -132,6 +133,54 @@ fn q8_cache_tracks_f16() {
 }
 
 /// KL(p || q) of softmax(p_logits), softmax(q_logits), in nats.
+/// Prefix-cache blocks moved to the host tier and back hold exactly what
+/// they held: a prompt continued from restored blocks gives bit-identical
+/// logits to one continued from the original blocks, even after every
+/// device block was overwritten in between.
+#[test]
+fn host_tier_round_trip() {
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((b, g)) = setup() else { return };
+    let model = AnyModel::load(&b, &g).unwrap();
+    let vocab = rllm_model::Model::vocab_size(&model);
+    let mut q = tokens(200, vocab, 11);
+    q.extend(tokens(9, vocab, 12));
+    for kv in [KvType::F16, KvType::Q8] {
+        let mut pool = KvPool::new(&b, &model, 64 * 16, 16, kv).unwrap();
+        let block = rllm_model::Model::kv_block_bytes(&model, 16, kv);
+        assert_eq!(pool.add_host_tier(32 * block, kv).unwrap(), 32);
+        let mut cache = PrefixCache::default();
+        let mut s = SeqKv::default();
+        pool.step(&mut [StepItem { seq: &mut s, tokens: &q[..200], want: Want::Last }], false).unwrap();
+        cache.insert(&mut pool, &q[..200], s);
+        // Continue from the cached prefix (192 tokens, 12 blocks).
+        let continue_from_cache = |pool: &mut KvPool<_, _>, cache: &mut PrefixCache| {
+            let (n, blocks) = cache.lookup(pool, &q);
+            assert_eq!(n, 192);
+            let mut s = SeqKv::with_prefix(blocks, n);
+            let out = pool.step(&mut [StepItem { seq: &mut s, tokens: &q[n..], want: Want::All }], false).unwrap();
+            s.free(&mut pool.alloc);
+            out
+        };
+        let reference = continue_from_cache(&mut pool, &mut cache);
+        // Evict to the host, overwrite every device block, restore.
+        let all = pool.alloc.n_blocks();
+        assert!(cache.make_room(&mut pool, all));
+        assert_eq!((cache.len(), cache.host_len()), (0, 1));
+        let junk = tokens(all * 16, vocab, 13);
+        let mut s = SeqKv::default();
+        for part in junk.chunks(512) {
+            pool.step(&mut [StepItem { seq: &mut s, tokens: part, want: Want::None }], false).unwrap();
+        }
+        s.free(&mut pool.alloc);
+        let restored = continue_from_cache(&mut pool, &mut cache);
+        assert_eq!(cache.stats().restored, 12);
+        let diff = reference.iter().zip(&restored).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        assert_eq!(diff, 0, "{kv}: {diff} of {} logits differ after the round trip", reference.len());
+        cache.clear(&mut pool);
+    }
+}
+
 fn kl_divergence(p: &[f32], q: &[f32]) -> f64 {
     let log_softmax = |x: &[f32]| {
         let max = x.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v)) as f64;

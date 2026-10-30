@@ -209,6 +209,24 @@ impl<B: Backend> Model<B> for Qwen3<B> {
         Ok(b.alloc_kv(self.cfg.kv_layout(n_blocks, block_size, kv))?)
     }
 
+    type HostCache = B::HostKv;
+
+    fn kv_block_bytes(&self, block_size: usize, kv: KvType) -> usize {
+        self.cfg.kv_layout(1, block_size, kv).block_bytes()
+    }
+
+    fn alloc_host_cache(&self, b: &B, n_blocks: usize, block_size: usize, kv: KvType) -> Result<B::HostKv> {
+        Ok(b.alloc_host_kv(self.cfg.kv_layout(n_blocks, block_size, kv), n_blocks)?)
+    }
+
+    fn kv_to_host(&self, b: &B, cache: &B::KvCache, store: &mut B::HostKv, dev: &[u32], host: &[u32]) -> Result<()> {
+        Ok(b.kv_to_host(cache, store, dev, host)?)
+    }
+
+    fn kv_from_host(&self, b: &B, cache: &mut B::KvCache, store: &B::HostKv, host: &[u32], dev: &[u32]) -> Result<()> {
+        Ok(b.kv_from_host(cache, store, host, dev)?)
+    }
+
     fn forward(&self, b: &B, cache: &mut B::KvCache, batch: &Batch, block_size: usize) -> Result<Vec<f32>> {
         self.forward_impl(b, cache, batch, block_size)
     }

@@ -1,7 +1,6 @@
 use anyhow::Result;
 use rllm_core::{Backend, KvType};
-use rllm_kv::{BlockAllocator, SeqKv};
-
+use rllm_kv::{BlockAllocator, BlockStore, SeqKv};
 
 use crate::{Batch, Model};
 
@@ -34,6 +33,8 @@ pub struct KvPool<'m, B: Backend, M: Model<B>> {
     block_size: usize,
     /// Unique per pool (`Batch::cache_id`).
     id: u64,
+    /// Host tier for the prefix cache: host block storage and its allocator.
+    host: Option<(M::HostCache, BlockAllocator)>,
 }
 
 static NEXT_POOL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -43,7 +44,22 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
         let n_blocks = max_tokens.div_ceil(block_size);
         let kv = model.alloc_cache(backend, n_blocks, block_size, kv)?;
         let id = NEXT_POOL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Self { backend, model, kv, alloc: BlockAllocator::new(n_blocks, block_size), block_size, id })
+        Ok(Self { backend, model, kv, alloc: BlockAllocator::new(n_blocks, block_size), block_size, id, host: None })
+    }
+
+    /// Add a host tier of `bytes` (rounded down to whole blocks) that the
+    /// prefix cache moves evicted blocks to. Returns its size in blocks.
+    pub fn add_host_tier(&mut self, bytes: usize, kv: KvType) -> Result<usize> {
+        let n = bytes / self.model.kv_block_bytes(self.block_size, kv).max(1);
+        anyhow::ensure!(n > 0, "host cache smaller than one KV block");
+        let store = self.model.alloc_host_cache(self.backend, n, self.block_size, kv)?;
+        self.host = Some((store, BlockAllocator::new(n, self.block_size)));
+        Ok(n)
+    }
+
+    /// Host tier blocks: (total, free).
+    pub fn host_blocks(&self) -> Option<(usize, usize)> {
+        self.host.as_ref().map(|(_, a)| (a.n_blocks(), a.n_free()))
     }
 
     pub fn block_size(&self) -> usize {
@@ -100,6 +116,26 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
             return Ok(Vec::new());
         }
         Ok(out)
+    }
+}
+
+impl<B: Backend, M: Model<B>> BlockStore for KvPool<'_, B, M> {
+    fn device(&mut self) -> &mut BlockAllocator {
+        &mut self.alloc
+    }
+
+    fn host(&mut self) -> Option<&mut BlockAllocator> {
+        self.host.as_mut().map(|(_, a)| a)
+    }
+
+    fn to_host(&mut self, dev: &[u32], host: &[u32]) -> rllm_kv::Result<()> {
+        let (store, _) = self.host.as_mut().ok_or_else(|| rllm_kv::Error::Copy("no host tier".into()))?;
+        self.model.kv_to_host(self.backend, &self.kv, store, dev, host).map_err(|e| rllm_kv::Error::Copy(format!("{e:#}")))
+    }
+
+    fn to_device(&mut self, host: &[u32], dev: &[u32]) -> rllm_kv::Result<()> {
+        let (store, _) = self.host.as_ref().ok_or_else(|| rllm_kv::Error::Copy("no host tier".into()))?;
+        self.model.kv_from_host(self.backend, &mut self.kv, store, host, dev).map_err(|e| rllm_kv::Error::Copy(format!("{e:#}")))
     }
 }
 

@@ -164,6 +164,11 @@ pub struct Cache<B: Backend> {
     global: B::KvCache,
 }
 
+pub struct HostCache<B: Backend> {
+    swa: B::HostKv,
+    global: B::HostKv,
+}
+
 fn scalar_f32(g: &Gguf, name: &str) -> Result<Option<f32>> {
     let Some(info) = g.tensor(name) else { return Ok(None) };
     let t = host_tensor(g, &info.name)?;
@@ -173,6 +178,14 @@ fn scalar_f32(g: &Gguf, name: &str) -> Result<Option<f32>> {
 }
 
 impl<B: Backend> Gemma4<B> {
+    /// Sliding-window and global cache layouts (separate pools: their head
+    /// sizes differ). Both use the same block ids.
+    fn kv_layouts(&self, n_blocks: usize, block_size: usize, kv: KvType) -> [KvLayout; 2] {
+        let c = &self.cfg;
+        let layout = |n_layers, head_dim| KvLayout { n_layers, n_blocks, block_size, n_kv_heads: c.n_kv_heads, head_dim, dtype: kv };
+        [layout(self.n_swa_kv.max(1), c.head_dim_swa), layout(self.n_global_kv.max(1), c.head_dim_global)]
+    }
+
     pub fn load(backend: &B, g: &Gguf) -> Result<Self> {
         let cfg = Gemma4Config::from_gguf(g)?;
         let w = |name: &str| load_weight(backend, g, name);
@@ -405,12 +418,32 @@ impl<B: Backend> Model<B> for Gemma4<B> {
     type Cache = Cache<B>;
 
     fn alloc_cache(&self, b: &B, n_blocks: usize, block_size: usize, kv: KvType) -> Result<Cache<B>> {
-        let c = &self.cfg;
-        let layout = |n_layers, head_dim| KvLayout { n_layers, n_blocks, block_size, n_kv_heads: c.n_kv_heads, head_dim, dtype: kv };
+        let [swa, global] = self.kv_layouts(n_blocks, block_size, kv);
         Ok(Cache {
-            swa: b.alloc_kv(layout(self.n_swa_kv.max(1), c.head_dim_swa)).context("allocating sliding-window KV cache")?,
-            global: b.alloc_kv(layout(self.n_global_kv.max(1), c.head_dim_global)).context("allocating global KV cache")?,
+            swa: b.alloc_kv(swa).context("allocating sliding-window KV cache")?,
+            global: b.alloc_kv(global).context("allocating global KV cache")?,
         })
+    }
+
+    type HostCache = HostCache<B>;
+
+    fn kv_block_bytes(&self, block_size: usize, kv: KvType) -> usize {
+        self.kv_layouts(1, block_size, kv).iter().map(KvLayout::block_bytes).sum()
+    }
+
+    fn alloc_host_cache(&self, b: &B, n_blocks: usize, block_size: usize, kv: KvType) -> Result<HostCache<B>> {
+        let [swa, global] = self.kv_layouts(n_blocks, block_size, kv);
+        Ok(HostCache { swa: b.alloc_host_kv(swa, n_blocks)?, global: b.alloc_host_kv(global, n_blocks)? })
+    }
+
+    fn kv_to_host(&self, b: &B, cache: &Cache<B>, store: &mut HostCache<B>, dev: &[u32], host: &[u32]) -> Result<()> {
+        b.kv_to_host(&cache.swa, &mut store.swa, dev, host)?;
+        Ok(b.kv_to_host(&cache.global, &mut store.global, dev, host)?)
+    }
+
+    fn kv_from_host(&self, b: &B, cache: &mut Cache<B>, store: &HostCache<B>, host: &[u32], dev: &[u32]) -> Result<()> {
+        b.kv_from_host(&mut cache.swa, &store.swa, host, dev)?;
+        Ok(b.kv_from_host(&mut cache.global, &store.global, host, dev)?)
     }
 
     fn forward(&self, b: &B, cache: &mut Cache<B>, batch: &Batch, block_size: usize) -> Result<Vec<f32>> {

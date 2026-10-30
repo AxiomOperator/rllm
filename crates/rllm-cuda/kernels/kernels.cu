@@ -1173,6 +1173,18 @@ extern "C" __global__ void kv_store(const float* __restrict__ k, const float* __
     vc[dst] = f32_to_f16_bits(v[i]);
 }
 
+// Copy whole KV blocks: block i is `bytes` bytes from src + src_idx[i] *
+// src_stride to dst + dst_idx[i] * dst_stride. One side is a cache layer's
+// pool, the other mapped pinned host memory (the prefix cache's host tier),
+// so this one kernel moves blocks over PCIe in either direction.
+extern "C" __global__ void kv_copy_blocks(const unsigned char* __restrict__ src, unsigned char* __restrict__ dst,
+                                          const u32* __restrict__ src_idx, const u32* __restrict__ dst_idx,
+                                          long long src_stride, long long dst_stride, int bytes) {
+    const uint4* s = (const uint4*)(src + (long long)src_idx[blockIdx.x] * src_stride);
+    uint4* d = (uint4*)(dst + (long long)dst_idx[blockIdx.x] * dst_stride);
+    for (int i = threadIdx.x; i < bytes / 16; i += blockDim.x) d[i] = s[i];
+}
+
 // q8 version (keys rotated, see kv_rotate_q). One block per (token, KV head).
 extern "C" __global__ void kv_store_q8(const float* __restrict__ k, const float* __restrict__ v,
                                        const u32* __restrict__ slots, i8* kc, f16_bits* ksc, i8* vc, f16_bits* vsc,

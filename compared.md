@@ -40,7 +40,9 @@ where a number exists.
 | CUDA graphs for decode | ✓ | Steps of up to 8 tokens. |
 | Quantized matmuls with int8 activations | ✓ | MMQ (prefill) and dp4a matvec (decode), as in llama.cpp. |
 | 8-bit KV cache | ✓ | `--kv-type q8`, keys Hadamard-rotated as in llama.cpp. Perplexity +0.19% (llama.cpp q8_0: +0.21%). vLLM uses FP8 instead. |
-| Speculative decoding with a draft model | ✓ | Exact speculative sampling. vLLM also has EAGLE, MTP and n-gram drafting; see gaps. |
+| Speculative decoding with a draft model | ✓ | Exact speculative sampling. vLLM also has EAGLE and MTP; see gaps. |
+| Prompt lookup (n-gram) speculation | ✓ | `--prompt-lookup`: 2.6× on a code edit, unchanged on free text, output identical. |
+| Prefix cache tier in system RAM | ✓ | `--host-cache-gb`: evicted prefixes move to pinned RAM; time to first token on a 2.5k-token repeat 381 → 39 ms. vLLM: CPU offload / LMCache. llama.cpp: per-slot save/restore only. |
 | JSON mode and `json_schema` | ◐ | Structure is enforced token by token; value constraints (`pattern`, `minimum`, `minLength`, …) are not. |
 | Tool calling, including `required` and named tools | ✓ | Calls are constrained to the tools' schemas. Hermes/Qwen and Gemma 4 formats only. |
 | Reasoning output (`reasoning_content`) | ✓ | `reasoning_effort` switches thinking on or off. |
@@ -108,14 +110,14 @@ Ordered roughly by how much each one limits what rllm can serve.
 | Partial GPU offload (model bigger than VRAM) | ✓ `-ngl` | ◐ CPU offload | The whole model must fit on one GPU. |
 | FP8 compute and KV cache | ✗ | ✓ | Phase 4 (FP8 on Ada). |
 | Several models per server | ✓ router mode | ◐ one per process | One model per `rllm serve`. |
-| KV offload, disaggregated prefill/decode | ✗ | ✓ (LMCache, connectors) | |
+| Disaggregated prefill/decode, KV offload to disk or other machines | ✗ | ✓ (LMCache, connectors) | rllm offloads to system RAM only (see Feature parity). |
 
 ### Serving and decoding
 
 | Gap | llama.cpp | vLLM | Notes |
 |---|---|---|---|
 | Throughput at very high concurrency | ◐ | ✓ | Not benchmarked against vLLM yet. rllm's graph-replayed steps hold up to 8 tokens, and `--parallel` defaults to 4. The Phase 2 exit criterion (concurrency 16/32/64 vs vLLM) is still open. |
-| Draft-free speculation (EAGLE, MTP, n-gram) | ◐ n-gram | ✓ | rllm only supports a separate draft model with the same tokenizer. |
+| Learned draft heads (EAGLE, MTP) | ✗ | ✓ | rllm has a separate draft model and prompt lookup (n-gram). |
 | Prefix cache for the draft model | ✓ | ✓ | rllm's draft re-reads each request's whole prompt. |
 | Speculation in the CLI | ✓ | n/a | `rllm run` has no `--draft`; only the server does. |
 | Grammars and regex (GBNF, regex, full JSON Schema) | ✓ GBNF | ✓ xgrammar, guidance | rllm enforces JSON structure only, not value constraints. |

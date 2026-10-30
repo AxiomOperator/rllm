@@ -76,6 +76,15 @@ enum Cmd {
         /// Most tokens the draft model proposes per step.
         #[arg(long, default_value_t = 5)]
         draft_tokens: usize,
+        /// Speculative decoding without a draft model: propose the tokens that
+        /// followed the latest few tokens' earlier occurrence in the prompt or
+        /// output. Helps when output copies input (code edits, quoting, RAG).
+        #[arg(long)]
+        prompt_lookup: bool,
+        /// Keep evicted prefix-cache blocks in this much pinned system memory
+        /// (GiB) and copy them back on a hit instead of recomputing.
+        #[arg(long, default_value_t = 0.0)]
+        host_cache_gb: f64,
         /// Save stored chat completions and responses to this JSON file (loaded at start).
         #[arg(long)]
         store_file: Option<PathBuf>,
@@ -225,6 +234,8 @@ fn main() -> Result<()> {
             kv_type,
             draft,
             draft_tokens,
+            prompt_lookup,
+            host_cache_gb,
             store_file,
             quiet,
         } => {
@@ -243,6 +254,8 @@ fn main() -> Result<()> {
                 kv_type,
                 draft,
                 draft_tokens,
+                prompt_lookup,
+                host_cache_bytes: (host_cache_gb.max(0.0) * (1u64 << 30) as f64) as usize,
                 store_file,
                 log: !quiet,
             };

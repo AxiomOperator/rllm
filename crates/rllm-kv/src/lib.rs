@@ -8,6 +8,8 @@
 pub enum Error {
     #[error("KV cache out of blocks (need {need}, have {free})")]
     OutOfBlocks { need: usize, free: usize },
+    #[error("KV block copy: {0}")]
+    Copy(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -41,6 +43,11 @@ impl BlockAllocator {
         let b = self.free.pop()?;
         self.refcount[b as usize] = 1;
         Some(b)
+    }
+
+    /// Allocate `n` blocks (one reference each), or none if fewer are free.
+    pub fn alloc_n(&mut self, n: usize) -> Option<Vec<u32>> {
+        (n <= self.free.len()).then(|| (0..n).map(|_| self.alloc().expect("checked above")).collect())
     }
 
     /// Add a reference to an allocated block (prefix sharing).
@@ -120,127 +127,298 @@ impl SeqKv {
     }
 }
 
+/// Where cached blocks live, for [`PrefixCache`]: the device pool, and
+/// optionally a host tier (pinned system memory) that evicted entries move to
+/// instead of being dropped.
+pub trait BlockStore {
+    fn device(&mut self) -> &mut BlockAllocator;
+
+    /// The host tier's allocator, if there is one.
+    fn host(&mut self) -> Option<&mut BlockAllocator> {
+        None
+    }
+
+    /// Copy device blocks `dev[i]` to host blocks `host[i]`.
+    fn to_host(&mut self, dev: &[u32], host: &[u32]) -> Result<()> {
+        let _ = (dev, host);
+        Err(Error::Copy("no host tier".into()))
+    }
+
+    /// Copy host blocks `host[i]` to device blocks `dev[i]`.
+    fn to_device(&mut self, host: &[u32], dev: &[u32]) -> Result<()> {
+        let _ = (host, dev);
+        Err(Error::Copy("no host tier".into()))
+    }
+}
+
+/// A plain device pool, without a host tier.
+impl BlockStore for BlockAllocator {
+    fn device(&mut self) -> &mut BlockAllocator {
+        self
+    }
+}
+
 /// Finished sequences kept for reuse: a later request whose tokens start
 /// with the same prefix shares their full blocks instead of recomputing them.
 ///
 /// Only whole blocks are shared, so a sharing sequence never writes into a
 /// block someone else reads. Entries hold one reference to each of their
 /// blocks; they are evicted least-recently-used first when blocks run out.
+///
+/// With a host tier ([`BlockStore::host`]), an evicted entry is copied to
+/// host blocks instead of dropped, and a later lookup that matches it
+/// further than anything on the device copies it back: a copy over PCIe
+/// instead of recomputing the prefix. Host entries are evicted LRU in turn.
 #[derive(Default)]
 pub struct PrefixCache {
     entries: Vec<Entry>,
     clock: u64,
+    stats: TierStats,
 }
 
 struct Entry {
     tokens: Vec<u32>,
+    /// Device block ids, or host block ids if `on_host`.
     blocks: Vec<u32>,
     used: u64,
+    on_host: bool,
+}
+
+/// Host tier activity since start.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TierStats {
+    /// Blocks copied to the host.
+    pub offloaded: usize,
+    /// Blocks copied back to the device.
+    pub restored: usize,
 }
 
 impl PrefixCache {
-    /// Upper bound on entries; beyond it the oldest is evicted on insert.
+    /// Upper bound on device entries; beyond it the oldest is evicted on insert.
     const MAX_ENTRIES: usize = 256;
+    /// Upper bound on host entries (lookups scan every entry).
+    const MAX_HOST_ENTRIES: usize = 2048;
 
+    /// Entries on the device.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.iter().filter(|e| !e.on_host).count()
     }
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// Blocks held by the cache (some may also be in use by sequences).
+    /// Device blocks held by the cache (some may also be in use by sequences).
     pub fn n_blocks(&self) -> usize {
-        self.entries.iter().map(|e| e.blocks.len()).sum()
+        self.entries.iter().filter(|e| !e.on_host).map(|e| e.blocks.len()).sum()
+    }
+
+    /// Entries in the host tier.
+    pub fn host_len(&self) -> usize {
+        self.entries.iter().filter(|e| e.on_host).count()
+    }
+
+    /// Host blocks held by the cache.
+    pub fn host_blocks(&self) -> usize {
+        self.entries.iter().filter(|e| e.on_host).map(|e| e.blocks.len()).sum()
+    }
+
+    pub fn stats(&self) -> TierStats {
+        self.stats
+    }
+
+    fn touch(&mut self, i: usize) {
+        self.clock += 1;
+        self.entries[i].used = self.clock;
     }
 
     /// The longest cached block-aligned prefix of `tokens`, leaving at least
     /// one token to compute (the model needs it for the next logits).
     /// Takes a reference to each returned block. Returns (tokens covered, blocks).
-    pub fn lookup(&mut self, alloc: &mut BlockAllocator, tokens: &[u32]) -> (usize, Vec<u32>) {
-        let bs = alloc.block_size();
+    pub fn lookup(&mut self, store: &mut impl BlockStore, tokens: &[u32]) -> (usize, Vec<u32>) {
+        let bs = store.device().block_size();
         let limit = tokens.len().saturating_sub(1) / bs;
-        let mut best: Option<(usize, usize)> = None;
+        // Best match on the device and on the host: (entry, blocks).
+        let mut best: [Option<(usize, usize)>; 2] = [None, None];
         for (i, e) in self.entries.iter().enumerate() {
             let common = e.tokens.iter().zip(tokens).take_while(|(a, b)| a == b).count();
             let n = (common / bs).min(limit).min(e.blocks.len());
-            if n > 0 && best.is_none_or(|(_, m)| n > m) {
-                best = Some((i, n));
+            let b = &mut best[e.on_host as usize];
+            if n > 0 && b.is_none_or(|(_, m)| n > m) {
+                *b = Some((i, n));
             }
         }
-        let Some((i, n)) = best else {
+        let on_device = best[0].map_or(0, |b| b.1);
+        if let Some((i, n)) = best[1]
+            && n > on_device
+            && let Some(hit) = self.restore(store, i, n)
+        {
+            return hit;
+        }
+        let Some((i, n)) = best[0] else {
             return (0, Vec::new());
         };
-        self.clock += 1;
-        self.entries[i].used = self.clock;
+        self.touch(i);
         let blocks = self.entries[i].blocks[..n].to_vec();
         for &b in &blocks {
-            alloc.share(b);
+            store.device().share(b);
         }
         (n * bs, blocks)
     }
 
+    /// Copy the first `n` blocks of host entry `i` back to the device as a
+    /// device entry, and share them with the caller. None if there isn't
+    /// room on the device or the copy fails.
+    fn restore(&mut self, store: &mut impl BlockStore, i: usize, n: usize) -> Option<(usize, Vec<u32>)> {
+        let bs = store.device().block_size();
+        // Out of the list while making room, so evictions can't touch it.
+        let mut e = self.entries.swap_remove(i);
+        self.clock += 1;
+        e.used = self.clock;
+        let dev = if self.make_room(store, n) { store.device().alloc_n(n) } else { None };
+        let Some(dev) = dev else {
+            self.entries.push(e);
+            return None;
+        };
+        if store.to_device(&e.blocks[..n], &dev).is_err() {
+            dev.into_iter().for_each(|b| store.device().release(b));
+            self.entries.push(e);
+            return None;
+        }
+        self.stats.restored += n;
+        let tokens = e.tokens[..n * bs].to_vec();
+        if n == e.blocks.len() {
+            // The device now has all of it.
+            let host = store.host().expect("host entries need a host tier");
+            e.blocks.into_iter().for_each(|b| host.release(b));
+        } else {
+            self.entries.push(e);
+        }
+        self.add_device(store, tokens, dev.clone());
+        for &b in &dev {
+            store.device().share(b);
+        }
+        Some((n * bs, dev))
+    }
+
     /// Retire a sequence whose cache holds `tokens` (`seq.len == tokens.len()`).
     /// Its full blocks join the cache; the partial last block is released.
-    pub fn insert(&mut self, alloc: &mut BlockAllocator, tokens: &[u32], mut seq: SeqKv) {
-        let bs = alloc.block_size();
+    pub fn insert(&mut self, store: &mut impl BlockStore, tokens: &[u32], mut seq: SeqKv) {
+        let bs = store.device().block_size();
         let full = seq.len.min(tokens.len()) / bs;
         for b in seq.block_table.drain(full..) {
-            alloc.release(b);
+            store.device().release(b);
         }
         if full == 0 {
             return;
         }
         let tokens = &tokens[..full * bs];
-        // An existing entry that already covers this one: keep it instead.
-        if let Some(e) = self.entries.iter_mut().find(|e| e.tokens.starts_with(tokens)) {
-            self.clock += 1;
-            e.used = self.clock;
+        // An existing device entry that already covers this one: keep it instead.
+        if let Some(i) = self.entries.iter().position(|e| !e.on_host && e.tokens.starts_with(tokens)) {
+            self.touch(i);
             for b in seq.block_table.drain(..) {
-                alloc.release(b);
+                store.device().release(b);
             }
             return;
         }
-        // Entries this one extends are now redundant.
+        if self.len() >= Self::MAX_ENTRIES {
+            self.evict(store);
+        }
+        self.add_device(store, tokens.to_vec(), std::mem::take(&mut seq.block_table));
+    }
+
+    /// Add a device entry, dropping the entries (either tier) it extends.
+    fn add_device(&mut self, store: &mut impl BlockStore, tokens: Vec<u32>, blocks: Vec<u32>) {
+        self.drop_extended(store, &tokens);
+        self.clock += 1;
+        self.entries.push(Entry { tokens, blocks, used: self.clock, on_host: false });
+    }
+
+    /// Drop entries whose tokens are a prefix of `tokens`: redundant once
+    /// `tokens` is cached.
+    fn drop_extended(&mut self, store: &mut impl BlockStore, tokens: &[u32]) {
         let mut i = 0;
         while i < self.entries.len() {
             if tokens.starts_with(&self.entries[i].tokens) {
                 let e = self.entries.swap_remove(i);
-                e.blocks.into_iter().for_each(|b| alloc.release(b));
+                Self::release(store, e);
             } else {
                 i += 1;
             }
         }
-        if self.entries.len() >= Self::MAX_ENTRIES {
-            self.evict(alloc);
-        }
-        self.clock += 1;
-        self.entries.push(Entry { tokens: tokens.to_vec(), blocks: std::mem::take(&mut seq.block_table), used: self.clock });
     }
 
-    /// Drop the least recently used entry. False if the cache is empty.
-    pub fn evict(&mut self, alloc: &mut BlockAllocator) -> bool {
-        let Some(i) = self.entries.iter().enumerate().min_by_key(|(_, e)| e.used).map(|(i, _)| i) else {
+    fn release(store: &mut impl BlockStore, e: Entry) {
+        if e.on_host {
+            let host = store.host().expect("host entries need a host tier");
+            e.blocks.into_iter().for_each(|b| host.release(b));
+        } else {
+            e.blocks.into_iter().for_each(|b| store.device().release(b));
+        }
+    }
+
+    /// Free the least recently used device entry's blocks, moving it to the
+    /// host tier if there is one. False if no device entry is left.
+    pub fn evict(&mut self, store: &mut impl BlockStore) -> bool {
+        let lru = self.entries.iter().enumerate().filter(|(_, e)| !e.on_host).min_by_key(|(_, e)| e.used).map(|(i, _)| i);
+        let Some(i) = lru else {
             return false;
         };
         let e = self.entries.swap_remove(i);
-        e.blocks.into_iter().for_each(|b| alloc.release(b));
+        self.offload(store, &e);
+        Self::release(store, e);
         true
     }
 
-    /// Evict until `need` blocks are free (or the cache is empty).
-    pub fn make_room(&mut self, alloc: &mut BlockAllocator, need: usize) -> bool {
-        while alloc.n_free() < need {
-            if !self.evict(alloc) {
+    /// Copy a device entry into the host tier (if there is one, it fits,
+    /// and the host doesn't already hold it).
+    fn offload(&mut self, store: &mut impl BlockStore, e: &Entry) {
+        let n = e.blocks.len();
+        let Some(capacity) = store.host().map(|h| h.n_blocks()) else { return };
+        if n > capacity || self.entries.iter().any(|h| h.on_host && h.tokens.starts_with(&e.tokens)) {
+            return;
+        }
+        while store.host().unwrap().n_free() < n || self.host_len() >= Self::MAX_HOST_ENTRIES {
+            let lru = self.entries.iter().enumerate().filter(|(_, h)| h.on_host).min_by_key(|(_, h)| h.used).map(|(i, _)| i);
+            let Some(j) = lru else { return };
+            let h = self.entries.swap_remove(j);
+            Self::release(store, h);
+        }
+        let host = store.host().unwrap().alloc_n(n).expect("checked above");
+        if store.to_host(&e.blocks, &host).is_err() {
+            let h = store.host().unwrap();
+            host.into_iter().for_each(|b| h.release(b));
+            return;
+        }
+        self.stats.offloaded += n;
+        // Host entries this one extends are redundant now.
+        let mut j = 0;
+        while j < self.entries.len() {
+            if self.entries[j].on_host && e.tokens.starts_with(&self.entries[j].tokens) {
+                let h = self.entries.swap_remove(j);
+                Self::release(store, h);
+            } else {
+                j += 1;
+            }
+        }
+        self.entries.push(Entry { tokens: e.tokens.clone(), blocks: host, used: e.used, on_host: true });
+    }
+
+    /// Evict until `need` device blocks are free (or nothing is left to evict).
+    pub fn make_room(&mut self, store: &mut impl BlockStore, need: usize) -> bool {
+        while store.device().n_free() < need {
+            if !self.evict(store) {
                 return false;
             }
         }
         true
     }
 
-    pub fn clear(&mut self, alloc: &mut BlockAllocator) {
-        while self.evict(alloc) {}
+    /// Drop every entry, in both tiers.
+    pub fn clear(&mut self, store: &mut impl BlockStore) {
+        for e in std::mem::take(&mut self.entries) {
+            Self::release(store, e);
+        }
     }
 }
 
@@ -335,5 +513,128 @@ mod tests {
         assert_eq!(pc.n_blocks(), 3);
         pc.clear(&mut a);
         assert_eq!(a.n_free(), 8);
+    }
+
+    /// A device pool and host tier whose blocks hold a payload, so tests can
+    /// check that the right data moves.
+    struct TwoTier {
+        dev: BlockAllocator,
+        host: BlockAllocator,
+        dev_data: Vec<u32>,
+        host_data: Vec<u32>,
+    }
+
+    impl TwoTier {
+        fn new(dev: usize, host: usize, bs: usize) -> Self {
+            Self { dev: BlockAllocator::new(dev, bs), host: BlockAllocator::new(host, bs), dev_data: vec![0; dev], host_data: vec![0; host] }
+        }
+
+        /// A sequence holding `tokens`; each block's payload is its first token.
+        fn seq(&mut self, tokens: &[u32]) -> SeqKv {
+            let mut s = SeqKv::default();
+            s.append(&mut self.dev, tokens.len()).unwrap();
+            let bs = self.dev.block_size();
+            for (j, &b) in s.block_table.iter().enumerate() {
+                self.dev_data[b as usize] = tokens[j * bs];
+            }
+            s
+        }
+    }
+
+    impl BlockStore for TwoTier {
+        fn device(&mut self) -> &mut BlockAllocator {
+            &mut self.dev
+        }
+        fn host(&mut self) -> Option<&mut BlockAllocator> {
+            Some(&mut self.host)
+        }
+        fn to_host(&mut self, dev: &[u32], host: &[u32]) -> Result<()> {
+            for (&d, &h) in dev.iter().zip(host) {
+                self.host_data[h as usize] = self.dev_data[d as usize];
+            }
+            Ok(())
+        }
+        fn to_device(&mut self, host: &[u32], dev: &[u32]) -> Result<()> {
+            for (&h, &d) in host.iter().zip(dev) {
+                self.dev_data[d as usize] = self.host_data[h as usize];
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn host_tier_keeps_evicted_prefixes() {
+        let mut st = TwoTier::new(4, 8, 2);
+        let mut pc = PrefixCache::default();
+        let a: Vec<u32> = (10..16).collect(); // 3 blocks
+        let s = st.seq(&a);
+        pc.insert(&mut st, &a, s);
+        // Room for 3 more blocks: `a` moves to the host.
+        assert!(pc.make_room(&mut st, 3));
+        assert_eq!((pc.len(), pc.host_len(), pc.host_blocks()), (0, 1, 3));
+        assert_eq!(st.dev.n_free(), 4);
+
+        // A prompt continuing `a` gets its blocks back, with their data.
+        let mut q = a.clone();
+        q.extend([99, 98]);
+        let (n, blocks) = pc.lookup(&mut st, &q);
+        assert_eq!(n, 6);
+        let payload: Vec<u32> = blocks.iter().map(|&b| st.dev_data[b as usize]).collect();
+        assert_eq!(payload, vec![10, 12, 14]);
+        // Restored whole: back on the device, gone from the host.
+        assert_eq!((pc.len(), pc.host_len(), st.host.n_free()), (1, 0, 8));
+        assert_eq!(pc.stats().offloaded, 3);
+        assert_eq!(pc.stats().restored, 3);
+        blocks.into_iter().for_each(|b| st.dev.release(b));
+        pc.clear(&mut st);
+        assert_eq!((st.dev.n_free(), st.host.n_free()), (4, 8));
+    }
+
+    #[test]
+    fn host_tier_restores_partial_matches_and_evicts_lru() {
+        let mut st = TwoTier::new(4, 4, 2);
+        let mut pc = PrefixCache::default();
+        let a: Vec<u32> = (0..6).collect();
+        let b: Vec<u32> = (100..104).collect();
+        for t in [&a, &b] {
+            let s = st.seq(t);
+            pc.insert(&mut st, t, s);
+            assert!(pc.make_room(&mut st, 4));
+        }
+        // The host holds 4 blocks: `b` (2) arrived last and pushed out `a` (3).
+        assert_eq!((pc.host_len(), pc.host_blocks()), (1, 2));
+        let s = st.seq(&a);
+        pc.insert(&mut st, &a, s);
+        assert!(pc.make_room(&mut st, 4));
+        // Now `a` is in and `b` (LRU) is out.
+        assert_eq!((pc.host_len(), pc.host_blocks()), (1, 3));
+
+        // Matching only `a`'s first block restores that block alone; the
+        // host keeps the whole entry.
+        let (n, blocks) = pc.lookup(&mut st, &[0, 1, 7, 7]);
+        assert_eq!(n, 2);
+        assert_eq!(st.dev_data[blocks[0] as usize], 0);
+        assert_eq!((pc.len(), pc.host_len()), (1, 1));
+        blocks.into_iter().for_each(|b| st.dev.release(b));
+        // Evicting the restored block again: the host already covers it.
+        assert!(pc.make_room(&mut st, 4));
+        assert_eq!((pc.len(), pc.host_len(), pc.stats().offloaded), (0, 1, 8));
+    }
+
+    #[test]
+    fn device_hits_win_over_equal_host_hits() {
+        let mut st = TwoTier::new(8, 8, 2);
+        let mut pc = PrefixCache::default();
+        let a: Vec<u32> = (0..4).collect();
+        let s = st.seq(&a);
+        pc.insert(&mut st, &a, s);
+        assert!(pc.make_room(&mut st, 8));
+        let s = st.seq(&a);
+        pc.insert(&mut st, &a, s);
+        // Same prefix in both tiers: no copy.
+        let (n, blocks) = pc.lookup(&mut st, &[0, 1, 2, 3, 4]);
+        assert_eq!(n, 4);
+        assert_eq!(pc.stats().restored, 0);
+        blocks.into_iter().for_each(|b| st.dev.release(b));
     }
 }

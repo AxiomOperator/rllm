@@ -29,6 +29,15 @@ pub struct Metrics {
     /// model accepted.
     pub draft_tokens: AtomicU64,
     pub draft_accepted: AtomicU64,
+    /// Prompt lookup: tokens proposed and accepted.
+    pub lookup_tokens: AtomicU64,
+    pub lookup_accepted: AtomicU64,
+    /// Prefix cache host tier.
+    pub host_blocks_total: AtomicU64,
+    pub host_blocks_free: AtomicU64,
+    pub host_cache_entries: AtomicU64,
+    pub host_offloaded_blocks: AtomicU64,
+    pub host_restored_blocks: AtomicU64,
     pub steps: AtomicU64,
     pub step_tokens: AtomicU64,
     /// Time spent in forward passes and sampling, microseconds.
@@ -72,6 +81,13 @@ impl Metrics {
         one("preemptions_total", "counter", "Generations paused to free KV blocks.", get(&self.preemptions) as f64);
         one("draft_tokens_total", "counter", "Tokens proposed by the draft model.", get(&self.draft_tokens) as f64);
         one("draft_tokens_accepted_total", "counter", "Draft tokens the model accepted.", get(&self.draft_accepted) as f64);
+        one("lookup_tokens_total", "counter", "Tokens proposed by prompt lookup.", get(&self.lookup_tokens) as f64);
+        one("lookup_tokens_accepted_total", "counter", "Prompt lookup tokens the model accepted.", get(&self.lookup_accepted) as f64);
+        one("kv_host_blocks_total", "gauge", "Host tier blocks (pinned system memory).", get(&self.host_blocks_total) as f64);
+        one("kv_host_blocks_free", "gauge", "Free host tier blocks.", get(&self.host_blocks_free) as f64);
+        one("prefix_cache_host_entries", "gauge", "Cached prompt prefixes in the host tier.", get(&self.host_cache_entries) as f64);
+        one("kv_offloaded_blocks_total", "counter", "KV blocks copied to the host tier.", get(&self.host_offloaded_blocks) as f64);
+        one("kv_restored_blocks_total", "counter", "KV blocks copied back from the host tier.", get(&self.host_restored_blocks) as f64);
         one("engine_steps_total", "counter", "Forward passes.", get(&self.steps) as f64);
         one("engine_step_tokens_total", "counter", "Tokens processed by forward passes.", get(&self.step_tokens) as f64);
         one("engine_busy_seconds_total", "counter", "Time spent in forward passes and sampling.", get(&self.busy_us) as f64 / 1e6);

@@ -12,6 +12,7 @@ rllm-gguf = { path = "crates/rllm-gguf" }
 rllm-core = { path = "crates/rllm-core" }
 rllm-cpu = { path = "crates/rllm-cpu" }
 rllm-cuda = { path = "crates/rllm-cuda" }
+rllm-hip = { path = "crates/rllm-hip" }
 rllm-kv = { path = "crates/rllm-kv" }
 rllm-model = { path = "crates/rllm-model" }
 rllm-tokenizer = { path = "crates/rllm-tokenizer" }

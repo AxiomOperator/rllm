@@ -12,8 +12,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Args;
-use rllm_core::KvType;
-use rllm_cuda::{CudaBackend, DeviceInfo};
+use rllm_core::{Backend, KvType};
+use rllm_cuda::CudaBackend;
+use rllm_hip::HipBackend;
 use rllm_gguf::Gguf;
 use rllm_kv::SeqKv;
 use rllm_model::{AnyModel, KvPool, Model, ModelProfile, StepItem, Want};
@@ -35,7 +36,7 @@ const PREFILL_CHUNK: usize = 512;
 #[derive(Args)]
 pub struct TuneArgs {
     model: PathBuf,
-    /// `cuda`, `cuda:N` or `cpu` (default: the GPU with the most free memory).
+    /// `cpu`, `gpu[:N]`, `cuda[:N]` or `hip[:N]` (default: the GPU with the most free memory).
     #[arg(short, long)]
     device: Option<String>,
     /// Context to plan for, in tokens (default: the model's, up to 32768).
@@ -60,9 +61,60 @@ pub struct TuneArgs {
     json: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuKind {
+    Cuda,
+    Hip,
+}
+
+/// A GPU of either vendor (rllm_cuda's or rllm_hip's `DeviceInfo`).
+#[derive(Debug, Clone)]
+struct Gpu {
+    kind: GpuKind,
+    ordinal: usize,
+    name: String,
+    arch: String,
+    sms: usize,
+    total_bytes: usize,
+    free_bytes: usize,
+    integrated: bool,
+}
+
+macro_rules! gpus {
+    ($kind:expr, $devices:expr) => {
+        $devices.into_iter().map(|d| Gpu {
+            kind: $kind,
+            ordinal: d.ordinal,
+            name: d.name,
+            arch: d.arch,
+            sms: d.sms,
+            total_bytes: d.total_bytes,
+            free_bytes: d.free_bytes,
+            integrated: d.integrated,
+        })
+    };
+}
+
+impl Gpu {
+    /// Its `-d` value.
+    fn device(&self) -> String {
+        let kind = match self.kind {
+            GpuKind::Cuda => "cuda",
+            GpuKind::Hip => "hip",
+        };
+        if self.ordinal == 0 { kind.into() } else { format!("{kind}:{}", self.ordinal) }
+    }
+
+    /// Memory rllm may plan to use. An integrated GPU's free memory is also
+    /// the system's, so leave 8 GiB of RAM for everything else.
+    fn usable_bytes(&self, ram_available: usize) -> usize {
+        if self.integrated { self.free_bytes.min(ram_available.saturating_sub(8 << 30)) } else { self.free_bytes }
+    }
+}
+
 /// The machine, as far as sizing is concerned.
 struct Machine {
-    gpu: Option<DeviceInfo>,
+    gpu: Option<Gpu>,
     ram_total: usize,
     ram_available: usize,
     cpu: String,
@@ -164,16 +216,17 @@ fn plan(m: &ModelProfile, draft: Option<&Draft>, mach: &Machine, want_ctx: Optio
         p.parallel = p.parallel.min(2);
         p.kv_tokens = p.ctx * p.parallel;
         p.prompt_lookup = false;
-        p.warnings.push("No CUDA GPU found: the CPU backend is rllm's correctness reference, not tuned for speed (a few tokens/s on 7B models).".into());
+        p.warnings.push("No GPU found: the CPU backend is rllm's correctness reference, not tuned for speed (a few tokens/s on 7B models).".into());
         return p;
     };
-    p.device = if gpu.ordinal == 0 { "cuda".into() } else { format!("cuda:{}", gpu.ordinal) };
+    p.device = gpu.device();
+    let free = gpu.usable_bytes(mach.ram_available);
 
     // Draft model: only when it is much smaller than the target, and not for
     // busy servers (speculation pauses once 5 requests decode together).
     let busy = want_parallel.is_some_and(|n| n > 4);
     let draft = draft.filter(|d| d.profile.weight_bytes * 4 <= m.weight_bytes && !busy);
-    let margin = (512 * MIB).max(gpu.free_bytes * 4 / 100);
+    let margin = (512 * MIB).max(free * 4 / 100);
     // The draft only drafts for sequences up to DRAFT_MAX_CONTEXT tokens, so
     // its runtime buffers and (capped) KV pool don't grow with the context.
     let draft_bytes = |kv| {
@@ -187,7 +240,7 @@ fn plan(m: &ModelProfile, draft: Option<&Draft>, mach: &Machine, want_ctx: Optio
         device_weights(m) + runtime_overhead(m, kv, ctx) + margin + if with_draft { draft_bytes(kv) } else { 0 }
     };
     let per_token = |kv| m.kv_bytes_per_token(kv);
-    let tokens = |kv, ctx, with_draft| gpu.free_bytes.saturating_sub(fixed(kv, ctx, with_draft)) / per_token(kv) / 1024 * 1024;
+    let tokens = |kv, ctx, with_draft| free.saturating_sub(fixed(kv, ctx, with_draft)) / per_token(kv) / 1024 * 1024;
 
     // q8 halves the cache and decodes faster from about 8k tokens of
     // context (measured on Qwen3-8B and Nemotron); f16 stays for short
@@ -222,7 +275,7 @@ fn plan(m: &ModelProfile, draft: Option<&Draft>, mach: &Machine, want_ctx: Optio
             "Only {} tokens of KV cache fit: the model needs about {:.1} GiB of weights and runtime memory, and {:.1} GiB is free. Use a smaller quantization or free GPU memory.",
             kv_tokens,
             fixed(p.kv_type, p.ctx, false) as f64 / GIB,
-            gpu.free_bytes as f64 / GIB
+            free as f64 / GIB
         ));
         p.ctx = kv_tokens.max(BLOCK);
         p.parallel = 1;
@@ -234,7 +287,7 @@ fn plan(m: &ModelProfile, draft: Option<&Draft>, mach: &Machine, want_ctx: Optio
     }
     p.kv_tokens = kv_tokens;
     p.memory = Some([
-        gpu.free_bytes,
+        free,
         device_weights(m),
         if with_draft { draft_bytes(p.kv_type) } else { 0 },
         runtime_overhead(m, p.kv_type, p.ctx),
@@ -277,7 +330,9 @@ fn plan(m: &ModelProfile, draft: Option<&Draft>, mach: &Machine, want_ctx: Optio
     let pool_bytes = kv_tokens * m.kv_bytes_per_token(p.kv_type);
     let share = (mach.ram_available / 4).min(4 * pool_bytes).min(64 << 30);
     let gb = (share as f64 / GIB).floor() as usize;
-    if gb >= 1 && mach.ram_available.saturating_sub(gb << 30) >= 8 << 30 {
+    if gpu.integrated {
+        p.reasons.push("No --host-cache-gb: the GPU shares system RAM, so a host tier would only move KV within the same memory.".into());
+    } else if gb >= 1 && mach.ram_available.saturating_sub(gb << 30) >= 8 << 30 {
         p.host_cache_gb = gb;
         p.reasons.push(format!(
             "--host-cache-gb {gb}: evicted prompt prefixes ({} tokens' worth) wait in system RAM instead of being recomputed; {:.0} GiB stays available.",
@@ -292,14 +347,20 @@ fn plan(m: &ModelProfile, draft: Option<&Draft>, mach: &Machine, want_ctx: Optio
 }
 
 fn read_machine(device: Option<&str>) -> Result<Machine> {
-    let gpus = rllm_cuda::probe_devices();
-    let gpu = match device {
-        Some("cpu") => None,
-        Some(d) => {
-            let ord = if d == "cuda" { 0 } else { d.strip_prefix("cuda:").and_then(|n| n.parse().ok()).context("device must be cpu, cuda or cuda:N")? };
-            Some(gpus.iter().find(|g| g.ordinal == ord).cloned().with_context(|| format!("no CUDA device {ord}"))?)
+    let probe = |kind| -> Vec<Gpu> {
+        match kind {
+            GpuKind::Cuda => gpus!(kind, rllm_cuda::probe_devices()).collect(),
+            GpuKind::Hip => gpus!(kind, rllm_hip::probe_devices()).collect(),
         }
-        None => gpus.iter().max_by_key(|g| g.free_bytes).cloned(),
+    };
+    let find = |kind, ord: usize| -> Result<Gpu> {
+        probe(kind).into_iter().find(|g| g.ordinal == ord).with_context(|| format!("no {kind:?} device {ord}"))
+    };
+    let gpu = match device.map(crate::Device::parse).transpose()? {
+        Some(crate::Device::Cpu) => None,
+        Some(crate::Device::Cuda(i)) => Some(find(GpuKind::Cuda, i)?),
+        Some(crate::Device::Hip(i)) => Some(find(GpuKind::Hip, i)?),
+        None => probe(GpuKind::Cuda).into_iter().chain(probe(GpuKind::Hip)).max_by_key(|g| g.free_bytes),
     };
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let kib = |key: &str| {
@@ -374,26 +435,54 @@ fn tokens(n: usize, vocab: usize, seed: u64) -> Vec<u32> {
         .collect()
 }
 
+/// The device-memory queries `measure` needs (inherent on both GPU backends).
+trait MemInfo: Backend {
+    fn mem_info(&self) -> Result<(usize, usize)>;
+    fn hold_freed_memory(&self) -> Result<()>;
+}
+
+macro_rules! impl_mem_info {
+    ($b:ty) => {
+        impl MemInfo for $b {
+            fn mem_info(&self) -> Result<(usize, usize)> {
+                Ok(<$b>::mem_info(self)?)
+            }
+            fn hold_freed_memory(&self) -> Result<()> {
+                Ok(<$b>::hold_freed_memory(self)?)
+            }
+        }
+    };
+}
+impl_mem_info!(CudaBackend);
+impl_mem_info!(HipBackend);
+
+/// [`measure`] on `gpu`, with a fresh backend.
+fn measure_on(gpu: &Gpu, model_path: &Path, p: &Plan) -> Result<Measured> {
+    match gpu.kind {
+        GpuKind::Cuda => measure(&CudaBackend::new(gpu.ordinal)?, model_path, p),
+        GpuKind::Hip => measure(&HipBackend::new(gpu.ordinal)?, model_path, p),
+    }
+}
+
 /// Load the model and run the planned configuration: one request prefilled
 /// to near the full context, then 8 requests decoding together, then one
 /// alone; the draft model's decode step is timed against the target's.
-fn measure(model_path: &Path, p: &Plan, ordinal: usize) -> Result<Measured> {
-    let b = CudaBackend::new(ordinal)?;
+fn measure<B: MemInfo>(b: &B, model_path: &Path, p: &Plan) -> Result<Measured> {
     b.hold_freed_memory()?;
     let (free0, _) = b.mem_info()?;
     let g = Gguf::open(model_path)?;
-    let model = AnyModel::load(&b, &g)?;
+    let model = AnyModel::load(b, &g)?;
     let (free1, _) = b.mem_info()?;
     let dg = p.draft.as_ref().map(Gguf::open).transpose()?;
-    let draft = dg.as_ref().map(|g| AnyModel::load(&b, g)).transpose()?;
+    let draft = dg.as_ref().map(|g| AnyModel::load(b, g)).transpose()?;
     let (free2, _) = b.mem_info()?;
     let vocab = model.vocab_size();
 
-    let mut pool = KvPool::new(&b, &model, p.kv_tokens, BLOCK, p.kv_type)?;
-    let mut dpool = draft.as_ref().map(|d| KvPool::new(&b, d, draft_pool_tokens(p.kv_tokens), BLOCK, p.kv_type)).transpose()?;
+    let mut pool = KvPool::new(b, &model, p.kv_tokens, BLOCK, p.kv_type)?;
+    let mut dpool = draft.as_ref().map(|d| KvPool::new(b, d, draft_pool_tokens(p.kv_tokens), BLOCK, p.kv_type)).transpose()?;
     let pools = free2.saturating_sub(b.mem_info()?.0);
     let mut min_free = b.mem_info()?.0;
-    let mut note = |b: &CudaBackend| -> Result<()> {
+    let mut note = |b: &B| -> Result<()> {
         min_free = min_free.min(b.mem_info()?.0);
         Ok(())
     };
@@ -409,7 +498,7 @@ fn measure(model_path: &Path, p: &Plan, ordinal: usize) -> Result<Measured> {
         pool.step(&mut [StepItem { seq: &mut seqs[0], tokens: part, want: Want::Last }], false)?;
     }
     let prefill_tok_s = depth as f64 / t.elapsed().as_secs_f64();
-    note(&b)?;
+    note(b)?;
     for (i, s) in seqs.iter_mut().enumerate().skip(1) {
         pool.step(&mut [StepItem { seq: s, tokens: &tokens(short, vocab, i as u64 + 2), want: Want::Last }], false)?;
     }
@@ -428,7 +517,7 @@ fn measure(model_path: &Path, p: &Plan, ordinal: usize) -> Result<Measured> {
         Ok((steps * seqs.len()) as f64 / t0.elapsed().as_secs_f64())
     };
     let decode_batch_tok_s = timed(&mut seqs, &mut pool)?;
-    note(&b)?;
+    note(b)?;
     let decode_one_tok_s = timed(&mut seqs[..1], &mut pool)?;
     // Draft vs target, one short sequence each.
     let draft_ratio = match (&mut dpool, draft.as_ref()) {
@@ -437,7 +526,7 @@ fn measure(model_path: &Path, p: &Plan, ordinal: usize) -> Result<Measured> {
             dp.step(&mut [StepItem { seq: &mut ds[0], tokens: &tokens(short, vocab, 9), want: Want::Last }], false)?;
             let d_tok_s = timed(&mut ds, dp)?;
             let t_tok_s = timed(&mut seqs[1..2], &mut pool)?;
-            note(&b)?;
+            note(b)?;
             Some(t_tok_s / d_tok_s)
         }
         _ => None,
@@ -471,9 +560,10 @@ pub fn tune(a: TuneArgs) -> Result<()> {
         // Shrink the pool until the workload fits (rarely needed).
         let mut tries = 0;
         let m = loop {
-            match measure(&a.model, &p, gpu.ordinal) {
+            match measure_on(gpu, &a.model, &p) {
                 Ok(m) => break m,
-                Err(e) if tries < 3 && format!("{e:#}").contains("OUT_OF_MEMORY") => {
+                // CUDA_ERROR_OUT_OF_MEMORY, hipErrorOutOfMemory
+                Err(e) if tries < 3 && ["OUT_OF_MEMORY", "OutOfMemory"].iter().any(|s| format!("{e:#}").contains(s)) => {
                     tries += 1;
                     p.kv_tokens = p.kv_tokens * 85 / 100 / 1024 * 1024;
                     p.ctx = p.ctx.min(p.kv_tokens);
@@ -527,13 +617,20 @@ pub fn tune(a: TuneArgs) -> Result<()> {
     println!("Machine");
     match &mach.gpu {
         Some(gpu) => println!(
-            "  GPU {}: {} ({}, {} SMs), {:.1} GiB free of {:.1} GiB",
-            gpu.ordinal,
+            "  GPU {}: {} ({}, {} {}), {:.1} GiB free of {:.1} GiB{}",
+            gpu.device(),
             gpu.name,
             gpu.arch,
             gpu.sms,
+            // What the driver counts: SMs; WGPs (2 CUs each) on RDNA, CUs on CDNA.
+            match gpu.kind {
+                GpuKind::Cuda => "SMs",
+                GpuKind::Hip if gpu.arch.starts_with("gfx1") => "WGPs",
+                GpuKind::Hip => "CUs",
+            },
             gpu.free_bytes as f64 / GIB,
-            gpu.total_bytes as f64 / GIB
+            gpu.total_bytes as f64 / GIB,
+            if gpu.integrated { " (integrated: shares system RAM)" } else { "" }
         ),
         None => println!("  GPU: none"),
     }
@@ -608,8 +705,17 @@ pub fn tune(a: TuneArgs) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn gpu(free_gib: usize, total_gib: usize) -> DeviceInfo {
-        DeviceInfo { ordinal: 0, name: "test".into(), arch: "sm_89".into(), sms: 142, total_bytes: total_gib << 30, free_bytes: free_gib << 30 }
+    fn gpu(free_gib: usize, total_gib: usize) -> Gpu {
+        Gpu {
+            kind: GpuKind::Cuda,
+            ordinal: 0,
+            name: "test".into(),
+            arch: "sm_89".into(),
+            sms: 142,
+            total_bytes: total_gib << 30,
+            free_bytes: free_gib << 30,
+            integrated: false,
+        }
     }
 
     fn machine(free_gib: usize, ram_gib: usize) -> Machine {
@@ -672,6 +778,19 @@ mod tests {
         // A draft as large as a quarter of the model and no room left: dropped.
         let p = plan(&qwen8b(), Some(&d), &machine(6, 16), Some(32768), None);
         assert!(p.draft.is_none());
+    }
+
+    #[test]
+    fn integrated_gpu_leaves_ram_and_skips_the_host_tier() {
+        // Strix Halo: 44 GiB free to the GPU, but only 30 GiB of RAM available.
+        let apu = Gpu { kind: GpuKind::Hip, integrated: true, ..gpu(44, 100) };
+        let mach = Machine { gpu: Some(apu), ram_total: 128 << 30, ram_available: 30 << 30, cpu: "test".into(), hybrid: false };
+        let p = plan(&qwen8b(), None, &mach, None, None);
+        assert_eq!((p.device.as_str(), p.host_cache_gb), ("hip", 0));
+        // Planned from 30 - 8 = 22 GiB, not 44.
+        let mem = p.memory.unwrap();
+        assert_eq!(mem[0], 22 << 30);
+        assert!(p.kv_tokens * qwen8b().kv_bytes_per_token(p.kv_type) < 22 << 30);
     }
 
     #[test]

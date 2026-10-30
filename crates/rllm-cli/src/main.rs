@@ -7,6 +7,7 @@ use clap::{Args, Parser, Subcommand};
 use rllm_core::{Backend, KvType};
 use rllm_cpu::CpuBackend;
 use rllm_cuda::CudaBackend;
+use rllm_hip::HipBackend;
 use rllm_gguf::Gguf;
 use rllm_model::{AnyModel, Generator, Model, Sampler, SamplerConfig};
 use rllm_tokenizer::{ChatMessage, Tokenizer};
@@ -41,7 +42,7 @@ enum Cmd {
         host: String,
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        #[arg(short, long, default_value = "cuda")]
+        #[arg(short, long, default_value = "gpu")]
         device: String,
         /// Context size in tokens (prompt + output) for every request.
         #[arg(long, default_value_t = 8192)]
@@ -104,7 +105,7 @@ enum Cmd {
     Perplexity {
         model: PathBuf,
         file: PathBuf,
-        #[arg(short, long, default_value = "cuda")]
+        #[arg(short, long, default_value = "gpu")]
         device: String,
         #[arg(short, long, default_value_t = 512)]
         ctx: usize,
@@ -120,7 +121,7 @@ enum Cmd {
     /// a time from an empty context. Token ids are fixed pseudo-random.
     Bench {
         model: PathBuf,
-        #[arg(short, long, default_value = "cuda")]
+        #[arg(short, long, default_value = "gpu")]
         device: String,
         /// Prompt-processing size (0 to skip).
         #[arg(short = 'p', long, default_value_t = 512)]
@@ -159,8 +160,9 @@ enum Cmd {
         /// Decode steps to compare after the prompt.
         #[arg(short = 'n', long, default_value_t = 32)]
         steps: usize,
-        #[arg(long, default_value_t = 0)]
-        gpu: usize,
+        /// The device checked against the CPU: `gpu[:N]`, `cuda[:N]` or `hip[:N]`.
+        #[arg(short, long, default_value = "gpu")]
+        device: String,
         #[arg(long, default_value_t = 16)]
         block_size: usize,
         /// Max prompt tokens per forward pass (small values exercise the decode kernels).
@@ -175,8 +177,8 @@ enum Cmd {
 #[derive(Args)]
 struct RunArgs {
     model: PathBuf,
-    /// `cpu`, `cuda` or `cuda:N`.
-    #[arg(short, long, default_value = "cuda")]
+    /// `cpu`, `gpu[:N]` (CUDA or HIP, whichever this machine has), `cuda[:N]` or `hip[:N]`.
+    #[arg(short, long, default_value = "gpu")]
     device: String,
     prompt: String,
     /// Send the prompt as raw text instead of through the chat template.
@@ -216,15 +218,60 @@ struct RunArgs {
     kv_type: KvType,
 }
 
+/// A `-d` device: `cpu`, `cuda[:N]`, `hip[:N]`, or `gpu[:N]` for whichever
+/// GPU kind this machine has (CUDA first).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Device {
+    Cpu,
+    Cuda(usize),
+    Hip(usize),
+}
+
+impl Device {
+    fn parse(d: &str) -> Result<Self> {
+        let (kind, n) = d.split_once(':').unwrap_or((d, ""));
+        let ordinal = if n.is_empty() { 0 } else { n.parse()? };
+        Ok(match kind {
+            "cpu" if n.is_empty() => Device::Cpu,
+            "cuda" => Device::Cuda(ordinal),
+            "hip" | "rocm" => Device::Hip(ordinal),
+            "gpu" if rllm_cuda::device_count() > 0 => Device::Cuda(ordinal),
+            "gpu" if rllm_hip::device_count() > 0 => Device::Hip(ordinal),
+            "gpu" => anyhow::bail!("no CUDA or HIP device found"),
+            _ => anyhow::bail!("unknown device {d:?} (expected cpu, gpu[:N], cuda[:N] or hip[:N])"),
+        })
+    }
+}
+
+/// Run `$body` with `$b` bound to the backend for device string `$dev`.
+macro_rules! on_device {
+    ($dev:expr, $b:ident => $body:expr) => {
+        match Device::parse(&$dev)? {
+            Device::Cpu => {
+                let $b = CpuBackend::new();
+                $body
+            }
+            Device::Cuda(i) => {
+                let $b = CudaBackend::new(i)?;
+                $body
+            }
+            Device::Hip(i) => {
+                let $b = HipBackend::new(i)?;
+                $body
+            }
+        }
+    };
+}
+
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Inspect { model, tensors } => inspect(&model, tensors),
         Cmd::Tune(args) => tune::tune(args),
         Cmd::Tokenize { model, text } => tokenize(&model, &text),
-        Cmd::Run(args) => match args.device.as_str() {
-            "cpu" => run(&CpuBackend::new(), args),
-            d => run(&CudaBackend::new(parse_cuda(d)?)?, args),
-        },
+        Cmd::Run(args) => {
+            let device = args.device.clone();
+            on_device!(device, b => run(&b, args))
+        }
         Cmd::Serve {
             model,
             host,
@@ -266,28 +313,23 @@ fn main() -> Result<()> {
                 store_file,
                 log: !quiet,
             };
-            match device.as_str() {
-                "cpu" => rllm_server::serve(cfg, || Ok(CpuBackend::new())),
-                d => {
-                    let ordinal = parse_cuda(d)?;
-                    rllm_server::serve(cfg, move || Ok(CudaBackend::new(ordinal)?))
-                }
+            match Device::parse(&device)? {
+                Device::Cpu => rllm_server::serve(cfg, || Ok(CpuBackend::new())),
+                Device::Cuda(i) => rllm_server::serve(cfg, move || Ok(CudaBackend::new(i)?)),
+                Device::Hip(i) => rllm_server::serve(cfg, move || Ok(HipBackend::new(i)?)),
             }
         }
-        Cmd::Perplexity { model, file, device, ctx, chunks, kv_type } => match device.as_str() {
-            "cpu" => perplexity(&CpuBackend::new(), &model, &file, ctx, chunks, kv_type),
-            d => perplexity(&CudaBackend::new(parse_cuda(d)?)?, &model, &file, ctx, chunks, kv_type),
-        },
-        Cmd::Bench { model, device, n_prompt, n_gen, reps, depth, kv_type } => match device.as_str() {
-            "cpu" => bench(&CpuBackend::new(), &model, n_prompt, n_gen, reps, depth, kv_type),
-            d => bench(&CudaBackend::new(parse_cuda(d)?)?, &model, n_prompt, n_gen, reps, depth, kv_type),
-        },
-        Cmd::CompareRef { model, reference, prompt_file, device, prefill_chunk } => match device.as_str() {
-            "cpu" => compare_ref(&CpuBackend::new(), &model, &reference, prompt_file.as_deref(), prefill_chunk),
-            d => compare_ref(&CudaBackend::new(parse_cuda(d)?)?, &model, &reference, prompt_file.as_deref(), prefill_chunk),
-        },
-        Cmd::Compare { model, prompt, steps, gpu, block_size, prefill_chunk, kv_type } => {
-            compare(&model, &prompt, steps, gpu, block_size, prefill_chunk, kv_type)
+        Cmd::Perplexity { model, file, device, ctx, chunks, kv_type } => {
+            on_device!(device, b => perplexity(&b, &model, &file, ctx, chunks, kv_type))
+        }
+        Cmd::Bench { model, device, n_prompt, n_gen, reps, depth, kv_type } => {
+            on_device!(device, b => bench(&b, &model, n_prompt, n_gen, reps, depth, kv_type))
+        }
+        Cmd::CompareRef { model, reference, prompt_file, device, prefill_chunk } => {
+            on_device!(device, b => compare_ref(&b, &model, &reference, prompt_file.as_deref(), prefill_chunk))
+        }
+        Cmd::Compare { model, prompt, steps, device, block_size, prefill_chunk, kv_type } => {
+            on_device!(device, b => compare(&b, &model, &prompt, steps, block_size, prefill_chunk, kv_type))
         }
     }
 }
@@ -396,23 +438,22 @@ fn run<B: Backend>(backend: &B, a: RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn compare(path: &PathBuf, prompt: &str, steps: usize, gpu: usize, block_size: usize, prefill_chunk: usize, kv: KvType) -> Result<()> {
+fn compare<B: Backend>(gpu: &B, path: &PathBuf, prompt: &str, steps: usize, block_size: usize, prefill_chunk: usize, kv: KvType) -> Result<()> {
     let g = Gguf::open(path)?;
     let tok = Tokenizer::from_gguf(&g)?;
     let cpu = CpuBackend::new();
-    let cuda = CudaBackend::new(gpu)?;
-    eprintln!("[rllm] comparing {} against {}", cuda.name(), cpu.name());
-    let (m_cpu, m_gpu) = (AnyModel::load(&cpu, &g)?, AnyModel::load(&cuda, &g)?);
+    eprintln!("[rllm] comparing {} against {}", gpu.name(), cpu.name());
+    let (m_cpu, m_gpu) = (AnyModel::load(&cpu, &g)?, AnyModel::load(gpu, &g)?);
     let ids = tok.encode(prompt)?;
     let ctx = ids.len() + steps + 1;
     let mut a = Generator::with_kv(&cpu, &m_cpu, ctx, block_size, kv)?;
-    let mut b = Generator::with_kv(&cuda, &m_gpu, ctx, block_size, kv)?;
+    let mut b = Generator::with_kv(gpu, &m_gpu, ctx, block_size, kv)?;
 
     let mut la = a.feed(&ids, prefill_chunk)?;
     let mut lb = b.feed(&ids, prefill_chunk)?;
     let mut worst = 0f32;
     let mut mismatches = 0;
-    println!("{:>5} {:>10} {:>10} {:>8} {:>8}  token", "step", "max|diff|", "rel", "cpu", "cuda");
+    println!("{:>5} {:>10} {:>10} {:>8} {:>8}  token", "step", "max|diff|", "rel", "cpu", "gpu");
     for step in 0..=steps {
         let (diff, rel) = logit_diff(&la, &lb);
         worst = worst.max(rel);
@@ -449,13 +490,6 @@ fn logit_diff(reference: &[f32], other: &[f32]) -> (f32, f32) {
     (diff, diff / scale)
 }
 
-fn parse_cuda(d: &str) -> Result<usize> {
-    Ok(match d.strip_prefix("cuda") {
-        Some("") => 0,
-        Some(n) => n.trim_start_matches(':').parse()?,
-        None => anyhow::bail!("unknown device {d:?} (expected cpu, cuda or cuda:N)"),
-    })
-}
 
 struct RefDump {
     n_vocab: usize,

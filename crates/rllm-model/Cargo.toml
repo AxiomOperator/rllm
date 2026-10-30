@@ -13,4 +13,5 @@ anyhow.workspace = true
 
 [dev-dependencies]
 rllm-cuda.workspace = true
+rllm-hip.workspace = true
 rllm-tokenizer.workspace = true

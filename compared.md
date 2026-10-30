@@ -16,12 +16,12 @@ Legend: ✓ supported · ◐ partial or limited · ✗ not supported.
 | | rllm | llama.cpp | vLLM |
 |---|---|---|---|
 | Language, runtime | Rust, one binary | C/C++, one binary | Python + PyTorch |
-| Typical use | GGUF serving on NVIDIA | Local inference on almost any hardware | Datacenter serving at high concurrency |
+| Typical use | GGUF serving on NVIDIA and AMD | Local inference on almost any hardware | Datacenter serving at high concurrency |
 | Model architectures | 2 (Qwen3 dense, Gemma 4) | 100+ | 200+ (most Hugging Face architectures) |
 | Weight formats | GGUF: F32, F16, BF16, Q8_0, Q4_K, Q6_K | GGUF, all quant types | safetensors (FP16/BF16, FP8, AWQ, GPTQ, NVFP4, …), GGUF experimental |
-| Hardware | NVIDIA (CUDA), CPU (reference speed) | CPU, CUDA, Metal, Vulkan, HIP, SYCL and more | NVIDIA, AMD, Intel, TPU, CPU and more |
+| Hardware | NVIDIA (CUDA), AMD RDNA3 (ROCm/HIP), CPU (reference speed) | CPU, CUDA, Metal, Vulkan, HIP, SYCL and more | NVIDIA, AMD, Intel, TPU, CPU and more |
 | Multi-GPU | ✗ | ✓ layer or row split | ✓ tensor, pipeline, data and expert parallel |
-| Build needs | Rust; no CUDA toolkit (kernels compile at runtime with NVRTC) | C++ toolchain, plus a CUDA toolkit for GPU builds | pip wheels |
+| Build needs | Rust; no CUDA toolkit or ROCm SDK (kernels compile at runtime with NVRTC or hiprtc) | C++ toolchain, plus a CUDA toolkit for GPU builds | pip wheels |
 
 ## Feature parity
 
@@ -105,7 +105,7 @@ Ordered roughly by how much each one limits what rllm can serve.
 | Gap | llama.cpp | vLLM | Notes |
 |---|---|---|---|
 | One GPU per model | ✓ layer or row split | ✓ TP, PP, DP, EP | Tensor parallelism is Phase 3; no multi-GPU hardware in the dev setup yet. |
-| NVIDIA only (sm_86 and newer) | ✓ Metal, Vulkan, HIP, SYCL, … | ✓ ROCm, Intel, TPU, … | ROCm is Phase 3; the kernels are written to be hipify-friendly. |
+| NVIDIA (sm_86 and newer) and AMD RDNA3 only | ✓ Metal, Vulkan, HIP, SYCL, … | ✓ ROCm, Intel, TPU, … | The HIP backend shares the CUDA backend's code and kernels; its matrix-core kernels are gfx11-only (tested on gfx1151 Strix Halo). No Vulkan, Metal or Intel. |
 | Fast CPU inference | ✓ | ◐ | rllm's CPU backend is the f32 correctness reference: 0.2–0.35× llama.cpp on prompts, 0.5–0.94× on generation. |
 | Partial GPU offload (model bigger than VRAM) | ✓ `-ngl` | ◐ CPU offload | The whole model must fit on one GPU. |
 | FP8 compute and KV cache | ✗ | ✓ | Phase 4 (FP8 on Ada). |
@@ -138,9 +138,12 @@ Ordered roughly by how much each one limits what rllm can serve.
 | Qwen3-8B Q4_K_M, generation at 32k, f16 KV | 71.4 tok/s | 82.3 tok/s (1.15×) |
 | Qwen3-8B, prompt processing at 32k context | 2593 tok/s | 3261 tok/s (1.26×) |
 | CPU backend, prompt processing | 0.2–0.35× | 1× |
+| Strix Halo (gfx1151), Qwen3-8B Q4_K_M generation | 34.4 tok/s | 42.8 tok/s (1.25×) |
+| Strix Halo (gfx1151), Nemotron prompt processing (pp512) | 1934 tok/s | 2141 tok/s (1.11×) |
 
 rllm leads or ties on Qwen3-0.6B and Nemotron, the models it was tuned on.
-The 8B gap is the next profiling target.
+The 8B gap is the next profiling target. On the Strix Halo, rllm's prompt
+processing leads on every Qwen3 model (1.02–1.39×); see `compare.md`.
 
 ## Summary
 

@@ -91,7 +91,7 @@ CUDA backend:
 - prefill attention uses f16 tensor cores
 
 So it no longer matches rllm's f32 CPU reference to 1e-6 the way the first
-version did. The per-kernel parity tests (`crates/rllm-cuda/tests/parity.rs`)
+version did. The per-kernel parity tests (`crates/rllm-cuda/tests/common/parity.rs`)
 check each kernel against the CPU at tolerances that match each format.
 
 ## Performance: prompt processing and generation
@@ -448,7 +448,7 @@ or more splits now write their partial tiles to a buffer that a small kernel
 sums in split order; two splits still `atomicAdd` into a zeroed output,
 which is order-independent (x + y = y + x). Same tokens, same logits, every
 run: checked bit for bit on Qwen3-0.6B (forced through MMQ), Qwen3-8B and
-Nemotron on both GPUs (`crates/rllm-model/tests/gpu.rs`). The cost is in
+Nemotron on both GPUs (`crates/rllm-model/tests/common/gpu.rs`). The cost is in
 prefill only: pp512 0–1.8% slower on the Ada (Nemotron within noise,
 Qwen3-8B 6560 vs 6678 tok/s), 1.5–3% on the laptop. (Summing in the last
 block to finish each tile, llama.cpp's stream-k style, measured 13% slower
@@ -459,7 +459,11 @@ rotated by a Walsh–Hadamard matrix as llama.cpp does. Perplexity is within
 noise of f16 on Qwen3-8B and Nemotron (+0.19% on Qwen3-0.6B at ctx 512,
 llama.cpp's q8_0 +0.21% on the same chunks). Decode attention also got a
 split-context (flash-decoding) path for long contexts, which helps f16 as
-well.
+well. Its split count is now chosen per token rather than per step, so a
+verification step matches one-token steps bit for bit at any depth (the
+model tests caught the mismatch on the 20-WGP Strix Halo GPU), and batched
+decode at depth gets more parallelism: 8 Qwen3-8B requests at 32k, 489 →
+568 tok/s on the Ada (`rllm tune --measure`; one request unchanged).
 
 | Qwen3-8B Q4_K_M | rllm f16 | rllm q8 | llama.cpp f16 | llama.cpp q8_0 |
 |---|---:|---:|---:|---:|
@@ -506,6 +510,67 @@ pinned system memory and come back over PCIe on a hit. A 2546-token prompt
 repeated after two others displaced it from a 4096-token pool: time to first
 token 381 ms recomputed, 39 ms restored (375 MB copied back).
 
+## AMD Strix Halo: llama.cpp ROCm vs rllm HIP
+
+| | |
+|---|---|
+| GPU | Radeon 8060S in a Ryzen AI MAX+ 395 (gfx1151, RDNA 3.5, 40 CUs, wave32) |
+| Memory | 128 GB LPDDR5X shared with the CPU (100 GB addressable by the GPU) |
+| Software | Ubuntu 26.04, ROCm 7.14 |
+
+**How it was run:** llama.cpp is the box's own ROCm build (0.6.0-dev,
+`5e03bdd87`) in a container, `llama bench -ngl 99 -r 3` (f16 KV, flash
+attention auto). rllm was built on the box with no ROCm SDK headers
+involved (it loads HIP, hiprtc and hipBLAS at runtime) and run as
+`rllm bench -d hip -r 3`, each model right after llama.cpp. The box also
+holds an idle `llama-server` (gemma-4-31B, 56 GB; 0% GPU before the runs).
+
+### Speed (tokens/s), 2026-10-30
+
+| Model | pp512, llama.cpp | pp512, rllm | rllm ÷ llama.cpp | tg128, llama.cpp | tg128, rllm | rllm ÷ llama.cpp |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3-0.6B Q8_0 | 12518.87 ± 1371.83 | 16637.95 ± 61.71 | **1.33×** | 223.86 ± 0.58 | 216.12 ± 0.04 | 0.97× |
+| Qwen3-0.6B Q4_K_M | 12256.07 ± 1047.65 | 17086.75 ± 92.49 | **1.39×** | 285.25 ± 0.54 | 297.80 ± 0.13 | **1.04×** |
+| Qwen3-0.6B BF16 | 11138.34 ± 998.76 | 15171.59 ± 43.68 | **1.36×** | 135.11 ± 0.04 | 103.69 ± 0.05 | 0.77× |
+| Qwen3-8B Q4_K_M | 1302.65 ± 16.23 | 1327.08 ± 1.60 | **1.02×** | 42.84 ± 0.02 | 34.40 ± 0.00 | 0.80× |
+| Nemotron 3.5 Bolt E4B Q8_0 | 2140.94 ± 62.85 | 1933.73 ± 6.01 | 0.90× | 37.75 ± 0.03 | 36.42 ± 0.00 | 0.96× |
+
+How the HIP backend got there (Qwen3-8B pp512 / Nemotron pp512):
+
+| Step | Qwen3-8B | Nemotron |
+|---|---:|---:|
+| First working port: dequantize + hipBLAS, plain tiled attention | 349 | 575 |
+| hipBLAS writes f16 (then widened to f32): 4× faster GEMMs on gfx1151 | 869 | 1139 |
+| BF16 weights through the f16 GEMM | | 1366 |
+| Prefill attention on RDNA3 matrix cores (`attn_wmma`) | 956 | |
+| Int8 MMQ on matrix cores (`wmma_s8`), as on NVIDIA | 1327 | 1934 |
+
+Decode is bandwidth-bound: the big matvecs reach about 200 GB/s, close to
+what llama.cpp gets, but rllm's repacked Q4_K takes 5 bits per weight
+(f16 scale and min per 32) against GGUF's 4.5, so Qwen3-8B reads 11% more
+per token. BF16 decode uses the plain float matvec, which reaches only
+~125 GB/s here.
+
+### Correctness on gfx1151
+
+`rllm compare` (logits against the CPU reference at every step, 8 decode
+steps after a 50-token prompt), the same command on the RTX 6000 Ada for
+reference:
+
+| Model, KV cache | Worst relative diff, HIP | Same on CUDA (sm_89) | Argmax mismatches, HIP |
+|---|---:|---:|---:|
+| Qwen3-0.6B BF16, f16 | 9.9e-4 | | 0/9 |
+| Qwen3-0.6B Q8_0, f16 | 2.1e-2 | | 0/9 |
+| Qwen3-8B Q4_K_M, f16 | 1.5e-2 | 1.6e-2 | 0/9 |
+| Qwen3-8B Q4_K_M, q8 | 1.9e-2 | 1.8e-2 | 0/9 |
+| Nemotron E4B Q8_0, f16 | 5.2e-2 | 4.1e-2 | 0/9 |
+| Nemotron E4B Q8_0, q8 | 4.8e-2 | 6.8e-2 | 0/9 |
+
+All 13 GPU-vs-CPU kernel parity tests (`cargo test -p rllm-hip`) pass, and
+the server checks used on the Ada (a 30k-token prompt with 7 concurrent
+requests; prompt lookup; draft model; host-tier offload and restore) pass
+on gfx1151.
+
 ## Known gaps
 
 - **Prefill activation quantization on small GPUs:** on the RTX 6000 Ada no
@@ -537,6 +602,13 @@ token 381 ms recomputed, 39 ms restored (375 MB copied back).
 - **Several backends in one process:** two `CudaBackend`s recording CUDA
   graphs at once (only possible in tests) disturb each other's decode
   steps, so the GPU tests take a lock. The binaries create one backend.
+- **AMD (gfx1151):** decode trails llama.cpp on Qwen3-8B (0.80×, the
+  wider Q4_K repack) and BF16 (0.77×, the float matvec); Nemotron prefill is
+  0.90×. hipBLAS on gfx1151 is 4× slower with f32 output, so GEMMs write f16
+  scaled by 1/256 and widen it (overflow past 1.7e7). Prefill attention on
+  Gemma's 512-wide heads still takes the plain kernel (`attn_wmma` covers
+  64/128/256). Only gfx11 (RDNA3) has the WMMA kernels; other AMD targets
+  run the plain kernels and are untested.
 - **Q4_K on CPU:** emulating llama.cpp's activation rounding doesn't narrow the
   gap. llama.cpp uses repacked Q4_K kernels on AVX2, whose rounding isn't
   mirrored. The gap is still within llama.cpp's own noise floor.

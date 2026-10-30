@@ -1,0 +1,15 @@
+[package]
+name = "rllm-hip"
+description = "AMD backend: the rllm-cuda backend and kernels over HIP, hiprtc and hipBLAS (loaded at runtime)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rllm-core.workspace = true
+half.workspace = true
+libloading = "0.9"
+
+[dev-dependencies]
+half.workspace = true
+rllm-cpu.workspace = true

@@ -9,7 +9,7 @@ error format.
 ```sh
 rllm serve models/Qwen3-0.6B-Q8_0.gguf --port 8080
 rllm serve model.gguf --host 0.0.0.0 --port 8080 --ctx 8192 --parallel 8 \
-    --api-key "$KEY" --model-name my-model --strict-model -d cuda:0 \
+    --api-key "$KEY" --model-name my-model --strict-model -d gpu:0 \
     --store-file store.json
 # A draft model for speculative decoding, and an 8-bit KV cache:
 rllm serve models/Qwen3-8B-Q4_K_M.gguf --draft models/Qwen3-0.6B-Q8_0.gguf --kv-type q8
@@ -26,7 +26,7 @@ r = client.chat.completions.create(model="my-model", messages=[{"role": "user", 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--host`, `--port` | `127.0.0.1`, `8080` | Listen address. |
-| `-d` | `cuda` | `cuda`, `cuda:N` or `cpu`. |
+| `-d` | `gpu` | `gpu[:N]` (CUDA if present, else HIP), `cuda[:N]`, `hip[:N]` or `cpu`. |
 | `--ctx` | 8192 | Most tokens (prompt + output) one request may use. |
 | `--parallel` | 4 | Most requests decoded together in one batch. More wait in a queue. |
 | `--kv-tokens` | `ctx × parallel` | Size of the KV cache shared by all requests, in tokens. Allocated once at startup. |
@@ -60,7 +60,12 @@ the reason for each setting:
 - **`--prompt-lookup`:** on.
 - **`--host-cache-gb`:** a quarter of available RAM, at most 4× the KV pool and 64 GiB, as long as 8 GiB stays available.
 
-It picks the GPU with the most free memory, so it accounts for other
+**Integrated GPUs** (AMD Strix Halo and other APUs) use system RAM as GPU
+memory: `rllm tune` plans the pool from the smaller of the GPU's free memory
+and available RAM less 8 GiB, and suggests no host tier (it would only move
+KV within the same memory).
+
+It picks the GPU with the most free memory (CUDA or HIP), so it accounts for other
 processes on a shared GPU. `--ctx`, `--parallel`, `--draft`, `--no-draft`
 and `-d` constrain the plan, and `--json` prints it for scripts.
 
@@ -221,7 +226,7 @@ With `--draft`, a small model with the same tokenizer (for example
 Qwen3-0.6B for Qwen3-8B) proposes a few tokens for each decoding request,
 and one forward pass of the main model checks them all. Every accepted token
 is a main-model step saved.
-- **Exact.** Verification follows the speculative sampling rule (accept a drafted token with probability min(1, p/q), otherwise draw from the leftover distribution), so output is distributed exactly as without a draft. Greedy output is token for token the same on Qwen3: a verification step computes the same logits as one-token steps. On Gemma 4 models, whose one-token steps use their own fused kernels, it matches as closely as batched requests do.
+- **Exact.** Verification follows the speculative sampling rule (accept a drafted token with probability min(1, p/q), otherwise draw from the leftover distribution), so output is distributed exactly as without a draft. Greedy output is token for token the same on Qwen3: a verification step computes the same logits as one-token steps, at any context length (decode attention splits a long context per token, not per step). On Gemma 4 models, whose one-token steps use their own fused kernels, it matches as closely as batched requests do.
 - **Request features.** Logit bias, frequency and presence penalties, logprobs, stop sequences and `n` all apply as usual (the draft sees the bias and penalties too). Requests with a JSON constraint (`json_object`, `json_schema`, forced tool calls) decode without drafts.
 - **Adaptive.** Each request proposes one token more than it last had accepted, up to `--draft-tokens`, so drafts stay short where the text is hard to predict. After three verifications in a row that accept nothing, the request decodes without drafts for 8 steps.
 - **Batching.** Drafts are shortened so a step stays within 8 tokens (one request: up to 7 drafts; two: 3 each; three or four: 1 each). With 5 or more requests decoding, the batch alone keeps the GPU busy and speculation pauses.
@@ -282,6 +287,7 @@ further than anything on the GPU copies it back instead of recomputing it.
 - **How.** Host memory is pinned and mapped into the GPU's address space, and one kernel per layer and part (K, V, q8 scales) moves a list of blocks over PCIe. The copies run on the same stream as the forward passes, so there is no host synchronization: a freed device block can be reused by the very next step.
 - **Exact.** Blocks come back bit for bit (a GPU test overwrites every device block in between and compares logits, f16 and q8, Qwen3 and Gemma 4).
 - **Bookkeeping.** The host tier evicts least recently used entries in turn (at most 2048). A prefix already covered by a host entry isn't copied twice; a restored entry leaves the host when the device has all of it. Only the matched blocks are copied back.
+- **Integrated GPUs.** On an APU such as Strix Halo the host tier works (it passes the same checks) but gains nothing: the "device" memory is system RAM too. Give the memory to `--kv-tokens` instead.
 - **Sizing.** One block of 16 tokens takes `16 × layers × kv_heads × head_dim × 4` bytes in f16 (2.4 MB for Qwen3-8B; half with `--kv-type q8`). 16 GiB holds about 116k tokens of Qwen3-8B prefixes. The memory is allocated and locked at startup.
 
 | Qwen3-8B Q4_K_M, RTX 6000 Ada, 4096-token KV pool | no host tier | `--host-cache-gb 4` |
@@ -414,14 +420,15 @@ Unit tests cover:
 - **The KV cache:** truncation after rejected drafts; the host tier (offload on eviction, full and partial restores, LRU eviction on the host, device hits preferred).
 - **Prompt lookup:** latest match wins, shorter tails as fallback, proposals stop at the end of the sequence.
 
-GPU tests (`crates/rllm-model/tests/gpu.rs`) need a model file:
+GPU tests (`crates/rllm-model/tests/common/gpu.rs`) need a model file:
 `RLLM_TEST_MODEL=models/Qwen3-0.6B-Q8_0.gguf cargo test --release -p rllm-model --test gpu`
 (add `RLLM_MMQ=1` to send a small model's prefill through the int8 kernels).
 They check that the same tokens give bit-identical logits on every run,
 that a verification step matches one-token steps, that a q8 cache tracks
 f16 on real text (97–99% same top token, mean KL ≤ 4e-3), and that blocks
 moved to the host tier and back give bit-identical logits. They passed on
-Qwen3-0.6B, Qwen3-8B and Nemotron on both GPUs. The CUDA parity tests
-(`crates/rllm-cuda/tests/parity.rs`) run every attention path on a q8 cache
+Qwen3-0.6B, Qwen3-8B and Nemotron on both NVIDIA GPUs and on the Strix Halo
+(`--test gpu_hip`, the same tests on HIP). The CUDA parity tests
+(`crates/rllm-cuda/tests/common/parity.rs`) run every attention path on a q8 cache
 against the CPU backend, which emulates q8's rounding.
 - **The output parser:** reasoning and tool-call markers split at every possible point, Gemma argument syntax, stop sequences spanning chunks.

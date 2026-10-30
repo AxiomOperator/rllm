@@ -921,6 +921,7 @@ dependencies = [
  "rllm-cpu",
  "rllm-cuda",
  "rllm-gguf",
+ "rllm-hip",
  "rllm-kv",
  "rllm-model",
  "rllm-server",
@@ -966,6 +967,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rllm-hip"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "libloading",
+ "rllm-core",
+ "rllm-cpu",
+]
+
+[[package]]
 name = "rllm-kv"
 version = "0.1.0"
 dependencies = [
@@ -980,6 +991,7 @@ dependencies = [
  "rllm-core",
  "rllm-cuda",
  "rllm-gguf",
+ "rllm-hip",
  "rllm-kv",
  "rllm-tokenizer",
 ]

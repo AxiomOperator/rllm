@@ -54,7 +54,7 @@ crates/
   rllm-core/       Tensor, DType, Backend trait, quant block formats
   rllm-cpu/        CPU reference backend (correctness oracle first, speed later)
   rllm-cuda/       CUDA backend: cudarc, cuBLASLt, kernels/*.cu
-  rllm-hip/        (Phase 3) HIP backend, built from the same kernels
+  rllm-hip/        HIP backend: rllm-cuda's backend.rs and kernels over a HIP `gpu` module
   rllm-model/      Model configs + forward passes (Qwen3 first)
   rllm-kv/         Paged KV block allocator, block tables, prefix cache
   rllm-sched/      (Phase 2) Continuous-batching scheduler (for now: rllm-server/src/engine.rs)
@@ -114,6 +114,12 @@ HIP backend built from the hipified kernels, hipBLASLt, Strix Halo tuning (unifi
 
 **Exit:** Phase 1 correctness harness passes on gfx1151; decode tok/s on Strix Halo benchmarked against llama.cpp (both its HIP and Vulkan backends); a model served across 2 GPUs with TP.
 
+**Status (2026-10-30):** the HIP backend runs on gfx1151 and passes the correctness harness (parity tests, `rllm compare`, server checks); benchmarked against llama.cpp's ROCm build in `compare.md` (its Vulkan build not yet). How it is built:
+- **One backend, two vendor layers.** `rllm-cuda/src/backend.rs` is compiled by both crates against a small `gpu` module: cudarc in `rllm-cuda`, dlopened HIP/hiprtc/hipBLAS in `rllm-hip` (no ROCm needed to build; one binary serves both vendors, `-d gpu` picks whichever is present).
+- **One kernel source.** `kernels.cu` has a HIP prelude (f16 conversion, shuffles, dp4a) and RDNA3 WMMA versions of the tensor-core work: the MMQ inner loop and a prefill attention kernel. The PTX-only kernels are stubs on HIP.
+- **gfx1151 specifics.** hipBLAS GEMMs write f16 (4× faster than f32 output there), scaled to keep range; BF16 weights go through f16. Integrated memory: `rllm tune` sizes from RAM and skips the host tier.
+- **Left:** hipBLASLt (1.5× hipBLAS on f16 output), a tighter Q4_K repack for decode bandwidth, WMMA attention for 512-wide heads, gfx12 WMMA, multi-GPU.
+
 ### Phase 4 — Advanced
 
 Speculative decoding, MoE (Qwen3 MoE), structured output, model hot-swapping, disaggregated prefill/decode, FP8 on Ada.
@@ -125,6 +131,6 @@ Speculative decoding, MoE (Qwen3 MoE), structured output, model hot-swapping, di
 
 ## Open questions
 
-- Is there a maintained HIP binding crate, or does rllm-hip need its own `-sys` crate? Decide at the start of Phase 3.
+- ~~Is there a maintained HIP binding crate, or does rllm-hip need its own `-sys` crate?~~ Own thin bindings, loaded with dlopen (`rllm-hip/src/ffi.rs`): about 40 entry points.
 - Attention kernel: write our own paged attention, or adapt FlashInfer-style kernels? FlashInfer is CUDA-only, so adapting it adds porting work in Phase 3.
 - Is NVIDIA's newer Rust CUDA work worth using for host-side code? Check its maturity; kernels stay in CUDA C++ either way.

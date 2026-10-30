@@ -1,7 +1,9 @@
-// rllm CUDA kernels. Compiled at runtime with NVRTC for the device's arch.
+// rllm GPU kernels. Compiled at runtime for the device's arch: NVRTC on
+// NVIDIA, hiprtc on AMD (rllm-hip passes -DRLLM_HIP).
 //
-// Portability rules (so these hipify for ROCm later):
-//   - no inline PTX outside the small "vendor shim" helpers (f16 cvt, mma)
+// Portability rules:
+//   - no inline PTX outside the small "vendor shim" helpers (f16 cvt, mma),
+//     each with a HIP version (or, for tensor cores, a stub; see below)
 //   - warp width comes from WARP_SIZE, never a literal 32
 //   - no headers: NVRTC/hiprtc builtins only
 //
@@ -29,8 +31,28 @@ typedef unsigned short f16_bits;
 
 #define NEG_INF __int_as_float(0xff800000)
 
+#ifdef RLLM_HIP
+// Vendor shim (HIP): RDNA runs wave32, the same lockstep width as a CUDA
+// warp. HIP's *_sync shuffles want 64-bit masks; every rllm caller uses
+// the whole warp, so map them to the unmasked forms.
+#define __shfl_xor_sync(mask, v, o) __shfl_xor(v, o, WARP_SIZE)
+#define __shfl_sync(mask, v, l) __shfl(v, l, WARP_SIZE)
+#define __syncwarp() __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront")
+#define __dp4a(a, b, c) __builtin_amdgcn_sudot4(true, (int)(a), true, (int)(b), (int)(c), false)
+#define __ldcs(p) (*(p))
+// Kernels that don't exist on this target, so the backend can still load every name.
+#define RLLM_STUB(NAME) extern "C" __global__ void NAME() { __builtin_trap(); }
+
+__device__ __forceinline__ float f16_to_f32(f16_bits h) {
+    return (float)__builtin_bit_cast(_Float16, h);
+}
+
+__device__ __forceinline__ f16_bits f32_to_f16_bits(float f) {
+    return __builtin_bit_cast(f16_bits, (_Float16)f);
+}
+#else
 // Vendor shim: f16 <-> f32 with the hardware cvt instructions (round to
-// nearest even). The HIP port maps these to __half2float / __float2half.
+// nearest even).
 __device__ __forceinline__ float f16_to_f32(f16_bits h) {
     float f;
     asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
@@ -42,9 +64,16 @@ __device__ __forceinline__ f16_bits f32_to_f16_bits(float f) {
     asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
     return h;
 }
+#endif
 
 __device__ __forceinline__ float ld_f16(const u8* p) {
     return f16_to_f32((f16_bits)(p[0] | (p[1] << 8)));
+}
+
+// Same, for a 2-byte aligned value: one load instead of two byte loads (the
+// repacked weight scales are always aligned).
+__device__ __forceinline__ float ld_f16a(const u8* p) {
+    return f16_to_f32(*(const f16_bits*)p);
 }
 
 __device__ __forceinline__ float ld_bf16(const u8* p) {
@@ -257,6 +286,14 @@ __device__ __forceinline__ int q6_to_s8x4(int q) {
 // One warp per output row; weights are read once for all m (<= MV_MAX_M) rows.
 #define MV_MAX_M 8
 
+// Unrolling the unit loops keeps more weight loads in flight on RDNA (+1%
+// decode); on NVIDIA it cost registers (-6% Qwen3-8B decode on sm_89).
+#ifdef RLLM_HIP
+#define MV_UNROLL _Pragma("unroll 4")
+#else
+#define MV_UNROLL
+#endif
+
 // Quantized weights: int8 dot products (dp4a) against quantize_q8 activations.
 // Q8/Q6: each lane takes half a unit (16 elements) per step; Q4: a whole unit.
 // Every weight load is an aligned 16-byte read, contiguous across the warp.
@@ -269,10 +306,12 @@ __device__ __forceinline__ void mv_dot(const u8* __restrict__ qr, const u8* __re
                                        int lane, float* acc) {
     const int units = k / 32;
     if (F == FMT_Q4) {
+        MV_UNROLL
         for (int u = lane; u < units; u += WARP_SIZE) {
             int4 w = *(const int4*)(qr + u * 16);
             const int* wi = (const int*)&w;
-            float d = ld_f16(sr + u * 4), mn = ld_f16(sr + u * 4 + 2);
+            u32 dm = *(const u32*)(sr + u * 4);
+            float d = f16_to_f32(dm & 0xffff), mn = f16_to_f32(dm >> 16);
 #pragma unroll
             for (int j = 0; j < MV_MAX_M; j++) {
                 if (j < m) {
@@ -293,6 +332,7 @@ __device__ __forceinline__ void mv_dot(const u8* __restrict__ qr, const u8* __re
             }
         }
     } else {
+        MV_UNROLL
         for (int h = lane; h < units * 2; h += WARP_SIZE) {
             int u = h >> 1, half = h & 1;
             int w[4];
@@ -300,7 +340,7 @@ __device__ __forceinline__ void mv_dot(const u8* __restrict__ qr, const u8* __re
             if (F == FMT_Q8) {
                 int4 v = *(const int4*)(qr + h * 16);
                 w[0] = v.x; w[1] = v.y; w[2] = v.z; w[3] = v.w;
-                d = ld_f16(sr + u * 2);
+                d = ld_f16a(sr + u * 2);
             } else {  // FMT_Q6
                 int4 lo = *(const int4*)(qr + u * 16);
                 int2 hi = *(const int2*)(hr + u * 8);
@@ -311,7 +351,7 @@ __device__ __forceinline__ void mv_dot(const u8* __restrict__ qr, const u8* __re
                     int hv = (((i & 1) ? hi.y : hi.x) >> (2 * (2 * half + (i >> 1)))) & 0x03030303;
                     w[i] = q6_to_s8x4(lv | (hv << 4));
                 }
-                d = ld_f16(sr + h * 2);
+                d = ld_f16a(sr + h * 2);
             }
 #pragma unroll
             for (int j = 0; j < MV_MAX_M; j++) {
@@ -524,6 +564,14 @@ extern "C" __global__ void f32_to_bf16(const float* __restrict__ x, unsigned sho
         u32 b = __float_as_uint(x[i]);
         out[i] = (unsigned short)((b + 0x7fff + ((b >> 16) & 1)) >> 16);
     }
+}
+
+// 16-bit GEMM output (f16, or bf16 if `bf`) back to f32 times `scale`, 4
+// values per thread.
+extern "C" __global__ void half_to_f32(const unsigned short* __restrict__ x, float* __restrict__ out, long n, int bf,
+                                       float scale) {
+    long i = ((long)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    for (long j = i; j < min(i + 4, n); j++) out[j] = (bf ? __uint_as_float((u32)x[j] << 16) : f16_to_f32(x[j])) * scale;
 }
 
 // One block per row of width d.
@@ -861,7 +909,11 @@ __device__ __forceinline__ float gelu_tanh(float x) {
 __device__ __forceinline__ float gelu_tanh_fast(float x) {
     const float SQRT_2_OVER_PI = 0.7978845608f;
     float y = SQRT_2_OVER_PI * (x + 0.044715f * x * x * x), th;
+#ifdef RLLM_HIP
+    th = tanhf(y);
+#else
     asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(y));
+#endif
     return 0.5f * x * (1.f + th);
 }
 
@@ -1390,6 +1442,187 @@ extern "C" __global__ void attn_prefill(const float* __restrict__ q, const f16_b
     }
 }
 
+#ifdef RLLM_HIP
+// ---------------------------------------------------------------------------
+// Prefill attention on RDNA3 matrix cores (WMMA 16x16x16, f16 in, f32
+// accumulate), FlashAttention-2 style. Same grid and tiles as attn_prefill:
+// (tiles, kv heads); a block's rows are (token, head) pairs of one tile, 16
+// per wave (WA_WAVES waves). Per BK-key chunk: K is staged row-major and V
+// transposed in shared memory; each wave computes S = Q.K^T (16 x BK), runs
+// the online softmax on it, then O += P.V. WMMA fragments (wave32, gfx11):
+//   A (16x16): lane l holds row l%16, k = 0..15 (lanes 16-31 repeat 0-15)
+//   B (16x16): lane l holds column l%16, k = 0..15
+//   C/D:       lane l holds column l%16, rows 2i + l/16 (i = 0..7)
+// P goes from the D layout to the A layout through shared memory.
+#define WA_WAVES 4
+#define WA_ROWS (WA_WAVES * 16)
+
+typedef _Float16 wa_half16 __attribute__((ext_vector_type(16)));
+typedef float wa_float8 __attribute__((ext_vector_type(8)));
+
+template <int HD>
+struct WaCfg {
+    static constexpr int BK = HD <= 128 ? 32 : 16;  // keys per chunk
+    static constexpr int QS = HD + 8;               // padded row strides (halves)
+    static constexpr int KS = HD + 8;
+    static constexpr int VS = BK + 8;
+    static constexpr int PS = 16 + 8;
+    static constexpr int SMEM = (WA_ROWS * QS + BK * KS + HD * VS + WA_WAVES * 16 * PS) * 2;
+};
+
+#if defined(__GFX11__)
+template <int HD>
+__device__ void attn_wmma(const float* __restrict__ q, const f16_bits* __restrict__ kc,
+                          const f16_bits* __restrict__ vc, float* __restrict__ out, const u32* __restrict__ tiles,
+                          const u32* __restrict__ token_seq, const u32* __restrict__ positions,
+                          const u32* __restrict__ block_tables, int max_blocks, int n_heads, int n_kv_heads,
+                          int block_size, float scale, int window, int tile_tokens) {
+    typedef WaCfg<HD> C;
+    constexpr int BK = C::BK, QS = C::QS, KS = C::KS, VS = C::VS, PS = C::PS, NT = HD / 16;
+    extern __shared__ __align__(16) char wa_smem[];
+    _Float16* Qs = (_Float16*)wa_smem;
+    _Float16* Ks = Qs + WA_ROWS * QS;
+    _Float16* Vt = Ks + BK * KS;
+    _Float16* Ps = Vt + HD * VS;
+
+    const int group = n_heads / n_kv_heads;
+    const int rows = tile_tokens * group;
+    const int t0 = tiles[2 * blockIdx.x], nt = tiles[2 * blockIdx.x + 1];
+    const int kvh = blockIdx.y;
+    const int wave = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const int col = lane % 16, half = lane / 16;
+    const int kv_w = n_kv_heads * HD;
+    const u32* table = block_tables + (long)token_seq[t0] * max_blocks;
+
+    // Queries, pre-scaled, as f16 (rows past the tile are zero).
+    for (int i = threadIdx.x; i < WA_ROWS * HD / 4; i += blockDim.x) {
+        int r = i / (HD / 4), d = (i % (HD / 4)) * 4;
+        int t = r / group, h = kvh * group + r % group;
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (r < rows && t < nt) v = *(const float4*)(q + ((long)(t0 + t) * n_heads + h) * HD + d);
+        _Float16* dst = Qs + r * QS + d;
+        dst[0] = (_Float16)(v.x * scale);
+        dst[1] = (_Float16)(v.y * scale);
+        dst[2] = (_Float16)(v.z * scale);
+        dst[3] = (_Float16)(v.w * scale);
+    }
+
+    // This lane's 8 rows (2i + half) of the wave's 16: query positions.
+    int qpos[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int r = wave * 16 + 2 * i + half, t = r / group;
+        qpos[i] = (r < rows && t < nt) ? (int)positions[t0 + t] : -1;
+    }
+    const int first = positions[t0], last = positions[t0 + nt - 1];
+    const int kbeg = window > 0 ? max(0, first + 1 - window) : 0;
+    const int kend = last + 1;
+
+    wa_float8 o[NT];
+#pragma unroll
+    for (int t = 0; t < NT; t++) o[t] = (wa_float8){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float m[8], l[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) m[i] = NEG_INF, l[i] = 0.f;
+    _Float16* Pw = Ps + wave * 16 * PS;
+    const _Float16* Qw = Qs + (wave * 16 + col) * QS;
+
+    for (int k0 = kbeg; k0 < kend; k0 += BK) {
+        __syncthreads();  // previous chunk's K/V reads are done
+        // K rows (8 halves per thread) as stored; V transposed.
+        for (int i = threadIdx.x; i < BK * HD / 8; i += blockDim.x) {
+            int p = i / (HD / 8), d = (i % (HD / 8)) * 8, kp = k0 + p;
+            uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
+            if (kp < kend) {
+                long base = ((long)table[kp / block_size] * block_size + kp % block_size) * kv_w + kvh * HD + d;
+                kv = *(const uint4*)(kc + base);
+                vv = *(const uint4*)(vc + base);
+            }
+            *(uint4*)(Ks + p * KS + d) = kv;
+            const f16_bits* vh = (const f16_bits*)&vv;
+#pragma unroll
+            for (int j = 0; j < 8; j++) ((f16_bits*)Vt)[(d + j) * VS + p] = vh[j];
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int j = 0; j < BK / 16; j++) {
+            // S = Q . K^T for keys k0 + 16j ..
+            wa_float8 s = (wa_float8){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            const _Float16* kr = Ks + (j * 16 + col) * KS;
+#pragma unroll
+            for (int t = 0; t < NT; t++) {
+                wa_half16 a = *(const wa_half16*)(Qw + t * 16);
+                wa_half16 b = *(const wa_half16*)(kr + t * 16);
+                s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, s);
+            }
+            // Mask, then the online softmax per row (16 lanes share a row set).
+            const int kp = k0 + j * 16 + col;
+            float corr[8];
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                bool ok = kp < kend && kp <= qpos[i] && (window <= 0 || qpos[i] - kp < window);
+                float v = ok ? s[i] : NEG_INF;
+                float mx = v;
+                for (int off = 8; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 16));
+                float m_new = fmaxf(m[i], mx);
+                float p = (m_new == NEG_INF || v == NEG_INF) ? 0.f : __expf(v - m_new);
+                corr[i] = m_new == NEG_INF ? 1.f : __expf(m[i] - m_new);
+                float sum = p;
+                for (int off = 8; off > 0; off >>= 1) sum += __shfl_xor(sum, off, 16);
+                l[i] = l[i] * corr[i] + sum;
+                m[i] = m_new;
+                Pw[(2 * i + half) * PS + col] = (_Float16)p;
+            }
+#pragma unroll
+            for (int t = 0; t < NT; t++)
+#pragma unroll
+                for (int i = 0; i < 8; i++) o[t][i] *= corr[i];
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+            // O += P . V: A = P rows, B = V^T rows (one head dim, 16 keys).
+            wa_half16 a = *(const wa_half16*)(Pw + col * PS);
+#pragma unroll
+            for (int t = 0; t < NT; t++) {
+                wa_half16 b = *(const wa_half16*)(Vt + (t * 16 + col) * VS + j * 16);
+                o[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, o[t]);
+            }
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int r = wave * 16 + 2 * i + half, t = r / group;
+        if (r >= rows || t >= nt) continue;
+        float inv = l[i] > 0.f ? 1.f / l[i] : 0.f;
+        float* op = out + ((long)(t0 + t) * n_heads + kvh * group + r % group) * HD + col;
+#pragma unroll
+        for (int tt = 0; tt < NT; tt++) op[tt * 16] = o[tt][i] * inv;
+    }
+}
+
+#define INSTANTIATE_WA(HD)                                                                                   \
+    extern "C" __global__ void __launch_bounds__(WA_WAVES * 32) attn_wmma_d##HD(                             \
+        const float* q, const f16_bits* kc, const f16_bits* vc, float* out, const u32* tiles,                 \
+        const u32* token_seq, const u32* positions, const u32* block_tables, int max_blocks, int n_heads,     \
+        int n_kv_heads, int block_size, float scale, int window, int tile_tokens) {                           \
+        attn_wmma<HD>(q, kc, vc, out, tiles, token_seq, positions, block_tables, max_blocks, n_heads,         \
+                      n_kv_heads, block_size, scale, window, tile_tokens);                                    \
+    }
+#else
+#define INSTANTIATE_WA(HD) \
+    extern "C" __global__ void attn_wmma_d##HD() { __builtin_trap(); }
+#endif  // __GFX11__
+INSTANTIATE_WA(64)
+INSTANTIATE_WA(128)
+INSTANTIATE_WA(256)
+#endif  // RLLM_HIP
+
+#ifndef RLLM_HIP
 // ---------------------------------------------------------------------------
 // Vendor shim: tensor-core MMA. PTX on NVIDIA (sm_80+); the HIP port maps
 // these two functions to MFMA/WMMA builtins. Nothing else uses inline PTX.
@@ -1652,8 +1885,15 @@ __device__ __forceinline__ void ldmatrix_x4_trans(u32* r, const void* row_addr) 
                  : "r"(smem_u32(row_addr)));
 }
 
+#else
+// HIP: no PTX tensor-core attention (attn_wmma is the RDNA3 counterpart).
+RLLM_STUB(attn_prefill_tc)
+#endif  // RLLM_HIP
+
+#if !defined(RLLM_HIP) || defined(__GFX11__)
 // Quantized GEMM for prefill ("MMQ"): out[m, n] = x[m, k] . W[n, k]^T with
-// int8 tensor cores, reading the repacked weights directly (no f16 copy).
+// int8 tensor cores (mma.sync on NVIDIA, WMMA on RDNA3), reading the
+// repacked weights directly (no f16 copy).
 // x is pre-quantized by quantize_q8 (int8 + per-unit scale and scaled sum).
 //
 // Block: MMQ_BM weight rows x MMQ_BN tokens, 8 warps in a 4x2 grid, each warp
@@ -1682,6 +1922,43 @@ __device__ __forceinline__ void ldmatrix_x4_trans(u32* r, const void* row_addr) 
 #define MMQ_STRIDE (MMQ_CU * 32 + 16)  // padded int8 row stride in smem
 #define MMQ_THREADS 128
 #define MMQ_MT (MMQ_BM / 2 / 16)  // row tiles per warp (2 warp rows)
+// Accumulator tiles per warp: token tiles (32 tokens) x values per lane.
+// mma.sync m16n8: 4 tiles of 8 tokens, 4 values (rows g, g+8 x tokens 2t, 2t+1).
+// WMMA 16x16: 2 tiles of 16 tokens, 8 values (rows 2e + lane/16, token lane%16).
+#ifdef RLLM_HIP
+#define MMQ_NT 2
+#define MMQ_E 8
+#else
+#define MMQ_NT 4
+#define MMQ_E 4
+#endif
+
+// Row (within the warp row's 64) and token (within the warp's 32) of
+// accumulator value e of tile (mt, nt).
+__device__ __forceinline__ int mmq_row(int mt, int e, int lane) {
+#ifdef RLLM_HIP
+    return mt * 16 + 2 * e + lane / 16;
+#else
+    return mt * 16 + lane / 4 + (e >= 2 ? 8 : 0);
+#endif
+}
+__device__ __forceinline__ int mmq_tok(int nt, int e, int lane) {
+#ifdef RLLM_HIP
+    return nt * 16 + lane % 16;
+#else
+    return nt * 8 + 2 * (lane % 4) + (e & 1);
+#endif
+}
+
+#ifdef RLLM_HIP
+typedef int mmq_int8v __attribute__((ext_vector_type(8)));
+// c += a (16x16 int8, rows) . b (16x16 int8, columns), signed.
+__device__ __forceinline__ mmq_int8v wmma_s8(int4 a, int4 b, mmq_int8v c) {
+    typedef int int4v __attribute__((ext_vector_type(4)));
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, __builtin_bit_cast(int4v, a), true,
+                                                      __builtin_bit_cast(int4v, b), c, false);
+}
+#endif
 
 // int -> float for the MMA epilogue. A plain conversion measured faster on
 // sm_120 than the add/subtract "magic number" trick (one instruction instead
@@ -1718,12 +1995,12 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
     const int per_split = ((units + splits - 1) / splits + MMQ_CU - 1) / MMQ_CU * MMQ_CU;
     const int u_beg = blockIdx.z * per_split, u_end = min(units, u_beg + per_split);
     const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
-    const int g = lane / 4, t = lane % 4;
     const int wm = warp / 2, wn = warp % 2;  // warp tile: MMQ_MT*16 rows x 32 tokens
 
-    float acc[MMQ_MT][4][4];
+    float acc[MMQ_MT][MMQ_NT][MMQ_E];
     for (int a = 0; a < MMQ_MT; a++)
-        for (int b = 0; b < 4; b++) acc[a][b][0] = acc[a][b][1] = acc[a][b][2] = acc[a][b][3] = 0.f;
+        for (int b = 0; b < MMQ_NT; b++)
+            for (int e = 0; e < MMQ_E; e++) acc[a][b][e] = 0.f;
 
     for (int u0 = u_beg; u0 < u_end; u0 += MMQ_CU) {
         const int cu = min(MMQ_CU, u_end - u0);
@@ -1790,7 +2067,51 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
         }
         __syncthreads();
 
+#ifdef RLLM_HIP
         for (int ul = 0; ul < cu; ul++) {
+            // WMMA fragments: lane l holds row (A) or token (B) l%16 and 16
+            // of the unit's 32 bytes; a unit is two k-steps (Q6: one per scale).
+            const int col = lane % 16, half = lane / 16;
+            int4 a[MMQ_MT][2], b[MMQ_NT][2];
+            for (int mt = 0; mt < MMQ_MT; mt++)
+                for (int h = 0; h < 2; h++)
+                    a[mt][h] = *(const int4*)(As + (wm * (MMQ_MT * 16) + mt * 16 + col) * MMQ_STRIDE + ul * 32 + h * 16);
+            for (int nt = 0; nt < MMQ_NT; nt++)
+                for (int h = 0; h < 2; h++)
+                    b[nt][h] = *(const int4*)(Bs + (wn * 32 + nt * 16 + col) * MMQ_STRIDE + ul * 32 + h * 16);
+            float dbx[MMQ_NT], sbx[MMQ_NT];
+            for (int nt = 0; nt < MMQ_NT; nt++) {
+                const int tc = wn * 32 + nt * 16 + col;
+                dbx[nt] = Bd[ul][tc];
+                sbx[nt] = F == FMT_Q4 ? Bsum[ul][tc] : 0.f;
+            }
+#pragma unroll
+            for (int mt = 0; mt < MMQ_MT; mt++) {
+                const int rb = wm * (MMQ_MT * 16) + mt * 16 + half;  // + 2e
+#pragma unroll
+                for (int nt = 0; nt < MMQ_NT; nt++) {
+                    const mmq_int8v z = {0, 0, 0, 0, 0, 0, 0, 0};
+                    float* c = acc[mt][nt];
+                    if (F == FMT_Q6) {
+                        mmq_int8v c0 = wmma_s8(a[mt][0], b[nt][0], z), c1 = wmma_s8(a[mt][1], b[nt][1], z);
+#pragma unroll
+                        for (int e = 0; e < MMQ_E; e++)
+                            c[e] += dbx[nt] * (Ad[2 * ul][rb + 2 * e] * i2f_small(c0[e]) +
+                                               Ad[2 * ul + 1][rb + 2 * e] * i2f_small(c1[e]));
+                    } else {
+                        mmq_int8v ci = wmma_s8(a[mt][1], b[nt][1], wmma_s8(a[mt][0], b[nt][0], z));
+#pragma unroll
+                        for (int e = 0; e < MMQ_E; e++) {
+                            c[e] += dbx[nt] * Ad[2 * ul][rb + 2 * e] * i2f_small(ci[e]);
+                            if (F == FMT_Q4) c[e] -= Am[ul][rb + 2 * e] * sbx[nt];
+                        }
+                    }
+                }
+            }
+        }
+#else
+        for (int ul = 0; ul < cu; ul++) {
+            const int g = lane / 4, t = lane % 4;
             // Fragments for this unit: A for 2 row tiles, B for 4 token tiles.
             u32 a[MMQ_MT][4], b[4][2];
             float da[MMQ_MT][2][2], ma[MMQ_MT][2], dbx[4][2], sbx[4][2];
@@ -1876,6 +2197,7 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
                 }
             }
         }
+#endif
         __syncthreads();
     }
 
@@ -1895,10 +2217,10 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
 #pragma unroll
         for (int mt = 0; mt < MMQ_MT; mt++)
 #pragma unroll
-            for (int nt = 0; nt < 4; nt++)
+            for (int nt = 0; nt < MMQ_NT; nt++)
 #pragma unroll
-                for (int e = 0; e < 4; e++) {
-                    int rl = mt * 16 + g + (e >= 2 ? 8 : 0), tl = wn * 32 + nt * 8 + 2 * t + (e & 1);
+                for (int e = 0; e < MMQ_E; e++) {
+                    int rl = mmq_row(mt, e, lane), tl = wn * 32 + mmq_tok(nt, e, lane);
                     GU[at(tl, rl)] = acc[mt][nt][e];
                 }
         __syncthreads();
@@ -1961,12 +2283,10 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
 #pragma unroll
     for (int mt = 0; mt < MMQ_MT; mt++) {
 #pragma unroll
-        for (int nt = 0; nt < 4; nt++) {
-            int row = r0 + wm * (MMQ_MT * 16) + mt * 16 + g;
-            int tok = c0 + wn * 32 + nt * 8 + 2 * t;
+        for (int nt = 0; nt < MMQ_NT; nt++) {
 #pragma unroll
-            for (int e = 0; e < 4; e++) {
-                int rr = row + (e >= 2 ? 8 : 0), tt = tok + (e & 1);
+            for (int e = 0; e < MMQ_E; e++) {
+                int rr = r0 + wm * (MMQ_MT * 16) + mmq_row(mt, e, lane), tt = c0 + wn * 32 + mmq_tok(nt, e, lane);
                 if (rr < n && tt < m) {
                     if (splits > 2)
                         part[(long)blockIdx.z * m * n + (long)tt * n + rr] = acc[mt][nt][e];
@@ -2004,6 +2324,12 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
 INSTANTIATE_MMQ(q8, FMT_Q8)
 INSTANTIATE_MMQ(q4, FMT_Q4)
 INSTANTIATE_MMQ(q6, FMT_Q6)
+#else
+// HIP targets without RDNA3 WMMA: the backend doesn't call MMQ there.
+RLLM_STUB(mmq_q8) RLLM_STUB(mmq_q4) RLLM_STUB(mmq_q6)
+RLLM_STUB(mmq_glu_silu_q8) RLLM_STUB(mmq_glu_silu_q4) RLLM_STUB(mmq_glu_silu_q6)
+RLLM_STUB(mmq_glu_gelu_q8) RLLM_STUB(mmq_glu_gelu_q4) RLLM_STUB(mmq_glu_gelu_q6)
+#endif
 
 // out[i] = part[0][i] + part[1][i] + ... in split order (see mmq's split-K).
 extern "C" __global__ void mmq_sum_splits(const float* __restrict__ part, float* __restrict__ out, int splits,
@@ -2279,6 +2605,7 @@ INSTANTIATE_AD(4, 128)
 INSTANTIATE_AD(4, 256)
 INSTANTIATE_AD(4, 512)
 
+#ifndef RLLM_HIP
 // FlashAttention-2 style prefill attention on tensor cores, templated on head dim.
 //
 // Grid: (tiles, kv heads). Block: FaCfg::WARPS warps = RG row groups (16 query
@@ -2575,3 +2902,6 @@ INSTANTIATE_FA(64)
 INSTANTIATE_FA(128)
 INSTANTIATE_FA(256)
 INSTANTIATE_FA(512)
+#else
+RLLM_STUB(attn_fa_d64) RLLM_STUB(attn_fa_d128) RLLM_STUB(attn_fa_d256) RLLM_STUB(attn_fa_d512)
+#endif  // RLLM_HIP

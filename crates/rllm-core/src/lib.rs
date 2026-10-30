@@ -6,11 +6,13 @@
 
 mod dtype;
 pub mod quant;
+pub mod sample;
 
 use std::ops::Range;
 use std::sync::Arc;
 
 pub use dtype::DType;
+pub use sample::RowSample;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -183,6 +185,20 @@ pub trait Backend: Send + Sync {
     fn alloc(&self, len: usize) -> Result<Self::Buffer>;
     fn alloc_kv(&self, layout: KvLayout) -> Result<Self::KvCache>;
     fn to_host(&self, buf: &Self::Buffer, out: &mut [f32]) -> Result<()>;
+
+    /// Sample one token from each listed row of `logits` (`[n_rows, vocab]`),
+    /// as [`sample::sample_row`] does, into `out` (one id per entry of
+    /// `rows`). Ends a recorded step like `to_host`. GPU backends sample on
+    /// the device and copy back only the ids.
+    fn sample_rows(&self, logits: &Self::Buffer, n_rows: usize, vocab: usize, rows: &[(u32, &RowSample)], out: &mut [u32]) -> Result<()> {
+        let mut host = vec![0f32; n_rows * vocab];
+        self.to_host(logits, &mut host)?;
+        for ((r, s), o) in rows.iter().zip(out.iter_mut()) {
+            let r = *r as usize;
+            *o = sample::sample_row(&host[r * vocab..(r + 1) * vocab], s);
+        }
+        Ok(())
+    }
 
     /// `out[i, :] = table[tokens[i], :]`
     fn embed(&self, table: &Self::Weight, tokens: &[u32], out: &mut Self::Buffer) -> Result<()>;
@@ -470,15 +486,15 @@ pub trait Backend: Send + Sync {
 
     /// Fused attention input prep for one layer: `qn = rope(rmsnorm(q) * q_norm)`,
     /// and into the KV cache at `slots`: `rope(rmsnorm(k) * k_norm)` and
-    /// `v` (RMS-normalized with `v_norm` when given).
+    /// `v` (RMS-normalized with `v_norm` when given). `qk_norm` = (q_norm,
+    /// k_norm); without it q and k are only rotated (Llama).
     #[allow(clippy::too_many_arguments)]
     fn qkv_norm_rope_store(
         &self,
         q: &Self::Buffer,
         k: &Self::Buffer,
         v: &Self::Buffer,
-        q_norm: &Self::Weight,
-        k_norm: &Self::Weight,
+        qk_norm: Option<(&Self::Weight, &Self::Weight)>,
         v_norm: Option<&Self::Weight>,
         qn: &mut Self::Buffer,
         kv: &mut Self::KvCache,
@@ -493,9 +509,20 @@ pub trait Backend: Send + Sync {
         freq_factors: Option<&Self::Weight>,
     ) -> Result<()> {
         let n = positions.len();
-        self.rms_norm_rope(q, q_norm, qn, positions, n_heads, head_dim, eps, theta, freq_factors)?;
         let mut kn = self.alloc(n * n_kv_heads * head_dim)?;
-        self.rms_norm_rope(k, k_norm, &mut kn, positions, n_kv_heads, head_dim, eps, theta, freq_factors)?;
+        match qk_norm {
+            Some((q_norm, k_norm)) => {
+                self.rms_norm_rope(q, q_norm, qn, positions, n_heads, head_dim, eps, theta, freq_factors)?;
+                self.rms_norm_rope(k, k_norm, &mut kn, positions, n_kv_heads, head_dim, eps, theta, freq_factors)?;
+            }
+            None => {
+                let rows = |heads: usize| (0..(n * heads) as u32).collect::<Vec<_>>();
+                self.gather_rows(q, &rows(n_heads), head_dim, qn)?;
+                self.rope(qn, positions, n_heads, head_dim, theta, freq_factors)?;
+                self.gather_rows(k, &rows(n_kv_heads), head_dim, &mut kn)?;
+                self.rope(&mut kn, positions, n_kv_heads, head_dim, theta, freq_factors)?;
+            }
+        }
         match v_norm {
             Some(w) => {
                 let mut vn = self.alloc(n * n_kv_heads * head_dim)?;

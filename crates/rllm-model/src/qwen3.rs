@@ -1,18 +1,23 @@
-//! Qwen3 dense decoder (GGUF architecture `qwen3`).
+//! Dense decoders: Qwen3 and the Llama family (GGUF architectures `qwen3`
+//! and `llama`, which covers Llama 2/3 and Mistral).
 //!
-//! Per layer: RMSNorm → Q/K/V projections → per-head RMSNorm on Q and K →
-//! NeoX RoPE → paged GQA attention → output projection → residual, then
-//! RMSNorm → SwiGLU MLP → residual.
+//! Per layer: RMSNorm → Q/K/V projections → per-head RMSNorm on Q and K
+//! (Qwen3 only) → NeoX RoPE → paged GQA attention → output projection →
+//! residual, then RMSNorm → SwiGLU MLP → residual. Llama's Q/K rows are
+//! stored for ggml's adjacent-pair RoPE and are reordered on load (see
+//! `load_weight_rope_neox`).
 
 use anyhow::{Context, Result, bail};
 use rllm_core::{Activation, AttnMeta, Backend, KvLayout, KvType};
 use rllm_gguf::Gguf;
 
-use crate::loader::load_weight;
-use crate::{Batch, Model};
+use crate::loader::{load_weight, load_weight_rope_neox};
+use crate::{Batch, Model, StepOut};
 
 #[derive(Debug, Clone)]
 pub struct Qwen3Config {
+    /// `qwen3` or `llama`.
+    pub arch: String,
     pub n_layers: usize,
     pub hidden: usize,
     pub ffn: usize,
@@ -28,9 +33,10 @@ pub struct Qwen3Config {
 impl Qwen3Config {
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
         let arch = g.get_str("general.architecture")?;
-        if arch != "qwen3" {
-            bail!("unsupported architecture {arch:?} (only qwen3 for now)");
+        if !matches!(arch, "qwen3" | "llama") {
+            bail!("unsupported architecture {arch:?} (dense: qwen3, llama)");
         }
+        let llama = arch == "llama";
         let k = |s: &str| format!("{arch}.{s}");
         let n_heads = g.get_u64(&k("attention.head_count"))? as usize;
         let hidden = g.get_u64(&k("embedding_length"))? as usize;
@@ -40,6 +46,7 @@ impl Qwen3Config {
         };
         let vocab = g.require_tensor("token_embd.weight")?.dims[1] as usize;
         Ok(Self {
+            arch: arch.to_string(),
             n_layers: g.get_u64(&k("block_count"))? as usize,
             hidden,
             ffn: g.get_u64(&k("feed_forward_length"))? as usize,
@@ -47,8 +54,8 @@ impl Qwen3Config {
             n_kv_heads: g.get_u64(&k("attention.head_count_kv"))? as usize,
             head_dim,
             vocab,
-            rope_theta: g.get_f64(&k("rope.freq_base")).unwrap_or(1_000_000.0) as f32,
-            rms_eps: g.get_f64(&k("attention.layer_norm_rms_epsilon")).unwrap_or(1e-6) as f32,
+            rope_theta: g.get_f64(&k("rope.freq_base")).unwrap_or(if llama { 10_000.0 } else { 1_000_000.0 }) as f32,
+            rms_eps: g.get_f64(&k("attention.layer_norm_rms_epsilon")).unwrap_or(if llama { 1e-5 } else { 1e-6 }) as f32,
             max_context: g.get_u64(&k("context_length")).unwrap_or(32768) as usize,
         })
     }
@@ -79,8 +86,8 @@ struct Layer<B: Backend> {
     wk: B::Weight,
     wv: B::Weight,
     wo: B::Weight,
-    q_norm: B::Weight,
-    k_norm: B::Weight,
+    /// Per-head Q and K RMSNorm weights (Qwen3).
+    qk_norm: Option<(B::Weight, B::Weight)>,
     ffn_norm: B::Weight,
     gate: B::Weight,
     up: B::Weight,
@@ -94,23 +101,31 @@ pub struct Qwen3<B: Backend> {
     out_norm: B::Weight,
     /// `None` when the output projection is tied to the embedding table.
     output: Option<B::Weight>,
+    /// Llama 3.1+ RoPE scaling: per-frequency divisors (`rope_freqs.weight`).
+    rope_freqs: Option<B::Weight>,
 }
 
 impl<B: Backend> Qwen3<B> {
     pub fn load(backend: &B, g: &Gguf) -> Result<Self> {
         let cfg = Qwen3Config::from_gguf(g)?;
         let w = |name: &str| load_weight(backend, g, name);
+        let llama = cfg.arch == "llama";
+        // Q and K in NeoX order (see the module docs).
+        let wqk = |name: &str| if llama { load_weight_rope_neox(backend, g, name, cfg.head_dim) } else { w(name) };
         let layers = (0..cfg.n_layers)
             .map(|i| {
                 let p = |s: &str| format!("blk.{i}.{s}.weight");
+                let qk_norm = match g.tensor(&p("attn_q_norm")) {
+                    Some(_) => Some((w(&p("attn_q_norm"))?, w(&p("attn_k_norm"))?)),
+                    None => None,
+                };
                 Ok(Layer {
                     attn_norm: w(&p("attn_norm"))?,
-                    wq: w(&p("attn_q"))?,
-                    wk: w(&p("attn_k"))?,
+                    wq: wqk(&p("attn_q"))?,
+                    wk: wqk(&p("attn_k"))?,
                     wv: w(&p("attn_v"))?,
                     wo: w(&p("attn_output"))?,
-                    q_norm: w(&p("attn_q_norm"))?,
-                    k_norm: w(&p("attn_k_norm"))?,
+                    qk_norm,
                     ffn_norm: w(&p("ffn_norm"))?,
                     gate: w(&p("ffn_gate"))?,
                     up: w(&p("ffn_up"))?,
@@ -122,10 +137,14 @@ impl<B: Backend> Qwen3<B> {
             Some(_) => Some(w("output.weight")?),
             None => None,
         };
-        Ok(Self { embed: w("token_embd.weight")?, out_norm: w("output_norm.weight")?, layers, output, cfg })
+        let rope_freqs = match g.tensor("rope_freqs.weight") {
+            Some(_) => Some(w("rope_freqs.weight")?),
+            None => None,
+        };
+        Ok(Self { embed: w("token_embd.weight")?, out_norm: w("output_norm.weight")?, layers, output, rope_freqs, cfg })
     }
 
-    fn forward_impl(&self, b: &B, kv: &mut B::KvCache, batch: &Batch, block_size: usize) -> Result<Vec<f32>> {
+    fn forward_impl(&self, b: &B, kv: &mut B::KvCache, batch: &Batch, block_size: usize) -> Result<StepOut> {
         let c = &self.cfg;
         let n = batch.tokens.len();
         let (d, qw, kvw) = (c.hidden, c.q_width(), c.kv_width());
@@ -160,8 +179,8 @@ impl<B: Backend> Qwen3<B> {
             // h = attn_norm(x) on entry (fused into the previous layer's residual add).
             b.matmul_many(&h, &[&l.wq, &l.wk, &l.wv], &mut [&mut q, &mut k, &mut v], n)?;
             b.qkv_norm_rope_store(
-                &q, &k, &v, &l.q_norm, &l.k_norm, None, &mut qn, kv, li, batch.positions, batch.slots, c.n_heads,
-                c.n_kv_heads, c.head_dim, c.rms_eps, c.rope_theta, None,
+                &q, &k, &v, l.qk_norm.as_ref().map(|(a, b)| (a, b)), None, &mut qn, kv, li, batch.positions, batch.slots, c.n_heads,
+                c.n_kv_heads, c.head_dim, c.rms_eps, c.rope_theta, self.rope_freqs.as_ref(),
             )?;
             b.attention(&qn, kv, li, &meta, &mut attn)?;
             b.matmul(&attn, &l.wo, &mut h, n)?;
@@ -192,13 +211,11 @@ impl<B: Backend> Qwen3<B> {
         if batch.hidden {
             let mut host = vec![0f32; m * d];
             b.to_host(&normed, &mut host)?;
-            return Ok(host);
+            return Ok(StepOut { rows: host, ids: Vec::new() });
         }
         let mut logits = b.alloc(m * c.vocab)?;
         b.matmul(&normed, self.output.as_ref().unwrap_or(&self.embed), &mut logits, m)?;
-        let mut host = vec![0f32; m * c.vocab];
-        b.to_host(&logits, &mut host)?;
-        Ok(host)
+        crate::finish_logits(b, &logits, m, c.vocab, batch)
     }
 }
 
@@ -227,7 +244,7 @@ impl<B: Backend> Model<B> for Qwen3<B> {
         Ok(b.kv_from_host(cache, store, host, dev)?)
     }
 
-    fn forward(&self, b: &B, cache: &mut B::KvCache, batch: &Batch, block_size: usize) -> Result<Vec<f32>> {
+    fn forward(&self, b: &B, cache: &mut B::KvCache, batch: &Batch, block_size: usize) -> Result<StepOut> {
         self.forward_impl(b, cache, batch, block_size)
     }
 
@@ -237,6 +254,6 @@ impl<B: Backend> Model<B> for Qwen3<B> {
 
     fn summary(&self) -> String {
         let c = &self.cfg;
-        format!("qwen3: {} layers, hidden {}, {} heads / {} kv", c.n_layers, c.hidden, c.n_heads, c.n_kv_heads)
+        format!("{}: {} layers, hidden {}, {} heads / {} kv", c.arch, c.n_layers, c.hidden, c.n_heads, c.n_kv_heads)
     }
 }

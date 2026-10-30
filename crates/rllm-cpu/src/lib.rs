@@ -117,7 +117,7 @@ fn llamacpp_round_activations(dtype: DType, x: &mut [f32]) {
             }
         }
         // quantize_row_q8_K_ref: iscale = -127/max (signed max), q = nearest_int, d = 1/iscale (f32)
-        DType::Q4K | DType::Q6K => {
+        DType::Q4K | DType::Q5K | DType::Q6K | DType::IQ4XS => {
             for b in x.chunks_exact_mut(256) {
                 let (mut max, mut amax) = (0f32, 0f32);
                 for &v in b.iter() {

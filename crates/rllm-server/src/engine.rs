@@ -31,7 +31,7 @@ use anyhow::{Context, Result};
 use rllm_core::{Backend, KvType};
 use rllm_gguf::Gguf;
 use rllm_kv::{PrefixCache, SeqKv};
-use rllm_model::{AnyModel, Dist, KvPool, Model, Sampler, SamplerConfig, StepItem, Want};
+use rllm_model::{AnyModel, Dist, KvPool, Model, RowSample, Sampler, SamplerConfig, StepItem, Want};
 use rllm_tokenizer::Tokenizer;
 use tokio::sync::{mpsc as tmpsc, oneshot};
 
@@ -171,6 +171,9 @@ pub struct EngineConfig {
     pub prompt_lookup: bool,
     /// Pinned system memory for the prefix cache's host tier, in bytes (0: none).
     pub host_cache_bytes: usize,
+    /// Sample every token on the host from full logits rows, instead of on
+    /// the device where possible (see `device_sample`).
+    pub host_sampling: bool,
 }
 
 pub const BLOCK_SIZE: usize = 16;
@@ -776,6 +779,10 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         let active: Vec<usize> = (0..self.running.len()).filter(|&i| takes[i] > 0).collect();
         // Logits rows per active sequence, and where its KV stood before.
         let mut rows_of = Vec::with_capacity(active.len());
+        // Sequences whose next token is sampled on the device (see
+        // `device_sample`); one spec per logits row, in row order.
+        let mut on_device = vec![false; self.running.len()];
+        let mut sample: Vec<Option<RowSample>> = Vec::new();
         let mut start_of = vec![0usize; self.running.len()];
         let out = {
             // Verified tokens: the pending one, then the drafts.
@@ -798,31 +805,47 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                 let Seq { tokens, kv, .. } = s;
                 if !spec_tokens[i].is_empty() {
                     rows_of.push(takes[i]);
+                    sample.extend(std::iter::repeat_n(None, takes[i]));
                     items.push(StepItem { seq: kv, tokens: &spec_tokens[i], want: Want::All });
                 } else {
                     let all = start + takes[i] == tokens.len();
                     rows_of.push(all as usize);
+                    if all {
+                        let spec = device_sample(&s.params, &s.json, &s.counts, tokens.len(), self.cfg.host_sampling);
+                        on_device[i] = spec.is_some();
+                        sample.push(spec);
+                    }
                     items.push(StepItem { seq: kv, tokens: &tokens[start..start + takes[i]], want: if all { Want::Last } else { Want::None } });
                 }
             }
             Metrics::add(&self.metrics.steps, 1);
             Metrics::add(&self.metrics.step_tokens, n_tok);
             let t = Instant::now();
-            let out = self.pool.step(&mut items, false)?;
+            if sample.iter().all(Option::is_none) {
+                sample.clear();
+            }
+            let out = self.pool.step_sampled(&mut items, false, &sample)?;
             self.timing.forward += t.elapsed();
             out
         };
         let t_sample = Instant::now();
         // Sample every sequence whose pending tokens are all in the cache now.
         let vocab_n = self.pool.model().vocab_size();
-        let mut out = out;
+        let rllm_model::StepOut { rows: mut out, ids } = out;
+        // Tokens already sampled on the device: send them.
+        let mut ids = ids.into_iter();
+        let mut device_results: Vec<(usize, Next, usize)> = Vec::new();
+        for &i in active.iter().filter(|&&i| on_device[i]) {
+            let id = ids.next().context("missing device-sampled id")?;
+            device_results.push((i, emit(&mut self.running[i], id, None, &[], self.tok), 0));
+        }
         // Logits rows are processed in place (no copies: a fresh 1 MB
         // buffer per token costs more in page faults than the argmax).
         let mut rest: &mut [f32] = &mut out;
         let lookup: Vec<bool> = proposals.iter().map(|p| p.lookup).collect();
         let mut jobs: Vec<(usize, &mut [f32], Proposal)> = Vec::new();
         for (&i, &n) in active.iter().zip(&rows_of) {
-            if n > 0 {
+            if n > 0 && !on_device[i] {
                 anyhow::ensure!(rest.len() >= n * vocab_n, "missing logits rows");
                 let (rows, tail) = rest.split_at_mut(n * vocab_n);
                 rest = tail;
@@ -858,7 +881,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             })
         };
         let mut done: Vec<(usize, Finish)> = Vec::new();
-        for (i, next, kept) in results {
+        for (i, next, kept) in results.into_iter().chain(device_results) {
             if spec[i] > 0 && takes[i] > 1 {
                 // Keep the KV of the pending token and the accepted drafts;
                 // the draft cache keeps what it shares with them.
@@ -1025,6 +1048,27 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         }
         Ok(out)
     }
+}
+
+/// How to sample a sequence's next token on the device, or None when it
+/// needs its logits row on the host: logprobs, a JSON constraint (its
+/// verification steps never get here), or `--host-sampling`.
+fn device_sample(params: &GenParams, json: &Option<JsonState>, counts: &HashMap<u32, u32>, position: usize, host_only: bool) -> Option<RowSample> {
+    if host_only || params.logprobs.is_some() || json.is_some() {
+        return None;
+    }
+    let mut adjust = params.logit_bias.clone();
+    if params.frequency_penalty != 0.0 || params.presence_penalty != 0.0 {
+        adjust.extend(counts.iter().map(|(&id, &c)| (id, -(c as f32 * params.frequency_penalty + params.presence_penalty))));
+    }
+    Some(RowSample {
+        temperature: params.temperature,
+        top_k: params.top_k.min(u32::MAX as usize) as u32,
+        top_p: params.top_p,
+        seed: params.seed,
+        counter: position as u64,
+        adjust,
+    })
 }
 
 /// Process one sequence's logits: logprobs, logit bias, penalties, the JSON

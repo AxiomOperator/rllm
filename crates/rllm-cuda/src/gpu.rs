@@ -190,6 +190,10 @@ pub fn end_capture(stream: &Arc<Stream>) -> Result<Option<GraphExec>, Error> {
     stream.end_capture(sys::CUgraphInstantiate_flags(0))
 }
 
+/// Decode matvecs split rows of 1024+ columns over several warps only when
+/// one warp per row would leave SMs idle (tuned on sm_89/sm_120).
+pub const MATVEC_SPLIT_K: bool = false;
+
 /// Element type of GEMM inputs.
 /// GEMMs write f32 directly.
 pub const GEMM_HALF_OUT: bool = false;

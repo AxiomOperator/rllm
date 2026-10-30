@@ -108,6 +108,8 @@ Continuous batching, chunked prefill, prefix caching, quantized matmul kernels t
 
 **Exit:** API works with AegisLLM; at concurrency 16/32/64, throughput is benchmarked against vLLM and the gaps are understood.
 
+**Status (2026-10-30):** benchmarked (`compare.md`, "Concurrency"): Qwen3-0.6B BF16 at 0.96/0.82/0.76× vLLM's throughput at 16/32/64 clients after moving sampling to the GPU and graphing decode steps of up to 64 tokens; Qwen3-8B Q4_K_M at 0.53–0.60× of vLLM's AWQ, the gap being MMQ's fixed 64-token tile for decode steps of 9–32 tokens.
+
 ### Phase 3 — ROCm and multi-GPU
 
 HIP backend built from the hipified kernels, hipBLASLt, Strix Halo tuning (unified memory, bandwidth-bound decode), 2-way tensor parallelism (NCCL/RCCL), pipeline parallelism, model placement across nodes.
@@ -118,7 +120,8 @@ HIP backend built from the hipified kernels, hipBLASLt, Strix Halo tuning (unifi
 - **One backend, two vendor layers.** `rllm-cuda/src/backend.rs` is compiled by both crates against a small `gpu` module: cudarc in `rllm-cuda`, dlopened HIP/hiprtc/hipBLAS in `rllm-hip` (no ROCm needed to build; one binary serves both vendors, `-d gpu` picks whichever is present).
 - **One kernel source.** `kernels.cu` has a HIP prelude (f16 conversion, shuffles, dp4a) and RDNA3 WMMA versions of the tensor-core work: the MMQ inner loop and a prefill attention kernel. The PTX-only kernels are stubs on HIP.
 - **gfx1151 specifics.** hipBLAS GEMMs write f16 (4× faster than f32 output there), scaled to keep range; BF16 weights go through f16. Integrated memory: `rllm tune` sizes from RAM and skips the host tier.
-- **Left:** hipBLASLt (1.5× hipBLAS on f16 output), a tighter Q4_K repack for decode bandwidth, WMMA attention for 512-wide heads, gfx12 WMMA, multi-GPU.
+- **Since:** hipBLASLt for large GEMMs, Q4_K repacked at 4.625 bits, split-row decode matvecs, WMMA attention for every head dim (64–512), Q5_K and IQ4_XS, Llama/Mistral. Strix Halo vs llama.cpp ROCm: prefill 1.02–1.44×, decode 0.90–1.13×, 16k-context prefill and decode 0.88–0.96×.
+- **Left:** gfx12 WMMA, batch-sized MMQ tiles, the Vulkan comparison, multi-GPU.
 
 ### Phase 4 — Advanced
 

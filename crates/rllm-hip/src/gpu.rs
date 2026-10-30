@@ -661,6 +661,11 @@ pub fn alloc_mapped_host(ctx: &Arc<Context>, bytes: usize) -> Result<(PinnedSlic
     Ok((buf, dev as u64))
 }
 
+/// Decode matvecs split every row of 1024+ columns over 4 waves, as
+/// llama.cpp's do: on gfx1151 a wave per row left the memory system
+/// underused (BF16 0.6B decode 104 -> 125 tok/s).
+pub const MATVEC_SPLIT_K: bool = true;
+
 /// hipBLAS on gfx11 runs f16/bf16-output GEMMs about 4x faster than f32-output
 /// ones (measured 20-29 vs 5-6 TFLOPS on gfx1151, f32 accumulate either way),
 /// so GEMMs write the input's 16-bit type and a kernel widens it to f32, as
@@ -672,17 +677,44 @@ pub const GEMM_HALF_OUT: bool = true;
 /// f16 output keeps more precision than bf16 would (see GEMM_HALF_OUT).
 pub const BF16_VIA_F16: bool = true;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GemmIn {
     F16,
     BF16,
 }
 
-/// hipBLAS on the backend's stream, with a workspace when the library takes one.
+/// hipBLASLt's plan for one GEMM shape: descriptors and the chosen algorithm.
+struct LtPlan {
+    desc: ffi::LtDesc,
+    layouts: [ffi::LtLayout; 3],
+    /// `hipblasLtMatmulAlgo_t` (opaque, 24 bytes in ROCm 7).
+    algo: [u64; 3],
+}
+
+/// hipBLASLt handle and plans by (n, m, k, input type).
+struct Lt {
+    handle: ffi::LtHandle,
+    plans: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize, GemmIn), Option<LtPlan>>>,
+}
+
+/// hipBLAS on the backend's stream, with a workspace when the library takes
+/// one. Large f16/bf16-output GEMMs go through hipBLASLt when it loads: 1.5x
+/// hipBLAS on gfx1151 from 4096 x 4096 weights up (30-33 vs 16-22 TFLOPS),
+/// but no faster on small ones, where its higher per-call cost made
+/// Qwen3-0.6B prefill 18% slower.
 pub struct Blas {
     handle: ffi::BlasHandle,
-    _workspace: Slice<u8>,
+    lt: Option<Lt>,
+    stream: Arc<Stream>,
+    workspace: Slice<u8>,
 }
+
+const WORKSPACE: usize = 32 << 20;
+const LT_DESC_TRANSA: c_int = 0;
+const LT_DESC_TRANSB: c_int = 1;
+const LT_PREF_MAX_WORKSPACE_BYTES: c_int = 1;
+/// `sizeof(hipblasLtMatmulHeuristicResult_t)`; the algorithm is its first 24 bytes.
+const LT_HEURISTIC_BYTES: usize = 56;
 
 unsafe impl Send for Blas {}
 unsafe impl Sync for Blas {}
@@ -691,6 +723,15 @@ impl Drop for Blas {
     fn drop(&mut self) {
         if let Ok(b) = ffi::BLAS.as_ref() {
             unsafe { (b.hipblasDestroy)(self.handle) };
+        }
+        if let (Some(lt), Ok(f)) = (&self.lt, ffi::LT.as_ref()) {
+            for plan in lt.plans.lock().unwrap().values().flatten() {
+                unsafe {
+                    (f.hipblasLtMatmulDescDestroy)(plan.desc);
+                    plan.layouts.iter().for_each(|&l| _ = (f.hipblasLtMatrixLayoutDestroy)(l));
+                }
+            }
+            unsafe { (f.hipblasLtDestroy)(lt.handle) };
         }
     }
 }
@@ -704,7 +745,6 @@ impl Blas {
         if st != 0 {
             return Err(format!("hipblasCreate: {st}"));
         }
-        const WORKSPACE: usize = 32 << 20;
         let workspace = stream.alloc_zeros::<u8>(WORKSPACE).map_err(|e| e.0)?;
         unsafe {
             if (b.hipblasSetStream)(handle, stream.raw) != 0 {
@@ -715,7 +755,65 @@ impl Blas {
                 set(handle, workspace.ptr as *mut c_void, WORKSPACE);
             }
         }
-        Ok(Self { handle, _workspace: workspace })
+        let lt = if std::env::var_os("RLLM_NO_HIPBLASLT").is_some() {
+            None
+        } else {
+            ffi::LT.as_ref().ok().and_then(|f| {
+                let mut h = std::ptr::null_mut();
+                (unsafe { (f.hipblasLtCreate)(&mut h) } == 0).then(|| Lt { handle: h, plans: Default::default() })
+            })
+        };
+        Ok(Self { handle, lt, stream: stream.clone(), workspace })
+    }
+
+    /// hipBLASLt's plan for this shape (made on first use; None if it has
+    /// no algorithm for it).
+    fn lt_plan<'a>(
+        &self,
+        lt: &'a Lt,
+        n: usize,
+        m: usize,
+        k: usize,
+        input: GemmIn,
+        ty: c_int,
+    ) -> std::sync::MutexGuard<'a, std::collections::HashMap<(usize, usize, usize, GemmIn), Option<LtPlan>>> {
+        let mut plans = lt.plans.lock().unwrap();
+        plans.entry((n, m, k, input)).or_insert_with(|| {
+            let f = ffi::LT.as_ref().ok()?;
+            // SAFETY: valid out-pointers and attribute buffers; everything
+            // created is either kept in the plan or destroyed here.
+            unsafe {
+                let mut desc = std::ptr::null_mut();
+                if (f.hipblasLtMatmulDescCreate)(&mut desc, HIPBLAS_COMPUTE_32F, HIP_R_32F) != 0 {
+                    return None;
+                }
+                let (ta, tb) = (HIPBLAS_OP_T, HIPBLAS_OP_N);
+                (f.hipblasLtMatmulDescSetAttribute)(desc, LT_DESC_TRANSA, (&ta as *const c_int).cast(), 4);
+                (f.hipblasLtMatmulDescSetAttribute)(desc, LT_DESC_TRANSB, (&tb as *const c_int).cast(), 4);
+                let mut layouts = [std::ptr::null_mut(); 3];
+                // A stored [n][k] (k-major, transposed in the op), B [m][k], C [m][n].
+                (f.hipblasLtMatrixLayoutCreate)(&mut layouts[0], ty, k as u64, n as u64, k as i64);
+                (f.hipblasLtMatrixLayoutCreate)(&mut layouts[1], ty, k as u64, m as u64, k as i64);
+                (f.hipblasLtMatrixLayoutCreate)(&mut layouts[2], ty, n as u64, m as u64, n as i64);
+                let mut pref = std::ptr::null_mut();
+                (f.hipblasLtMatmulPreferenceCreate)(&mut pref);
+                let ws = WORKSPACE as u64;
+                (f.hipblasLtMatmulPreferenceSetAttribute)(pref, LT_PREF_MAX_WORKSPACE_BYTES, (&ws as *const u64).cast(), 8);
+                let mut result = [0u64; LT_HEURISTIC_BYTES / 8];
+                let mut found = 0;
+                let st = (f.hipblasLtMatmulAlgoGetHeuristic)(
+                    lt.handle, desc, layouts[0], layouts[1], layouts[2], layouts[2], pref, 1, result.as_mut_ptr().cast(), &mut found,
+                );
+                (f.hipblasLtMatmulPreferenceDestroy)(pref);
+                if st != 0 || found < 1 {
+                    (f.hipblasLtMatmulDescDestroy)(desc);
+                    layouts.iter().for_each(|&l| _ = (f.hipblasLtMatrixLayoutDestroy)(l));
+                    return None;
+                }
+                Some(LtPlan { desc, layouts, algo: [result[0], result[1], result[2]] })
+            }
+        });
+        plans
     }
 
     /// See `rllm-cuda`'s `Blas::gemm_tn`; `c` has the input's type when
@@ -731,6 +829,36 @@ impl Blas {
             GemmIn::BF16 => HIP_R_16BF,
         };
         let beta = 0f32;
+        const LT_MIN_WEIGHT: usize = 8 << 20;
+        if let Some(lt) = self.lt.as_ref().filter(|_| GEMM_HALF_OUT && n * k >= LT_MIN_WEIGHT) {
+            let plans = self.lt_plan(lt, n, m, k, input, ty);
+            if let (Some(plan), Ok(f)) = (&plans[&(n, m, k, input)], ffi::LT.as_ref()) {
+                let [la, lb, lc] = plan.layouts;
+                // SAFETY: the plan describes exactly these shapes; the caller
+                // guarantees the pointers.
+                let st = unsafe {
+                    (f.hipblasLtMatmul)(
+                        lt.handle,
+                        plan.desc,
+                        (&alpha as *const f32).cast(),
+                        a as *const c_void,
+                        la,
+                        b as *const c_void,
+                        lb,
+                        (&beta as *const f32).cast(),
+                        c as *const c_void,
+                        lc,
+                        c as *mut c_void,
+                        lc,
+                        plan.algo.as_ptr().cast(),
+                        self.workspace.ptr as *mut c_void,
+                        WORKSPACE,
+                        self.stream.raw,
+                    )
+                };
+                return if st != 0 { Err(format!("hipblasLtMatmul: status {st}")) } else { Ok(()) };
+            }
+        }
         let st = unsafe {
             (lib.hipblasGemmEx)(
                 self.handle,

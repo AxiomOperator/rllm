@@ -83,6 +83,8 @@ pub struct ServeConfig {
     pub prompt_lookup: bool,
     /// Pinned system memory for the prefix cache's host tier (0: none).
     pub host_cache_bytes: usize,
+    /// Sample on the host from full logits rows (see `EngineConfig::host_sampling`).
+    pub host_sampling: bool,
     /// Save stored chat completions and responses here, and load them at start.
     pub store_file: Option<PathBuf>,
     /// Log one line per finished generation.
@@ -119,6 +121,7 @@ where
         draft_tokens: cfg.draft_tokens.max(1),
         prompt_lookup: cfg.prompt_lookup,
         host_cache_bytes: if cfg.prefix_cache { cfg.host_cache_bytes } else { 0 },
+        host_sampling: cfg.host_sampling,
     };
     let store = match &cfg.store_file {
         Some(p) => Store::load(p)?,

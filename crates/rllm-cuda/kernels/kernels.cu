@@ -30,6 +30,7 @@ typedef signed char i8;
 typedef unsigned short f16_bits;
 
 #define NEG_INF __int_as_float(0xff800000)
+#define POS_INF __int_as_float(0x7f800000)
 
 #ifdef RLLM_HIP
 // Vendor shim (HIP): RDNA runs wave32, the same lockstep width as a CUDA
@@ -96,7 +97,14 @@ __device__ __forceinline__ float warp_max(float v) {
 //   FMT_F32/F16/BF16  plain row-major values, as in GGUF.
 //   FMT_Q8  qs: int8 [k]; sc: f16 per unit (value = d * q).
 //   FMT_Q4  qs: 16 bytes per unit, byte b = q[b] | q[b+16] << 4;
-//           sc: f16 pair (d, m) per unit (value = d * q - m).
+//           sc: per 8 units (a GGUF super-block), 20 bytes: f16 d, f16 dmin,
+//           then a 6-bit scale and min per unit as bytes (value =
+//           d * scale * q - dmin * min). 4.625 bits per weight; GGUF's
+//           Q4_K packs the scales tighter (4.5), at the cost of unpacking.
+//   FMT_Q5  as FMT_Q4, plus qh: 4 bytes per unit, bit e = bit 4 of element e
+//           (value = d * scale * q - dmin * min, q = 0..31). 5.625 bits.
+//   FMT_IQ4 qs: 4-bit codebook indices laid out like FMT_Q4; sc: f16 per
+//           unit (value = d * kvalues_iq4nl[q]). 4.5 bits, as in GGUF.
 //   FMT_Q6  qs: low 4 bits, laid out like FMT_Q4; qh: 8 bytes per unit,
 //           byte b = hi[b] | hi[b+8] << 2 | hi[b+16] << 4 | hi[b+24] << 6;
 //           sc: f16 per 16 elements (value = d * ((lo | hi << 4) - 32)).
@@ -106,6 +114,42 @@ __device__ __forceinline__ float warp_max(float v) {
 #define FMT_Q8 3
 #define FMT_Q4 4
 #define FMT_Q6 5
+#define FMT_Q5 6
+#define FMT_IQ4 7
+// Formats whose units carry an offset (value = d q - m): MMQ adds a min term.
+#define HAS_MIN(F) ((F) == FMT_Q4 || (F) == FMT_Q5)
+
+// Bits 0..3 of `b` to bit 4 of bytes 0..3 (Q5's high bits, 4 elements).
+__device__ __forceinline__ int q5_hi4(u32 b) {
+    return (int)(((b & 1) | ((b & 2) << 7) | ((b & 4) << 14) | ((b & 8) << 21)) << 4);
+}
+
+// Bytes {lo, hi} selected by the 3-bit index in each byte of idx.
+__device__ __forceinline__ u32 perm8(u32 lo, u32 hi, u32 idx) {
+#ifdef RLLM_HIP
+    return __builtin_amdgcn_perm(hi, lo, idx);
+#else
+    u32 sel = (idx & 0x7) | ((idx >> 4) & 0x70) | ((idx >> 8) & 0x700) | ((idx >> 12) & 0x7000);
+    return __byte_perm(lo, hi, sel);
+#endif
+}
+
+// int8 codebook values (kvalues_iq4nl) for 4 indices, one per byte (0..15).
+__device__ __forceinline__ int iq4_vals(u32 idx) {
+    const u32 lo = perm8(0xBFAD9881u, 0xF6EADDCFu, idx & 0x07070707);
+    const u32 hi = perm8(0x26190D01u, 0x71594535u, idx & 0x07070707);
+    const u32 sel = ((idx >> 3) & 0x01010101) * 0xFF;
+    return (int)((lo & ~sel) | (hi & sel));
+}
+
+// FMT_Q4: unit u's scale d * scale and offset dmin * min.
+__device__ __forceinline__ void q4_dm(const u8* sc, int u, float& d, float& m) {
+    const u8* g = sc + (u >> 3) * 20;
+    u32 dd = *(const u32*)g;
+    u32 sm = *(const unsigned short*)(g + 4 + (u & 7) * 2);
+    d = f16_to_f32(dd & 0xffff) * (float)(sm & 0xff);
+    m = f16_to_f32(dd >> 16) * (float)(sm >> 8);
+}
 
 // Dequantize elements [4*sub, 4*sub + 4) of unit `u` of one row.
 // The single definition of each device format; everything else builds on it.
@@ -126,10 +170,24 @@ __device__ __forceinline__ void dequant4(const u8* qs, const u8* qh, const u8* s
         const i8* q = (const i8*)qs + u * 32 + e;
         for (int i = 0; i < 4; i++) y[i] = d * (float)q[i];
     } else if (F == FMT_Q4) {
-        float d = ld_f16(sc + u * 4), m = ld_f16(sc + u * 4 + 2);
+        float d, m;
+        q4_dm(sc, u, d, m);
         const u8* q = qs + u * 16 + (e & 15);
         int shift = (e >> 4) * 4;
         for (int i = 0; i < 4; i++) y[i] = d * (float)((q[i] >> shift) & 0xF) - m;
+    } else if (F == FMT_Q5) {
+        float d, m;
+        q4_dm(sc, u, d, m);
+        const u8* q = qs + u * 16 + (e & 15);
+        u32 hb = *(const u32*)(qh + u * 4);
+        int shift = (e >> 4) * 4;
+        for (int i = 0; i < 4; i++) y[i] = d * (float)(((q[i] >> shift) & 0xF) | (((hb >> (e + i)) & 1) << 4)) - m;
+    } else if (F == FMT_IQ4) {
+        float d = ld_f16(sc + u * 2);
+        const u8* q = qs + u * 16 + (e & 15);
+        int shift = (e >> 4) * 4;
+        const signed char kv[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+        for (int i = 0; i < 4; i++) y[i] = d * (float)kv[(q[i] >> shift) & 0xF];
     } else if (F == FMT_Q6) {
         float d = ld_f16(sc + ((u * 32 + e) >> 4) * 2);
         const u8* lo = qs + u * 16 + (e & 15);
@@ -174,7 +232,6 @@ extern "C" __global__ void repack_q4_k(const u8* __restrict__ raw, u8* qs, u8* s
     int r = idx / units, u = idx % units;
     const u8* b = raw + (long)r * (k / 256) * 144 + (u / 8) * 144;
     int j = u % 8;
-    float d = ld_f16(b), dmin = ld_f16(b + 2);
     const u8* scl = b + 4;
     int s, m;
     if (j < 4) {
@@ -185,8 +242,11 @@ extern "C" __global__ void repack_q4_k(const u8* __restrict__ raw, u8* qs, u8* s
         m = (scl[j + 4] >> 4) | ((scl[j] >> 6) << 4);
     }
     long orow = row0 + r;
-    st_f16(sc + orow * units * 4 + u * 4, d * s);
-    st_f16(sc + orow * units * 4 + u * 4 + 2, dmin * m);
+    u8* g = sc + orow * (k / 256) * 20 + (u / 8) * 20;
+    if (j == 0)
+        for (int i = 0; i < 4; i++) g[i] = b[i];  // d, dmin as stored
+    g[4 + 2 * j] = s;
+    g[5 + 2 * j] = m;
     const u8* q = b + 16 + (j / 2) * 32;
     int shift = (j & 1) * 4;
     u8* o = qs + orow * (k / 2) + u * 16;
@@ -215,6 +275,56 @@ extern "C" __global__ void repack_q6_k(const u8* __restrict__ raw, u8* qs, u8* q
         hi[i] = (q[i] >> 4) | ((q[i + 8] >> 4) << 2) | ((q[i + 16] >> 4) << 4) | ((q[i + 24] >> 4) << 6);
     st_f16(sc + orow * (k / 16) * 2 + u * 4, d * scl[2 * rr]);
     st_f16(sc + orow * (k / 16) * 2 + u * 4 + 2, d * scl[2 * rr + 1]);
+}
+
+extern "C" __global__ void repack_q5_k(const u8* __restrict__ raw, u8* qs, u8* qh, u8* sc, int row0, int n, int k) {
+    int units = k / 32;
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)n * units) return;
+    int r = idx / units, u = idx % units;
+    const u8* b = raw + (long)r * (k / 256) * 176 + (u / 8) * 176;
+    int j = u % 8;
+    int s, m;
+    const u8* scl = b + 4;
+    if (j < 4) {
+        s = scl[j] & 63;
+        m = scl[j + 4] & 63;
+    } else {
+        s = (scl[j + 4] & 0xF) | ((scl[j - 4] >> 6) << 4);
+        m = (scl[j + 4] >> 4) | ((scl[j] >> 6) << 4);
+    }
+    long orow = row0 + r;
+    u8* g = sc + orow * (k / 256) * 20 + (u / 8) * 20;
+    if (j == 0)
+        for (int i = 0; i < 4; i++) g[i] = b[i];  // d, dmin as stored
+    g[4 + 2 * j] = s;
+    g[5 + 2 * j] = m;
+    // Unit j: chunk j / 2 of 64, low (j even) or high nibbles; its high bits
+    // are bit j of qh[l].
+    const u8* q = b + 48 + (j / 2) * 32;
+    const u8* h = b + 16;
+    int shift = (j & 1) * 4;
+    u8* o = qs + orow * (k / 2) + u * 16;
+    for (int i = 0; i < 16; i++) o[i] = ((q[i] >> shift) & 0xF) | (((q[i + 16] >> shift) & 0xF) << 4);
+    u32 hb = 0;
+    for (int i = 0; i < 32; i++) hb |= (u32)((h[i] >> j) & 1) << i;
+    *(u32*)(qh + orow * (k / 8) + u * 4) = hb;
+}
+
+extern "C" __global__ void repack_iq4_xs(const u8* __restrict__ raw, u8* qs, u8* sc, int row0, int n, int k) {
+    int units = k / 32;
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)n * units) return;
+    int r = idx / units, u = idx % units;
+    const u8* b = raw + (long)r * (k / 256) * 136 + (u / 8) * 136;
+    int j = u % 8;
+    int scales_h = b[2] | (b[3] << 8);
+    int ls = ((b[4 + j / 2] >> (4 * (j % 2))) & 0xF) | (((scales_h >> (2 * j)) & 3) << 4);
+    long orow = row0 + r;
+    st_f16(sc + orow * units * 2 + u * 2, ld_f16(b) * (float)(ls - 32));
+    const u8* q = b + 8 + j * 16;
+    u8* o = qs + orow * (k / 2) + u * 16;
+    for (int i = 0; i < 16; i++) o[i] = q[i];  // same nibble layout
 }
 
 // ---------------------------------------------------------------------------
@@ -299,94 +409,154 @@ __device__ __forceinline__ int q6_to_s8x4(int q) {
 // Every weight load is an aligned 16-byte read, contiguous across the warp.
 // `block` is the block index within this weight (see matvec_multi).
 // One row's partial dot products (per lane; the caller reduces the warp):
-// acc[j] += row . x[j] for j < m.
+// acc[j] += row . x[j] for j < m, over units (Q8/Q6: half units) start,
+// start + stride, ... (lane, WARP_SIZE unless several warps share the row).
+// One step of a row's dot products: unit i (Q4) or half unit i (Q8/Q6).
 template <int F>
-__device__ __forceinline__ void mv_dot(const u8* __restrict__ qr, const u8* __restrict__ hr, const u8* __restrict__ sr,
-                                       const i8* __restrict__ xq, const float* __restrict__ xd, int k, int m,
-                                       int lane, float* acc) {
+__device__ __forceinline__ void mv_step(const u8* __restrict__ qr, const u8* __restrict__ hr, const u8* __restrict__ sr,
+                                        const i8* __restrict__ xq, const float* __restrict__ xd, int k, int m, int i,
+                                        float* acc) {
     const int units = k / 32;
-    if (F == FMT_Q4) {
-        MV_UNROLL
-        for (int u = lane; u < units; u += WARP_SIZE) {
-            int4 w = *(const int4*)(qr + u * 16);
-            const int* wi = (const int*)&w;
-            u32 dm = *(const u32*)(sr + u * 4);
-            float d = f16_to_f32(dm & 0xffff), mn = f16_to_f32(dm >> 16);
+    if (F == FMT_IQ4) {
+        const int u = i;
+        int4 w = *(const int4*)(qr + u * 16);
+        const int* wi = (const int*)&w;
+        const float d = ld_f16a(sr + u * 2);
+        int wl[4], wh[4];
 #pragma unroll
-            for (int j = 0; j < MV_MAX_M; j++) {
-                if (j < m) {
-                    const int4* xp = (const int4*)(xq + (long)j * k + u * 32);
-                    int4 xa = xp[0], xb = xp[1];
-                    const int* a = (const int*)&xa;
-                    const int* b = (const int*)&xb;
-                    int s = 0, sx = 0;
+        for (int c = 0; c < 4; c++) {
+            wl[c] = iq4_vals(wi[c] & 0x0F0F0F0F);
+            wh[c] = iq4_vals((wi[c] >> 4) & 0x0F0F0F0F);
+        }
 #pragma unroll
-                    for (int i = 0; i < 4; i++) {
-                        s = __dp4a(wi[i] & 0x0F0F0F0F, a[i], s);
-                        s = __dp4a((wi[i] >> 4) & 0x0F0F0F0F, b[i], s);
-                        sx = __dp4a(0x01010101, a[i], sx);
-                        sx = __dp4a(0x01010101, b[i], sx);
-                    }
-                    acc[j] += xd[(long)j * units + u] * (d * (float)s - mn * (float)sx);
+        for (int j = 0; j < MV_MAX_M; j++) {
+            if (j < m) {
+                const int4* xp = (const int4*)(xq + (long)j * k + u * 32);
+                int4 xa = xp[0], xb = xp[1];
+                const int* a = (const int*)&xa;
+                const int* b = (const int*)&xb;
+                int s = 0;
+#pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    s = __dp4a(wl[c], a[c], s);
+                    s = __dp4a(wh[c], b[c], s);
                 }
+                acc[j] += xd[(long)j * units + u] * d * (float)s;
+            }
+        }
+    } else if (F == FMT_Q4 || F == FMT_Q5) {
+        const int u = i;
+        int4 w = *(const int4*)(qr + u * 16);
+        const int* wi = (const int*)&w;
+        float d, mn;
+        q4_dm(sr, u, d, mn);
+        const u32 hb = F == FMT_Q5 ? *(const u32*)(hr + u * 4) : 0;
+#pragma unroll
+        for (int j = 0; j < MV_MAX_M; j++) {
+            if (j < m) {
+                const int4* xp = (const int4*)(xq + (long)j * k + u * 32);
+                int4 xa = xp[0], xb = xp[1];
+                const int* a = (const int*)&xa;
+                const int* b = (const int*)&xb;
+                int s = 0, sx = 0;
+#pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    int lo = wi[c] & 0x0F0F0F0F, hi = (wi[c] >> 4) & 0x0F0F0F0F;
+                    if (F == FMT_Q5) {
+                        lo |= q5_hi4(hb >> (4 * c));
+                        hi |= q5_hi4(hb >> (16 + 4 * c));
+                    }
+                    s = __dp4a(lo, a[c], s);
+                    s = __dp4a(hi, b[c], s);
+                    sx = __dp4a(0x01010101, a[c], sx);
+                    sx = __dp4a(0x01010101, b[c], sx);
+                }
+                acc[j] += xd[(long)j * units + u] * (d * (float)s - mn * (float)sx);
             }
         }
     } else {
-        MV_UNROLL
-        for (int h = lane; h < units * 2; h += WARP_SIZE) {
-            int u = h >> 1, half = h & 1;
-            int w[4];
-            float d;
-            if (F == FMT_Q8) {
-                int4 v = *(const int4*)(qr + h * 16);
-                w[0] = v.x; w[1] = v.y; w[2] = v.z; w[3] = v.w;
-                d = ld_f16a(sr + u * 2);
-            } else {  // FMT_Q6
-                int4 lo = *(const int4*)(qr + u * 16);
-                int2 hi = *(const int2*)(hr + u * 8);
-                const int* l4 = (const int*)&lo;
+        const int h = i, u = h >> 1, half = h & 1;
+        int w[4];
+        float d;
+        if (F == FMT_Q8) {
+            int4 v = *(const int4*)(qr + h * 16);
+            w[0] = v.x; w[1] = v.y; w[2] = v.z; w[3] = v.w;
+            d = ld_f16a(sr + u * 2);
+        } else {  // FMT_Q6
+            int4 lo = *(const int4*)(qr + u * 16);
+            int2 hi = *(const int2*)(hr + u * 8);
+            const int* l4 = (const int*)&lo;
 #pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    int lv = (l4[i] >> (4 * half)) & 0x0F0F0F0F;
-                    int hv = (((i & 1) ? hi.y : hi.x) >> (2 * (2 * half + (i >> 1)))) & 0x03030303;
-                    w[i] = q6_to_s8x4(lv | (hv << 4));
-                }
-                d = ld_f16a(sr + h * 2);
+            for (int c = 0; c < 4; c++) {
+                int lv = (l4[c] >> (4 * half)) & 0x0F0F0F0F;
+                int hv = (((c & 1) ? hi.y : hi.x) >> (2 * (2 * half + (c >> 1)))) & 0x03030303;
+                w[c] = q6_to_s8x4(lv | (hv << 4));
             }
+            d = ld_f16a(sr + h * 2);
+        }
 #pragma unroll
-            for (int j = 0; j < MV_MAX_M; j++) {
-                if (j < m) {
-                    int4 xv = *(const int4*)(xq + (long)j * k + h * 16);
-                    int s = __dp4a(w[0], xv.x, 0);
-                    s = __dp4a(w[1], xv.y, s);
-                    s = __dp4a(w[2], xv.z, s);
-                    s = __dp4a(w[3], xv.w, s);
-                    acc[j] += d * xd[(long)j * units + u] * (float)s;
-                }
+        for (int j = 0; j < MV_MAX_M; j++) {
+            if (j < m) {
+                int4 xv = *(const int4*)(xq + (long)j * k + h * 16);
+                int s = __dp4a(w[0], xv.x, 0);
+                s = __dp4a(w[1], xv.y, s);
+                s = __dp4a(w[2], xv.z, s);
+                s = __dp4a(w[3], xv.w, s);
+                acc[j] += d * xd[(long)j * units + u] * (float)s;
             }
         }
     }
 }
 
+// Steps per row for mv_step.
 template <int F>
+__device__ __forceinline__ int mv_steps(int k) {
+    return (F == FMT_Q4 || F == FMT_Q5 || F == FMT_IQ4) ? k / 32 : k / 16;
+}
+
+template <int F>
+__device__ __forceinline__ void mv_dot(const u8* __restrict__ qr, const u8* __restrict__ hr, const u8* __restrict__ sr,
+                                       const i8* __restrict__ xq, const float* __restrict__ xd, int k, int m,
+                                       int start, int stride, float* acc) {
+    MV_UNROLL
+    for (int i = start; i < mv_steps<F>(k); i += stride) mv_step<F>(qr, hr, sr, xq, xd, k, m, i, acc);
+}
+
+
+// KW warps per row as in matvec_f (split k; combined through shared memory).
+template <int F, int KW>
 __device__ void matvec_q(int block, const u8* __restrict__ qs, const u8* __restrict__ qh, const u8* __restrict__ sc,
                          const i8* __restrict__ xq, const float* __restrict__ xd, float* __restrict__ out, int n,
                          int k, int m, long qs_row, long qh_row, long sc_row) {
-    int warps = blockDim.x / WARP_SIZE;
-    int r = block * warps + threadIdx.x / WARP_SIZE;
-    int lane = threadIdx.x % WARP_SIZE;
-    if (r >= n) return;
+    __shared__ float part[MV_MAX_M][8];
+    const int warps = blockDim.x / WARP_SIZE, warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const int r = block * (warps / KW) + warp / KW, sub = warp % KW;
+    const bool valid = r < n;  // uniform per row group: no early return (barrier below)
+    if (KW == 1 && !valid) return;
+    const long rr = valid ? r : 0;
     float acc[MV_MAX_M];
 #pragma unroll
     for (int j = 0; j < MV_MAX_M; j++) acc[j] = 0.f;
-    mv_dot<F>(qs + (long)r * qs_row, qh + (long)r * qh_row, sc + (long)r * sc_row, xq, xd, k, m, lane, acc);
+    if (valid)
+        mv_dot<F>(qs + rr * qs_row, qh + rr * qh_row, sc + rr * sc_row, xq, xd, k, m, lane + sub * WARP_SIZE,
+                  WARP_SIZE * KW, acc);
 #pragma unroll
-    for (int j = 0; j < MV_MAX_M; j++) {
-        if (j < m) {
-            float s = warp_sum(acc[j]);
-            if (lane == 0) out[(long)j * n + r] = s;
-        }
+    for (int j = 0; j < MV_MAX_M; j++)
+        if (j < m) acc[j] = warp_sum(acc[j]);
+    if (KW > 1) {
+        if (lane == 0)
+#pragma unroll
+            for (int j = 0; j < MV_MAX_M; j++) part[j][warp] = acc[j];
+        __syncthreads();
+        if (sub != 0) return;
+#pragma unroll
+        for (int j = 0; j < MV_MAX_M; j++)
+            for (int q = 1; q < KW; q++) acc[j] += part[j][warp + q];
     }
+    if (!valid || lane != 0) return;
+#pragma unroll
+    for (int j = 0; j < MV_MAX_M; j++)
+        if (j < m) out[(long)j * n + r] = acc[j];
 }
 
 // Up to MV_TARGETS weights of one format that share the same input x (e.g.
@@ -448,6 +618,7 @@ __device__ void matvec_f(int block, const u8* __restrict__ w, const float* __res
 #pragma unroll
     for (int j = 0; j < MV_MAX_M; j++) acc[j] = 0.f;
     float y[8];
+    MV_UNROLL
     for (int c = lane + sub * WARP_SIZE; valid && c < k / 8; c += WARP_SIZE * kw) {
         load8<F>(row, c, y);
 #pragma unroll
@@ -532,14 +703,34 @@ __device__ void embed(const u8* __restrict__ qs, const u8* __restrict__ qh, cons
             matvec_f<F, 1>(blockIdx.x - t.block_start, t.qs, x, t.out, t.n, k, m, t.qs_row);                  \
     }
 
+// The split-row quantized matvec is HIP-only (gpu::MATVEC_SPLIT_K); leaving
+// it out of the CUDA build keeps the one-warp kernel as it was (its extra
+// instantiation cost 1.8% on Qwen3-0.6B Q8 decode on sm_89).
+#ifdef RLLM_HIP
+#define MATVEC_Q_KW4(F)                                                                                       \
+    if (kw == 4) {                                                                                            \
+        matvec_q<F, 4>(blockIdx.x - t.block_start, t.qs, t.qh, t.sc, xq, xd, t.out, t.n, k, m, t.qs_row,     \
+                       t.qh_row, t.sc_row);                                                                   \
+        return;                                                                                               \
+    }                                                                                                         \
+    if (kw == 2) {                                                                                            \
+        matvec_q<F, 2>(blockIdx.x - t.block_start, t.qs, t.qh, t.sc, xq, xd, t.out, t.n, k, m, t.qs_row,     \
+                       t.qh_row, t.sc_row);                                                                   \
+        return;                                                                                               \
+    }
+#else
+#define MATVEC_Q_KW4(F)
+#endif
 #define INSTANTIATE_QUANT(NAME, F)                                                                            \
     INSTANTIATE_COMMON(NAME, F)                                                                               \
-    extern "C" __global__ void matvec_##NAME(MvTargets ts, const i8* xq, const float* xd, int k, int m) {    \
+    extern "C" __global__ void matvec_##NAME(MvTargets ts, const i8* xq, const float* xd, int k, int m,      \
+                                             int kw) {                                                        \
         int i = 0;                                                                                            \
         while (i + 1 < ts.count && (int)blockIdx.x >= ts.t[i + 1].block_start) i++;                         \
         const MvTarget& t = ts.t[i];                                                                          \
-        matvec_q<F>(blockIdx.x - t.block_start, t.qs, t.qh, t.sc, xq, xd, t.out, t.n, k, m, t.qs_row,        \
-                    t.qh_row, t.sc_row);                                                                      \
+        MATVEC_Q_KW4(F)                                                                                       \
+        matvec_q<F, 1>(blockIdx.x - t.block_start, t.qs, t.qh, t.sc, xq, xd, t.out, t.n, k, m, t.qs_row,     \
+                       t.qh_row, t.sc_row);                                                                   \
     }
 
 INSTANTIATE_FLOAT(f32, FMT_F32)
@@ -548,6 +739,8 @@ INSTANTIATE_FLOAT(bf16, FMT_BF16)
 INSTANTIATE_QUANT(q8, FMT_Q8)
 INSTANTIATE_QUANT(q4, FMT_Q4)
 INSTANTIATE_QUANT(q6, FMT_Q6)
+INSTANTIATE_QUANT(q5, FMT_Q5)
+INSTANTIATE_QUANT(iq4, FMT_IQ4)
 
 // ---------------------------------------------------------------------------
 // Elementwise and normalization
@@ -635,6 +828,128 @@ __device__ __forceinline__ float block_sum(float v, float* scratch) {
     __syncthreads();
     v = lane < blockDim.x / WARP_SIZE ? scratch[lane] : 0.f;
     return warp_sum(v);
+}
+
+// ---------------------------------------------------------------------------
+// Device-side sampling (rllm-core/src/sample.rs is the reference): one block
+// per sampled row; only the token ids go back to the host.
+
+__device__ __forceinline__ float block_max(float v, float* scratch) {
+    int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    v = warp_max(v);
+    __syncthreads();
+    if (lane == 0) scratch[warp] = v;
+    __syncthreads();
+    v = lane < blockDim.x / WARP_SIZE ? scratch[lane] : NEG_INF;
+    return warp_max(v);
+}
+
+// (value, index) of the block's maximum; ties go to the lowest index.
+__device__ __forceinline__ int block_argmax(float v, int idx, float* sv, int* si) {
+    int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int o = WARP_SIZE / 2; o > 0; o >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffff, v, o);
+            int oi = __shfl_xor_sync(0xffffffff, idx, o);
+            if (ov > v || (ov == v && oi < idx)) v = ov, idx = oi;
+        }
+        if (pass == 1) break;
+        __syncthreads();
+        if (lane == 0) sv[warp] = v, si[warp] = idx;
+        __syncthreads();
+        v = lane < blockDim.x / WARP_SIZE ? sv[lane] : NEG_INF;
+        idx = lane < blockDim.x / WARP_SIZE ? si[lane] : 0x7fffffff;
+    }
+    return idx;
+}
+
+// Uniform in (0, 1) from (seed, counter, token): sample.rs's `uniform`.
+__device__ __forceinline__ float sample_uniform(unsigned long long seed, unsigned long long ctr, u32 tok) {
+    unsigned long long z = seed ^ (ctr * 0x9E3779B97F4A7C15ull) ^ ((unsigned long long)tok * 0xD1B54A32D192ED03ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    return ((float)(z >> 40) + 0.5f) * (1.f / 16777216.f);
+}
+
+// logits[at[i]] += delta[i] (logit bias, repetition penalties).
+extern "C" __global__ void logit_adjust(float* __restrict__ logits, const u32* __restrict__ at,
+                                        const u32* __restrict__ delta, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) logits[at[i]] += __uint_as_float(delta[i]);
+}
+
+#define SAMPLE_BISECT 40
+// params per sampled row (8 words): temperature bits, top_k, top_p bits,
+// seed lo/hi, counter lo/hi, logits row.
+extern "C" __global__ void __launch_bounds__(1024) sample_rows(const float* __restrict__ logits, int vocab,
+                                                               const u32* __restrict__ params, u32* __restrict__ out) {
+    __shared__ float sv[1024 / WARP_SIZE];
+    __shared__ int si[1024 / WARP_SIZE];
+    const u32* p = params + blockIdx.x * 8;
+    const float temp = __uint_as_float(p[0]), top_p = __uint_as_float(p[2]);
+    const int top_k = (int)p[1];
+    const unsigned long long seed = p[3] | ((unsigned long long)p[4] << 32), ctr = p[5] | ((unsigned long long)p[6] << 32);
+    const float* x = logits + (long)p[7] * vocab;
+    int best = 0x7fffffff;
+    float bv = NEG_INF;
+    if (temp <= 0.f) {
+        for (int i = threadIdx.x; i < vocab; i += blockDim.x)
+            if (x[i] > bv) bv = x[i], best = i;
+        best = block_argmax(bv, best, sv, si);
+        if (threadIdx.x == 0) out[blockIdx.x] = best;
+        return;
+    }
+    const float inv_t = 1.f / temp;
+    float lo = POS_INF, hi = NEG_INF;
+    for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
+        float v = x[i] * inv_t;
+        lo = fminf(lo, v);
+        hi = fmaxf(hi, v);
+    }
+    hi = block_max(hi, sv);
+    lo = -block_max(-lo, sv);
+    float thr = NEG_INF;
+    if (top_k > 0 && top_k < vocab) {
+        float a = lo, b = hi;
+        for (int it = 0; it < SAMPLE_BISECT; it++) {
+            const float mid = 0.5f * (a + b);
+            float c = 0.f;
+            for (int i = threadIdx.x; i < vocab; i += blockDim.x) c += x[i] * inv_t >= mid ? 1.f : 0.f;
+            if (block_sum(c, sv) >= (float)top_k) a = mid; else b = mid;
+        }
+        thr = a;
+        lo = a;
+    }
+    if (top_p < 1.f) {
+        float tot = 0.f;
+        for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
+            float v = x[i] * inv_t;
+            if (v >= thr) tot += __expf(v - hi);
+        }
+        tot = block_sum(tot, sv);
+        float a = lo, b = hi;
+        for (int it = 0; it < SAMPLE_BISECT; it++) {
+            const float mid = 0.5f * (a + b);
+            float m = 0.f;
+            for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
+                float v = x[i] * inv_t;
+                if (v >= mid) m += __expf(v - hi);
+            }
+            if (block_sum(m, sv) >= top_p * tot) a = mid; else b = mid;
+        }
+        thr = a;
+    }
+    // Gumbel-max over the candidates.
+    for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
+        float v = x[i] * inv_t;
+        if (v >= thr) {
+            float key = v - logf(-logf(sample_uniform(seed, ctr, i)));
+            if (key > bv) bv = key, best = i;
+        }
+    }
+    best = block_argmax(bv, best, sv, si);
+    if (threadIdx.x == 0) out[blockIdx.x] = best;
 }
 
 // x = (x + rmsnorm(src) * w) * scale; if has_next: out = rmsnorm(x) * w2.
@@ -791,8 +1106,9 @@ __device__ __forceinline__ float kv_at(const void* c, const f16_bits* sc, long i
 // int8 with scales ksc/vsc). Thread i handles pair (i, i+hd/2).
 extern "C" __global__ void qkv_norm_rope_store(const float* __restrict__ q, const float* __restrict__ k,
                                                const float* __restrict__ v, const float* __restrict__ qw,
-                                               const float* __restrict__ kw, const float* __restrict__ vw,
-                                               int has_vnorm, float* __restrict__ qn, void* __restrict__ kc,
+                                               const float* __restrict__ kw, int has_norm,
+                                               const float* __restrict__ vw, int has_vnorm, float* __restrict__ qn,
+                                               void* __restrict__ kc,
                                                void* __restrict__ vc, const u32* __restrict__ positions,
                                                const u32* __restrict__ slots, int n_tok, int n_heads,
                                                int n_kv_heads, int head_dim, float eps, float theta,
@@ -809,15 +1125,18 @@ extern "C" __global__ void qkv_norm_rope_store(const float* __restrict__ q, cons
     const float* w = is_q ? qw : kw;
 
     float a = i < half ? xr[i] : 0.f, b = i < half ? xr[i + half] : 0.f;
-    const float scale = rsqrtf(block_sum(a * a + b * b, scratch) / head_dim + eps);
+    // No q/k norm (Llama): rotate only.
+    const float scale = has_norm ? rsqrtf(block_sum(a * a + b * b, scratch) / head_dim + eps) : 1.f;
     float inv_freq = powf(theta, -2.f * i / head_dim);
     if (has_factors && i < half) inv_freq /= freq_factors[i];
     float sn, cs;
     sincosf(positions[t] * inv_freq, &sn, &cs);
     float ra = 0.f, rb = 0.f;
     if (i < half) {
-        a *= scale * w[i];
-        b *= scale * w[i + half];
+        if (has_norm) {
+            a *= scale * w[i];
+            b *= scale * w[i + half];
+        }
         ra = a * cs - b * sn;
         rb = a * sn + b * cs;
     }
@@ -932,8 +1251,8 @@ __device__ void matvec_glu(const MvTarget& g, const MvTarget& u, const i8* __res
     float ag[MV_MAX_M], au[MV_MAX_M];
 #pragma unroll
     for (int j = 0; j < MV_MAX_M; j++) ag[j] = au[j] = 0.f;
-    mv_dot<F>(g.qs + r * g.qs_row, g.qh + r * g.qh_row, g.sc + r * g.sc_row, xq, xd, k, m, lane, ag);
-    mv_dot<F>(u.qs + r * u.qs_row, u.qh + r * u.qh_row, u.sc + r * u.sc_row, xq, xd, k, m, lane, au);
+    mv_dot<F>(g.qs + r * g.qs_row, g.qh + r * g.qh_row, g.sc + r * g.sc_row, xq, xd, k, m, lane, WARP_SIZE, ag);
+    mv_dot<F>(u.qs + r * u.qs_row, u.qh + r * u.qh_row, u.sc + r * u.sc_row, xq, xd, k, m, lane, WARP_SIZE, au);
 #pragma unroll
     for (int j = 0; j < MV_MAX_M; j++) {
         if (j < m) {
@@ -962,20 +1281,23 @@ __device__ void matvec_glu(const MvTarget& g, const MvTarget& u, const i8* __res
                                float* out, int write_out) {                                                    \
         matvec_glu<F, 1>(g, u, xq, xd, k, m, qo, out, write_out);                                              \
     }
-// Float-weight form (F16/BF16/F32, decode): one warp per row computes its gate
-// and up dot products and writes act(gate) * up; no quantization involved.
-template <int F, int ACT>
+// Float-weight form (F16/BF16/F32, decode): KW warps per row (as in
+// matvec_f) compute its gate and up dot products and write act(gate) * up;
+// no quantization involved.
+template <int F, int ACT, int KW>
 __device__ void matvec_glu_f(const MvTarget& g, const MvTarget& u, const float* __restrict__ x, int k, int m,
                              float* __restrict__ out) {
-    const int warps = blockDim.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
-    const int r = blockIdx.x * warps + threadIdx.x / WARP_SIZE;
-    if (r >= g.n) return;
-    const u8* gr = g.qs + (long)r * g.qs_row;
-    const u8* ur = u.qs + (long)r * u.qs_row;
+    __shared__ float part[2][MV_MAX_M][8];
+    const int warps = blockDim.x / WARP_SIZE, warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const int r = blockIdx.x * (warps / KW) + warp / KW, sub = warp % KW;
+    const bool valid = r < g.n;  // uniform per row group: no early return (barrier below)
+    const u8* gr = g.qs + (long)(valid ? r : 0) * g.qs_row;
+    const u8* ur = u.qs + (long)(valid ? r : 0) * u.qs_row;
     float ag[MV_MAX_M], au[MV_MAX_M], yg[8], yu[8];
 #pragma unroll
     for (int j = 0; j < MV_MAX_M; j++) ag[j] = au[j] = 0.f;
-    for (int c = lane; c < k / 8; c += WARP_SIZE) {
+    MV_UNROLL
+    for (int c = lane + sub * WARP_SIZE; valid && c < k / 8; c += WARP_SIZE * KW) {
         load8<F>(gr, c, yg);
         load8<F>(ur, c, yu);
 #pragma unroll
@@ -991,23 +1313,42 @@ __device__ void matvec_glu_f(const MvTarget& g, const MvTarget& u, const float* 
         }
     }
 #pragma unroll
+    for (int j = 0; j < MV_MAX_M; j++)
+        if (j < m) ag[j] = warp_sum(ag[j]), au[j] = warp_sum(au[j]);
+    if (KW > 1) {
+        if (lane == 0)
+#pragma unroll
+            for (int j = 0; j < MV_MAX_M; j++) part[0][j][warp] = ag[j], part[1][j][warp] = au[j];
+        __syncthreads();
+        if (sub != 0) return;
+#pragma unroll
+        for (int j = 0; j < MV_MAX_M; j++)
+            for (int q = 1; q < KW; q++) ag[j] += part[0][j][warp + q], au[j] += part[1][j][warp + q];
+    }
+    if (!valid || lane != 0) return;
+#pragma unroll
     for (int j = 0; j < MV_MAX_M; j++) {
         if (j < m) {
-            const float gs = warp_sum(ag[j]), us = warp_sum(au[j]);
-            const float a = ACT == 0 ? gs / (1.f + __expf(-gs)) : gelu_tanh(gs);
-            if (lane == 0) out[(long)j * g.n + r] = a * us;
+            const float a = ACT == 0 ? ag[j] / (1.f + __expf(-ag[j])) : gelu_tanh(ag[j]);
+            out[(long)j * g.n + r] = a * au[j];
         }
     }
 }
 
 #define INSTANTIATE_MATVEC_GLU_F(NAME, F)                                                                       \
     extern "C" __global__ void matvec_glu_silu_##NAME(MvTarget g, MvTarget u, const float* x, int k, int m,     \
-                                                      float* out) {                                             \
-        matvec_glu_f<F, 0>(g, u, x, k, m, out);                                                                 \
+                                                      float* out, int kw) {                                     \
+        if (kw == 4)                                                                                            \
+            matvec_glu_f<F, 0, 4>(g, u, x, k, m, out);                                                          \
+        else                                                                                                    \
+            matvec_glu_f<F, 0, 1>(g, u, x, k, m, out);                                                          \
     }                                                                                                           \
     extern "C" __global__ void matvec_glu_gelu_##NAME(MvTarget g, MvTarget u, const float* x, int k, int m,     \
-                                                      float* out) {                                             \
-        matvec_glu_f<F, 1>(g, u, x, k, m, out);                                                                 \
+                                                      float* out, int kw) {                                     \
+        if (kw == 4)                                                                                            \
+            matvec_glu_f<F, 1, 4>(g, u, x, k, m, out);                                                          \
+        else                                                                                                    \
+            matvec_glu_f<F, 1, 1>(g, u, x, k, m, out);                                                          \
     }
 INSTANTIATE_MATVEC_GLU_F(f32, FMT_F32)
 INSTANTIATE_MATVEC_GLU_F(f16, FMT_F16)
@@ -1068,8 +1409,8 @@ __device__ void matvec_glu_norm(const MvTarget& g, const MvTarget& u, const floa
     float ag[MV_MAX_M], au[MV_MAX_M];
 #pragma unroll
     for (int j = 0; j < MV_MAX_M; j++) ag[j] = au[j] = 0.f;
-    mv_dot<F>(g.qs + r * g.qs_row, g.qh + r * g.qh_row, g.sc + r * g.sc_row, xq, xd, d, 1, lane, ag);
-    mv_dot<F>(u.qs + r * u.qs_row, u.qh + r * u.qh_row, u.sc + r * u.sc_row, xq, xd, d, 1, lane, au);
+    mv_dot<F>(g.qs + r * g.qs_row, g.qh + r * g.qh_row, g.sc + r * g.sc_row, xq, xd, d, 1, lane, WARP_SIZE, ag);
+    mv_dot<F>(u.qs + r * u.qs_row, u.qh + r * u.qh_row, u.sc + r * u.sc_row, xq, xd, d, 1, lane, WARP_SIZE, au);
     const float gs = warp_sum(ag[0]), us = warp_sum(au[0]);
     const float a = ACT == 0 ? gs / (1.f + __expf(-gs)) : gelu_tanh(gs);
     if (lane == 0) v[warp] = a * us;
@@ -1091,10 +1432,14 @@ __device__ void matvec_glu_norm(const MvTarget& g, const MvTarget& u, const floa
 INSTANTIATE_MATVEC_GLU_NORM(q8, FMT_Q8)
 INSTANTIATE_MATVEC_GLU_NORM(q4, FMT_Q4)
 INSTANTIATE_MATVEC_GLU_NORM(q6, FMT_Q6)
+INSTANTIATE_MATVEC_GLU_NORM(q5, FMT_Q5)
+INSTANTIATE_MATVEC_GLU_NORM(iq4, FMT_IQ4)
 
 INSTANTIATE_MATVEC_GLU(q8, FMT_Q8)
 INSTANTIATE_MATVEC_GLU(q4, FMT_Q4)
 INSTANTIATE_MATVEC_GLU(q6, FMT_Q6)
+INSTANTIATE_MATVEC_GLU(q5, FMT_Q5)
+INSTANTIATE_MATVEC_GLU(iq4, FMT_IQ4)
 
 extern "C" __global__ void gelu_mul(float* gate, const float* __restrict__ up, long n, QOut qo, int write_out) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1446,28 +1791,35 @@ extern "C" __global__ void attn_prefill(const float* __restrict__ q, const f16_b
 // ---------------------------------------------------------------------------
 // Prefill attention on RDNA3 matrix cores (WMMA 16x16x16, f16 in, f32
 // accumulate), FlashAttention-2 style. Same grid and tiles as attn_prefill:
-// (tiles, kv heads); a block's rows are (token, head) pairs of one tile, 16
-// per wave (WA_WAVES waves). Per BK-key chunk: K is staged row-major and V
-// transposed in shared memory; each wave computes S = Q.K^T (16 x BK), runs
-// the online softmax on it, then O += P.V. WMMA fragments (wave32, gfx11):
+// (tiles, kv heads); a block's rows are (token, head) pairs of one tile, in
+// row groups of 16. Each wave owns one row group and DS (<= 128) of the head
+// dims, so its queries (A fragments) and output accumulator stay in
+// registers; with HD > 128, DW = HD / DS waves share a row group and add
+// their partial scores through shared memory. Per BK-key chunk: K is staged
+// row-major and V transposed in shared memory; each wave computes S = Q.K^T
+// (16 x BK), runs the online softmax on it, then O += P.V for its dims.
+// WMMA fragments (wave32, gfx11):
 //   A (16x16): lane l holds row l%16, k = 0..15 (lanes 16-31 repeat 0-15)
 //   B (16x16): lane l holds column l%16, k = 0..15
 //   C/D:       lane l holds column l%16, rows 2i + l/16 (i = 0..7)
 // P goes from the D layout to the A layout through shared memory.
-#define WA_WAVES 4
-#define WA_ROWS (WA_WAVES * 16)
 
 typedef _Float16 wa_half16 __attribute__((ext_vector_type(16)));
 typedef float wa_float8 __attribute__((ext_vector_type(8)));
 
+#define WA_WAVES 8
 template <int HD>
 struct WaCfg {
-    static constexpr int BK = HD <= 128 ? 32 : 16;  // keys per chunk
-    static constexpr int QS = HD + 8;               // padded row strides (halves)
-    static constexpr int KS = HD + 8;
+    static constexpr int DS = HD < 128 ? HD : 128;  // dims per wave
+    static constexpr int DW = HD / DS;              // waves per row group
+    static constexpr int RG = WA_WAVES / DW;        // row groups per block
+    static constexpr int ROWS = RG * 16;
+    static constexpr int BK = HD <= 256 ? 32 : 16;  // keys per chunk
+    static constexpr int KS = HD + 8;               // padded row strides (halves)
     static constexpr int VS = BK + 8;
-    static constexpr int PS = 16 + 8;
-    static constexpr int SMEM = (WA_ROWS * QS + BK * KS + HD * VS + WA_WAVES * 16 * PS) * 2;
+    static constexpr int PS = BK + 8;
+    static constexpr int SX = DW > 1 ? WA_WAVES * 16 * BK * 4 : 0;  // partial scores (bytes)
+    static constexpr int SMEM = (BK * KS + HD * VS + WA_WAVES * 16 * PS) * 2 + SX;
 };
 
 #if defined(__GFX11__)
@@ -1478,40 +1830,47 @@ __device__ void attn_wmma(const float* __restrict__ q, const f16_bits* __restric
                           const u32* __restrict__ block_tables, int max_blocks, int n_heads, int n_kv_heads,
                           int block_size, float scale, int window, int tile_tokens) {
     typedef WaCfg<HD> C;
-    constexpr int BK = C::BK, QS = C::QS, KS = C::KS, VS = C::VS, PS = C::PS, NT = HD / 16;
+    constexpr int BK = C::BK, KS = C::KS, VS = C::VS, PS = C::PS, DW = C::DW, NT = C::DS / 16, NJ = BK / 16;
     extern __shared__ __align__(16) char wa_smem[];
-    _Float16* Qs = (_Float16*)wa_smem;
-    _Float16* Ks = Qs + WA_ROWS * QS;
+    _Float16* Ks = (_Float16*)wa_smem;
     _Float16* Vt = Ks + BK * KS;
     _Float16* Ps = Vt + HD * VS;
+    float* Sx = (float*)(Ps + WA_WAVES * 16 * PS);  // [wave][16 rows][BK], DW > 1 only
 
     const int group = n_heads / n_kv_heads;
     const int rows = tile_tokens * group;
     const int t0 = tiles[2 * blockIdx.x], nt = tiles[2 * blockIdx.x + 1];
     const int kvh = blockIdx.y;
     const int wave = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const int rg = wave / DW, d0 = (wave % DW) * C::DS;
     const int col = lane % 16, half = lane / 16;
     const int kv_w = n_kv_heads * HD;
     const u32* table = block_tables + (long)token_seq[t0] * max_blocks;
 
-    // Queries, pre-scaled, as f16 (rows past the tile are zero).
-    for (int i = threadIdx.x; i < WA_ROWS * HD / 4; i += blockDim.x) {
-        int r = i / (HD / 4), d = (i % (HD / 4)) * 4;
-        int t = r / group, h = kvh * group + r % group;
-        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-        if (r < rows && t < nt) v = *(const float4*)(q + ((long)(t0 + t) * n_heads + h) * HD + d);
-        _Float16* dst = Qs + r * QS + d;
-        dst[0] = (_Float16)(v.x * scale);
-        dst[1] = (_Float16)(v.y * scale);
-        dst[2] = (_Float16)(v.z * scale);
-        dst[3] = (_Float16)(v.w * scale);
+    // This lane's query row (of the row group's 16), this wave's dims,
+    // pre-scaled, as A fragments (rows past the tile are zero).
+    wa_half16 qf[NT];
+    {
+        const int r = rg * 16 + col, t = r / group;
+        const bool ok = r < rows && t < nt;
+        const float* qr = q + ((long)(t0 + (ok ? t : 0)) * n_heads + kvh * group + r % group) * HD + d0;
+#pragma unroll
+        for (int tt = 0; tt < NT; tt++)
+#pragma unroll
+            for (int e = 0; e < 16; e += 4) {
+                float4 v = ok ? *(const float4*)(qr + tt * 16 + e) : make_float4(0.f, 0.f, 0.f, 0.f);
+                qf[tt][e] = (_Float16)(v.x * scale);
+                qf[tt][e + 1] = (_Float16)(v.y * scale);
+                qf[tt][e + 2] = (_Float16)(v.z * scale);
+                qf[tt][e + 3] = (_Float16)(v.w * scale);
+            }
     }
 
-    // This lane's 8 rows (2i + half) of the wave's 16: query positions.
+    // This lane's 8 rows (2i + half) of the row group: query positions.
     int qpos[8];
 #pragma unroll
     for (int i = 0; i < 8; i++) {
-        int r = wave * 16 + 2 * i + half, t = r / group;
+        int r = rg * 16 + 2 * i + half, t = r / group;
         qpos[i] = (r < rows && t < nt) ? (int)positions[t0 + t] : -1;
     }
     const int first = positions[t0], last = positions[t0 + nt - 1];
@@ -1525,10 +1884,9 @@ __device__ void attn_wmma(const float* __restrict__ q, const f16_bits* __restric
 #pragma unroll
     for (int i = 0; i < 8; i++) m[i] = NEG_INF, l[i] = 0.f;
     _Float16* Pw = Ps + wave * 16 * PS;
-    const _Float16* Qw = Qs + (wave * 16 + col) * QS;
 
     for (int k0 = kbeg; k0 < kend; k0 += BK) {
-        __syncthreads();  // previous chunk's K/V reads are done
+        __syncthreads();  // previous chunk's K/V (and partial score) reads are done
         // K rows (8 halves per thread) as stored; V transposed.
         for (int i = threadIdx.x; i < BK * HD / 8; i += blockDim.x) {
             int p = i / (HD / 8), d = (i % (HD / 8)) * 8, kp = k0 + p;
@@ -1545,61 +1903,87 @@ __device__ void attn_wmma(const float* __restrict__ q, const f16_bits* __restric
         }
         __syncthreads();
 
+        // S = Q . K^T over this wave's dims, 16 keys at a time.
+        wa_float8 sj[NJ];
 #pragma unroll
-        for (int j = 0; j < BK / 16; j++) {
-            // S = Q . K^T for keys k0 + 16j ..
-            wa_float8 s = (wa_float8){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-            const _Float16* kr = Ks + (j * 16 + col) * KS;
-#pragma unroll
-            for (int t = 0; t < NT; t++) {
-                wa_half16 a = *(const wa_half16*)(Qw + t * 16);
-                wa_half16 b = *(const wa_half16*)(kr + t * 16);
-                s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, s);
-            }
-            // Mask, then the online softmax per row (16 lanes share a row set).
-            const int kp = k0 + j * 16 + col;
-            float corr[8];
-#pragma unroll
-            for (int i = 0; i < 8; i++) {
-                bool ok = kp < kend && kp <= qpos[i] && (window <= 0 || qpos[i] - kp < window);
-                float v = ok ? s[i] : NEG_INF;
-                float mx = v;
-                for (int off = 8; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 16));
-                float m_new = fmaxf(m[i], mx);
-                float p = (m_new == NEG_INF || v == NEG_INF) ? 0.f : __expf(v - m_new);
-                corr[i] = m_new == NEG_INF ? 1.f : __expf(m[i] - m_new);
-                float sum = p;
-                for (int off = 8; off > 0; off >>= 1) sum += __shfl_xor(sum, off, 16);
-                l[i] = l[i] * corr[i] + sum;
-                m[i] = m_new;
-                Pw[(2 * i + half) * PS + col] = (_Float16)p;
-            }
+        for (int j = 0; j < NJ; j++) {
+            sj[j] = (wa_float8){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            const _Float16* kr = Ks + (j * 16 + col) * KS + d0;
 #pragma unroll
             for (int t = 0; t < NT; t++)
+                sj[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[t], *(const wa_half16*)(kr + t * 16), sj[j]);
+        }
+        if (DW > 1) {
+            // Add the row group's partial scores (same order in every wave).
+            float* mine = Sx + wave * 16 * BK;
 #pragma unroll
-                for (int i = 0; i < 8; i++) o[t][i] *= corr[i];
-            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
-            __builtin_amdgcn_wave_barrier();
-            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
-            // O += P . V: A = P rows, B = V^T rows (one head dim, 16 keys).
-            wa_half16 a = *(const wa_half16*)(Pw + col * PS);
+            for (int j = 0; j < NJ; j++)
+#pragma unroll
+                for (int i = 0; i < 8; i++) mine[(2 * i + half) * BK + j * 16 + col] = sj[j][i];
+            __syncthreads();
+            const float* grp = Sx + rg * DW * 16 * BK;
+#pragma unroll
+            for (int j = 0; j < NJ; j++)
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    float v = 0.f;
+#pragma unroll
+                    for (int w = 0; w < DW; w++) v += grp[(w * 16 + 2 * i + half) * BK + j * 16 + col];
+                    sj[j][i] = v;
+                }
+        }
+        // Mask, then the online softmax per row over the whole chunk (16
+        // lanes share a row set): one max and one sum reduction per chunk.
+        float corr[8];
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            float v[NJ], mx = NEG_INF;
+#pragma unroll
+            for (int j = 0; j < NJ; j++) {
+                const int kp = k0 + j * 16 + col;
+                bool ok = kp < kend && kp <= qpos[i] && (window <= 0 || qpos[i] - kp < window);
+                v[j] = ok ? sj[j][i] : NEG_INF;
+                mx = fmaxf(mx, v[j]);
+            }
+            for (int off = 8; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 16));
+            const float m_new = fmaxf(m[i], mx);
+            corr[i] = m_new == NEG_INF ? 1.f : __expf(m[i] - m_new);
+            float sum = 0.f;
+#pragma unroll
+            for (int j = 0; j < NJ; j++) {
+                const float p = (m_new == NEG_INF || v[j] == NEG_INF) ? 0.f : __expf(v[j] - m_new);
+                sum += p;
+                Pw[(2 * i + half) * PS + j * 16 + col] = (_Float16)p;
+            }
+            for (int off = 8; off > 0; off >>= 1) sum += __shfl_xor(sum, off, 16);
+            l[i] = l[i] * corr[i] + sum;
+            m[i] = m_new;
+        }
+#pragma unroll
+        for (int t = 0; t < NT; t++)
+#pragma unroll
+            for (int i = 0; i < 8; i++) o[t][i] *= corr[i];
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+        // O += P . V for this wave's dims: A = P rows (16 keys), B = V^T rows.
+#pragma unroll
+        for (int j = 0; j < NJ; j++) {
+            wa_half16 a = *(const wa_half16*)(Pw + col * PS + j * 16);
 #pragma unroll
             for (int t = 0; t < NT; t++) {
-                wa_half16 b = *(const wa_half16*)(Vt + (t * 16 + col) * VS + j * 16);
+                wa_half16 b = *(const wa_half16*)(Vt + (d0 + t * 16 + col) * VS + j * 16);
                 o[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, o[t]);
             }
-            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
-            __builtin_amdgcn_wave_barrier();
-            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
         }
     }
 
 #pragma unroll
     for (int i = 0; i < 8; i++) {
-        int r = wave * 16 + 2 * i + half, t = r / group;
+        int r = rg * 16 + 2 * i + half, t = r / group;
         if (r >= rows || t >= nt) continue;
         float inv = l[i] > 0.f ? 1.f / l[i] : 0.f;
-        float* op = out + ((long)(t0 + t) * n_heads + kvh * group + r % group) * HD + col;
+        float* op = out + ((long)(t0 + t) * n_heads + kvh * group + r % group) * HD + d0 + col;
 #pragma unroll
         for (int tt = 0; tt < NT; tt++) op[tt * 16] = o[tt][i] * inv;
     }
@@ -1620,6 +2004,7 @@ __device__ void attn_wmma(const float* __restrict__ q, const f16_bits* __restric
 INSTANTIATE_WA(64)
 INSTANTIATE_WA(128)
 INSTANTIATE_WA(256)
+INSTANTIATE_WA(512)
 #endif  // RLLM_HIP
 
 #ifndef RLLM_HIP
@@ -1977,7 +2362,7 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
     // Q4-only; leaving them out keeps Q8/Q6 at 32 KB (3 blocks per SM).
     constexpr int A_BYTES = MMQ_BM * MMQ_STRIDE, B_BYTES = MMQ_BN * MMQ_STRIDE;
     constexpr int AD_BYTES = MMQ_CU * 2 * MMQ_BM * 4, BD_BYTES = MMQ_CU * MMQ_BN * 4;
-    constexpr int AM_BYTES = F == FMT_Q4 ? MMQ_CU * MMQ_BM * 4 : 0, BS_BYTES = F == FMT_Q4 ? BD_BYTES : 0;
+    constexpr int AM_BYTES = HAS_MIN(F) ? MMQ_CU * MMQ_BM * 4 : 0, BS_BYTES = HAS_MIN(F) ? BD_BYTES : 0;
     constexpr int SMEM_BYTES = A_BYTES + B_BYTES + AD_BYTES + BD_BYTES + AM_BYTES + BS_BYTES;
     __shared__ __align__(16) char smem[SMEM_BYTES];
     i8* As = (i8*)smem;
@@ -2014,7 +2399,7 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
                 *(int4*)dst = make_int4(0, 0, 0, 0);
                 *(int4*)(dst + 16) = make_int4(0, 0, 0, 0);
                 Ad[2 * ul][r] = Ad[2 * ul + 1][r] = 0.f;
-                if (F == FMT_Q4) Am[ul][r] = 0.f;
+                if (HAS_MIN(F)) Am[ul][r] = 0.f;
                 continue;
             }
             const u8* qr = (second ? qs2 : qs) + (long)gr * qs_row;
@@ -2024,13 +2409,28 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
                 *(int4*)dst = src[0];
                 *(int4*)(dst + 16) = src[1];
                 Ad[2 * ul][r] = ld_f16(sr + u * 2);
-            } else if (F == FMT_Q4) {
+            } else if (F == FMT_Q4 || F == FMT_Q5) {
                 int4 v = *(const int4*)(qr + u * 16);
-                *(int4*)dst = make_int4(v.x & 0x0F0F0F0F, v.y & 0x0F0F0F0F, v.z & 0x0F0F0F0F, v.w & 0x0F0F0F0F);
-                *(int4*)(dst + 16) = make_int4((v.x >> 4) & 0x0F0F0F0F, (v.y >> 4) & 0x0F0F0F0F,
-                                               (v.z >> 4) & 0x0F0F0F0F, (v.w >> 4) & 0x0F0F0F0F);
-                Ad[2 * ul][r] = ld_f16(sr + u * 4);
-                Am[ul][r] = ld_f16(sr + u * 4 + 2);
+                int lo[4] = {v.x & 0x0F0F0F0F, v.y & 0x0F0F0F0F, v.z & 0x0F0F0F0F, v.w & 0x0F0F0F0F};
+                int hi[4] = {(v.x >> 4) & 0x0F0F0F0F, (v.y >> 4) & 0x0F0F0F0F, (v.z >> 4) & 0x0F0F0F0F,
+                             (v.w >> 4) & 0x0F0F0F0F};
+                if (F == FMT_Q5) {
+                    u32 hb = *(const u32*)((second ? qh2 : qh) + (long)gr * qh_row + u * 4);
+                    for (int c = 0; c < 4; c++) {
+                        lo[c] |= q5_hi4(hb >> (4 * c));
+                        hi[c] |= q5_hi4(hb >> (16 + 4 * c));
+                    }
+                }
+                *(int4*)dst = make_int4(lo[0], lo[1], lo[2], lo[3]);
+                *(int4*)(dst + 16) = make_int4(hi[0], hi[1], hi[2], hi[3]);
+                q4_dm(sr, u, Ad[2 * ul][r], Am[ul][r]);
+            } else if (F == FMT_IQ4) {
+                int4 v = *(const int4*)(qr + u * 16);
+                *(int4*)dst = make_int4(iq4_vals(v.x & 0x0F0F0F0F), iq4_vals(v.y & 0x0F0F0F0F),
+                                        iq4_vals(v.z & 0x0F0F0F0F), iq4_vals(v.w & 0x0F0F0F0F));
+                *(int4*)(dst + 16) = make_int4(iq4_vals((v.x >> 4) & 0x0F0F0F0F), iq4_vals((v.y >> 4) & 0x0F0F0F0F),
+                                               iq4_vals((v.z >> 4) & 0x0F0F0F0F), iq4_vals((v.w >> 4) & 0x0F0F0F0F));
+                Ad[2 * ul][r] = ld_f16a(sr + u * 2);
             } else {  // FMT_Q6
                 int4 lov = *(const int4*)(qr + u * 16);
                 int2 hiv = *(const int2*)((second ? qh2 : qh) + (long)gr * qh_row + u * 8);
@@ -2056,14 +2456,14 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
                 *(int4*)dst = make_int4(0, 0, 0, 0);
                 *(int4*)(dst + 16) = make_int4(0, 0, 0, 0);
                 Bd[ul][c] = 0.f;
-                if (F == FMT_Q4) Bsum[ul][c] = 0.f;
+                if (HAS_MIN(F)) Bsum[ul][c] = 0.f;
                 continue;
             }
             const int4* src = (const int4*)(xq + (long)tok * k + u * 32);
             *(int4*)dst = src[0];
             *(int4*)(dst + 16) = src[1];
             Bd[ul][c] = xd[(long)tok * units + u];
-            if (F == FMT_Q4) Bsum[ul][c] = xs[(long)tok * units + u];
+            if (HAS_MIN(F)) Bsum[ul][c] = xs[(long)tok * units + u];
         }
         __syncthreads();
 
@@ -2083,7 +2483,7 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
             for (int nt = 0; nt < MMQ_NT; nt++) {
                 const int tc = wn * 32 + nt * 16 + col;
                 dbx[nt] = Bd[ul][tc];
-                sbx[nt] = F == FMT_Q4 ? Bsum[ul][tc] : 0.f;
+                sbx[nt] = HAS_MIN(F) ? Bsum[ul][tc] : 0.f;
             }
 #pragma unroll
             for (int mt = 0; mt < MMQ_MT; mt++) {
@@ -2103,7 +2503,7 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
 #pragma unroll
                         for (int e = 0; e < MMQ_E; e++) {
                             c[e] += dbx[nt] * Ad[2 * ul][rb + 2 * e] * i2f_small(ci[e]);
-                            if (F == FMT_Q4) c[e] -= Am[ul][rb + 2 * e] * sbx[nt];
+                            if (HAS_MIN(F)) c[e] -= Am[ul][rb + 2 * e] * sbx[nt];
                         }
                     }
                 }
@@ -2127,7 +2527,7 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
                     da[mt][h][0] = Ad[2 * ul + h][ra];
                     da[mt][h][1] = Ad[2 * ul + h][ra + 8];
                 }
-                if (F == FMT_Q4) {
+                if (HAS_MIN(F)) {
                     ma[mt][0] = Am[ul][ra];
                     ma[mt][1] = Am[ul][ra + 8];
                 }
@@ -2144,7 +2544,7 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
                 const int tc = wn * 32 + nt * 8 + 2 * t;
                 dbx[nt][0] = Bd[ul][tc];
                 dbx[nt][1] = Bd[ul][tc + 1];
-                if (F == FMT_Q4) {
+                if (HAS_MIN(F)) {
                     sbx[nt][0] = Bsum[ul][tc];
                     sbx[nt][1] = Bsum[ul][tc + 1];
                 }
@@ -2182,7 +2582,7 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
                         }
                     } else {
                         float d0 = da[mt][0][0], d1 = da[mt][0][1];
-                        if (F == FMT_Q4) {
+                        if (HAS_MIN(F)) {
                             c[0] += dbx[nt][0] * d0 * i2f_small(ci[nt][0][0]) - ma[mt][0] * sbx[nt][0];
                             c[1] += dbx[nt][1] * d0 * i2f_small(ci[nt][0][1]) - ma[mt][0] * sbx[nt][1];
                             c[2] += dbx[nt][0] * d1 * i2f_small(ci[nt][0][2]) - ma[mt][1] * sbx[nt][0];
@@ -2324,11 +2724,15 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
 INSTANTIATE_MMQ(q8, FMT_Q8)
 INSTANTIATE_MMQ(q4, FMT_Q4)
 INSTANTIATE_MMQ(q6, FMT_Q6)
+INSTANTIATE_MMQ(q5, FMT_Q5)
+INSTANTIATE_MMQ(iq4, FMT_IQ4)
 #else
 // HIP targets without RDNA3 WMMA: the backend doesn't call MMQ there.
-RLLM_STUB(mmq_q8) RLLM_STUB(mmq_q4) RLLM_STUB(mmq_q6)
+RLLM_STUB(mmq_q8) RLLM_STUB(mmq_q4) RLLM_STUB(mmq_q6) RLLM_STUB(mmq_q5) RLLM_STUB(mmq_iq4)
 RLLM_STUB(mmq_glu_silu_q8) RLLM_STUB(mmq_glu_silu_q4) RLLM_STUB(mmq_glu_silu_q6)
+RLLM_STUB(mmq_glu_silu_q5) RLLM_STUB(mmq_glu_silu_iq4)
 RLLM_STUB(mmq_glu_gelu_q8) RLLM_STUB(mmq_glu_gelu_q4) RLLM_STUB(mmq_glu_gelu_q6)
+RLLM_STUB(mmq_glu_gelu_q5) RLLM_STUB(mmq_glu_gelu_iq4)
 #endif
 
 // out[i] = part[0][i] + part[1][i] + ... in split order (see mmq's split-K).

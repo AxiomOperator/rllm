@@ -60,10 +60,26 @@ fn random_weight(rng: &mut Rng, dtype: DType, rows: usize, cols: usize) -> HostT
                 (0..140).for_each(|_| bytes.push(rng.byte()));
             }
         }
+        DType::Q5K => {
+            // Half Q4_K's scales: 5-bit values are twice as large, and the
+            // FFN tests' outputs would otherwise pass the f16 GEMM output
+            // range on HIP (see HALF_OUT_SCALE), which real weights never do.
+            for _ in 0..n / 256 {
+                bytes.extend(scale(rng, 0.0005, 0.005));
+                bytes.extend(scale(rng, 0.0005, 0.005));
+                (0..172).for_each(|_| bytes.push(rng.byte()));
+            }
+        }
         DType::Q6K => {
             for _ in 0..n / 256 {
                 (0..208).for_each(|_| bytes.push(rng.byte()));
                 bytes.extend(scale(rng, 0.0001, 0.001));
+            }
+        }
+        DType::IQ4XS => {
+            for _ in 0..n / 256 {
+                bytes.extend(scale(rng, 0.00005, 0.0005));
+                (0..134).for_each(|_| bytes.push(rng.byte()));
             }
         }
     }
@@ -117,7 +133,7 @@ fn matmul_all_dtypes_both_paths() {
     let cpu = CpuBackend::new();
     let mut rng = Rng(0x1234_5678);
     let (n, k) = (96, 512);
-    for dtype in [DType::F32, DType::F16, DType::BF16, DType::Q8_0, DType::Q4K, DType::Q6K] {
+    for dtype in [DType::F32, DType::F16, DType::BF16, DType::Q8_0, DType::Q4K, DType::Q6K, DType::Q5K, DType::IQ4XS] {
         let w = random_weight(&mut rng, dtype, n, k);
         let (wc, wg) = (cpu.upload(&w).unwrap(), gpu.upload(&w).unwrap());
         // m <= 8 uses the matvec kernel, larger m the f16 cuBLAS path.
@@ -129,7 +145,7 @@ fn matmul_all_dtypes_both_paths() {
             gpu.matmul(&xg, &wg, &mut og, m).unwrap();
             // m <= 8 on quantized weights runs int8 activations (dp4a), like
             // llama.cpp's q8_1 path: per-32 rounding costs ~0.5% per dot product.
-            let quantized = matches!(dtype, DType::Q8_0 | DType::Q4K | DType::Q6K);
+            let quantized = matches!(dtype, DType::Q8_0 | DType::Q4K | DType::Q6K | DType::Q5K | DType::IQ4XS);
             let tol = match (m <= 8, quantized) {
                 (true, false) => 1e-5,
                 (true, true) => 1.5e-2,
@@ -147,7 +163,7 @@ fn embed_all_dtypes() {
     let mut rng = Rng(42);
     let (vocab, d) = (50, 256);
     let ids = [0u32, 7, 49, 7, 3];
-    for dtype in [DType::F32, DType::F16, DType::BF16, DType::Q8_0, DType::Q4K, DType::Q6K] {
+    for dtype in [DType::F32, DType::F16, DType::BF16, DType::Q8_0, DType::Q4K, DType::Q6K, DType::Q5K, DType::IQ4XS] {
         let t = random_weight(&mut rng, dtype, vocab, d);
         let (tc, tg) = (cpu.upload(&t).unwrap(), gpu.upload(&t).unwrap());
         let (mut oc, mut og) = (cpu.alloc(ids.len() * d).unwrap(), gpu.alloc(ids.len() * d).unwrap());
@@ -155,7 +171,7 @@ fn embed_all_dtypes() {
         gpu.embed(&tg, &ids, &mut og).unwrap();
         // K-quants are repacked with per-unit f16 scales (d * sub-scale), which
         // rounds them by up to ~5e-4 relative.
-        let tol = if matches!(dtype, DType::Q4K | DType::Q6K) { 1e-3 } else { 1e-6 };
+        let tol = if matches!(dtype, DType::Q4K | DType::Q6K | DType::Q5K | DType::IQ4XS) { 1e-3 } else { 1e-6 };
         assert_close(&format!("embed {dtype}"), &download(&cpu, &oc, ids.len() * d), &download(&gpu, &og, ids.len() * d), tol);
     }
 }
@@ -370,7 +386,7 @@ fn qkv_norm_rope_store_matches() {
     let cpu = CpuBackend::new();
     let mut rng = Rng(11);
     let (n_heads, n_kv, hd, bs) = (8, 2, 128, 4);
-    for (v_norm, partial) in [(false, false), (true, true)] {
+    for (qk_norm, v_norm, partial) in [(true, false, false), (true, true, true), (false, false, true)] {
         let layout = KvLayout { n_layers: 1, n_blocks: 4, block_size: bs, n_kv_heads: n_kv, head_dim: hd, dtype: KvType::F16 };
         let (mut kc, mut kg) = (cpu.alloc_kv(layout).unwrap(), gpu.alloc_kv(layout).unwrap());
         let n = 5;
@@ -389,12 +405,12 @@ fn qkv_norm_rope_store_matches() {
         let nq = n * n_heads * hd;
         let (mut qnc, mut qng) = (cpu.alloc(nq).unwrap(), gpu.alloc(nq).unwrap());
         cpu.qkv_norm_rope_store(
-            &upload(&cpu, &q), &upload(&cpu, &k), &upload(&cpu, &v), &qwc, &kwc, v_norm.then_some(&vwc), &mut qnc,
+            &upload(&cpu, &q), &upload(&cpu, &k), &upload(&cpu, &v), qk_norm.then_some((&qwc, &kwc)), v_norm.then_some(&vwc), &mut qnc,
             &mut kc, 0, &positions, &slots, n_heads, n_kv, hd, 1e-6, 10_000.0, partial.then_some(&ffc),
         )
         .unwrap();
         gpu.qkv_norm_rope_store(
-            &upload(&gpu, &q), &upload(&gpu, &k), &upload(&gpu, &v), &qwg, &kwg, v_norm.then_some(&vwg), &mut qng,
+            &upload(&gpu, &q), &upload(&gpu, &k), &upload(&gpu, &v), qk_norm.then_some((&qwg, &kwg)), v_norm.then_some(&vwg), &mut qng,
             &mut kg, 0, &positions, &slots, n_heads, n_kv, hd, 1e-6, 10_000.0, partial.then_some(&ffg),
         )
         .unwrap();
@@ -417,7 +433,7 @@ fn qkv_norm_rope_store_matches() {
         cpu.attention(&upload(&cpu, &q1), &kc, 0, &meta, &mut oc).unwrap();
         gpu.attention(&upload(&gpu, &q1), &kg, 0, &meta, &mut og).unwrap();
         assert_close(
-            &format!("qkv_norm_rope_store cache v_norm={v_norm} partial={partial}"),
+            &format!("qkv_norm_rope_store cache qk_norm={qk_norm} v_norm={v_norm} partial={partial}"),
             &download(&cpu, &oc, n_heads * hd),
             &download(&gpu, &og, n_heads * hd),
             2e-3,
@@ -436,7 +452,7 @@ fn gated_ffn_fused_prefill_and_decode() {
     let (d, f) = (2048, 2048);
     // m = 1 and 3 take the decode form (matvec_glu, then the down matvec reads
     // its int8 output).
-    for (dtype, m) in [DType::Q8_0, DType::Q4K, DType::Q6K].into_iter().flat_map(|t| [(t, 70), (t, 1), (t, 3)]) {
+    for (dtype, m) in [DType::Q8_0, DType::Q4K, DType::Q6K, DType::Q5K, DType::IQ4XS].into_iter().flat_map(|t| [(t, 70), (t, 1), (t, 3)]) {
         let (gate, up, down) = (random_weight(&mut rng, dtype, f, d), random_weight(&mut rng, dtype, f, d), random_weight(&mut rng, dtype, d, f));
         let wc = [&gate, &up, &down].map(|w| cpu.upload(w).unwrap());
         let wg = [&gate, &up, &down].map(|w| gpu.upload(w).unwrap());
@@ -550,7 +566,7 @@ fn norm_add_gated_ffn_matches() {
     let mut rng = Rng(0x0a0d_d00d);
     let (d, f) = (512, 1024);
     let norm = |rng: &mut Rng, name: &str| f32_tensor(name, &rng.vec(d).iter().map(|v| 1.0 + 0.5 * v).collect::<Vec<_>>());
-    for dtype in [DType::Q8_0, DType::Q4K, DType::Q6K] {
+    for dtype in [DType::Q8_0, DType::Q4K, DType::Q6K, DType::Q5K, DType::IQ4XS] {
         let (gate, up, down) = (random_weight(&mut rng, dtype, f, d), random_weight(&mut rng, dtype, f, d), random_weight(&mut rng, dtype, d, f));
         let (n1, n2) = (norm(&mut rng, "n1"), norm(&mut rng, "n2"));
         let wc = [&gate, &up, &down, &n1, &n2].map(|w| cpu.upload(w).unwrap());
@@ -577,5 +593,50 @@ fn norm_add_gated_ffn_matches() {
             // Two int8 activation roundings, as in gated_ffn_fused_prefill_and_decode.
             assert_close(&format!("norm_add_gated_ffn out {dtype} rows={rows}"), &oc, &og, 5e-2);
         }
+    }
+}
+
+/// Device sampling against the reference (rllm-core's sample.rs, which the
+/// CPU backend runs): greedy exactly; random draws almost always (a draw
+/// can differ when a threshold or Gumbel key lands within float rounding).
+#[test]
+fn sample_rows_matches_reference() {
+    let Some(gpu) = gpu_backend() else { return };
+    let cpu = CpuBackend::new();
+    let mut rng = Rng(0x5a3_91e7);
+    let (rows, vocab) = (6, 5024);
+    let logits: Vec<f32> = (0..rows * vocab).map(|_| rng.f32() * 6.0).collect();
+    let configs = [
+        (0.0, 0, 1.0),
+        (1.0, 0, 1.0),
+        (0.7, 40, 1.0),
+        (1.0, 0, 0.9),
+        (0.8, 50, 0.95),
+    ];
+    for (t, k, p) in configs {
+        let (mut same, mut total) = (0, 0);
+        for counter in 0..20u64 {
+            let specs: Vec<rllm_core::RowSample> = (0..rows)
+                .map(|r| rllm_core::RowSample {
+                    temperature: t,
+                    top_k: k,
+                    top_p: p,
+                    seed: 42 + r as u64,
+                    counter,
+                    adjust: if r == 1 { vec![(7, 50.0), (9, -3.0)] } else { Vec::new() },
+                })
+                .collect();
+            // Every other row, in reverse: rows needn't be in order or complete.
+            let pick: Vec<(u32, &rllm_core::RowSample)> = (0..rows).rev().step_by(2).map(|r| (r as u32, &specs[r])).collect();
+            let (mut a, mut b) = (vec![0u32; pick.len()], vec![0u32; pick.len()]);
+            cpu.sample_rows(&upload(&cpu, &logits), rows, vocab, &pick, &mut a).unwrap();
+            gpu.sample_rows(&upload(&gpu, &logits), rows, vocab, &pick, &mut b).unwrap();
+            if t == 0.0 {
+                assert_eq!(a, b, "greedy");
+            }
+            same += a.iter().zip(&b).filter(|(x, y)| x == y).count();
+            total += a.len();
+        }
+        assert!(same * 100 >= total * 95, "T={t} k={k} p={p}: {same}/{total} draws agree");
     }
 }

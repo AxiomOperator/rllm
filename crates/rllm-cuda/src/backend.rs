@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::gpu::{self, DevicePtr, LaunchConfig, PushKernelArg};
 use rllm_core::quant::dequantize_row;
-use rllm_core::{Activation, AttnMeta, Backend, DType, Error, HostTensor, KvLayout, KvType, Result};
+use rllm_core::{Activation, AttnMeta, Backend, DType, Error, HostTensor, KvLayout, KvType, Result, RowSample};
 
 const KERNELS: &str = include_str!("../kernels/kernels.cu");
 /// Must match MV_MAX_M in kernels.cu.
@@ -28,14 +28,15 @@ fn fa_cfg(hd: usize) -> (usize, usize, usize, usize) {
 }
 
 /// Head dims with an `attn_wmma_d{HD}` prefill kernel (INSTANTIATE_WA, HIP only).
-const WA_HEAD_DIMS: [usize; 3] = [64, 128, 256];
-/// Query rows per attn_wmma block (WA_ROWS: 4 waves of 16).
-const WA_ROWS: usize = 64;
+const WA_HEAD_DIMS: [usize; 4] = [64, 128, 256, 512];
 
-/// Mirrors `WaCfg<HD>::SMEM` in kernels.cu.
-fn wa_smem(hd: usize) -> usize {
-    let bk = if hd <= 128 { 32 } else { 16 };
-    (WA_ROWS * (hd + 8) + bk * (hd + 8) + hd * (bk + 8) + 4 * 16 * 24) * 2
+/// Mirrors `WaCfg<HD>` in kernels.cu: (query rows per block, shared memory bytes).
+fn wa_cfg(hd: usize) -> (usize, usize) {
+    const WAVES: usize = 8;
+    let dw = hd / hd.min(128);
+    let bk = if hd <= 256 { 32 } else { 16 };
+    let sx = if dw > 1 { WAVES * 16 * bk * 4 } else { 0 };
+    (WAVES / dw * 16, (bk * (hd + 8) + hd * (bk + 8) + WAVES * 16 * (bk + 8)) * 2 + sx)
 }
 
 /// (group, head_dim) pairs with an `attn_decode_g{G}_d{HD}` kernel (INSTANTIATE_AD).
@@ -121,10 +122,13 @@ enum Fmt {
     Q8,
     Q4,
     Q6,
+    Q5,
+    IQ4,
 }
 
 impl Fmt {
-    const ALL: [Fmt; 6] = [Fmt::F32, Fmt::F16, Fmt::BF16, Fmt::Q8, Fmt::Q4, Fmt::Q6];
+    const ALL: [Fmt; 8] = [Fmt::F32, Fmt::F16, Fmt::BF16, Fmt::Q8, Fmt::Q4, Fmt::Q6, Fmt::Q5, Fmt::IQ4];
+    const QUANT: [Fmt; 5] = [Fmt::Q8, Fmt::Q4, Fmt::Q6, Fmt::Q5, Fmt::IQ4];
 
     fn of(dtype: DType) -> Self {
         match dtype {
@@ -134,6 +138,8 @@ impl Fmt {
             DType::Q8_0 => Fmt::Q8,
             DType::Q4K => Fmt::Q4,
             DType::Q6K => Fmt::Q6,
+            DType::Q5K => Fmt::Q5,
+            DType::IQ4XS => Fmt::IQ4,
         }
     }
 
@@ -145,11 +151,13 @@ impl Fmt {
             Fmt::Q8 => "q8",
             Fmt::Q4 => "q4",
             Fmt::Q6 => "q6",
+            Fmt::Q5 => "q5",
+            Fmt::IQ4 => "iq4",
         }
     }
 
     fn quantized(self) -> bool {
-        matches!(self, Fmt::Q8 | Fmt::Q4 | Fmt::Q6)
+        matches!(self, Fmt::Q8 | Fmt::Q4 | Fmt::Q6 | Fmt::Q5 | Fmt::IQ4)
     }
 
     /// Bytes per row of (qs, qh, sc) for a row of `k` elements.
@@ -158,7 +166,9 @@ impl Fmt {
             Fmt::F32 => (4 * k, 0, 0),
             Fmt::F16 | Fmt::BF16 => (2 * k, 0, 0),
             Fmt::Q8 => (k, 0, k / 32 * 2),
-            Fmt::Q4 => (k / 2, 0, k / 32 * 4),
+            Fmt::Q4 => (k / 2, 0, k / 256 * 20),
+            Fmt::Q5 => (k / 2, k / 8, k / 256 * 20),
+            Fmt::IQ4 => (k / 2, 0, k / 32 * 2),
             Fmt::Q6 => (k / 2, k / 4, k / 16 * 2),
         }
     }
@@ -309,6 +319,8 @@ pub struct CudaBackend {
     tensor_cores: bool,
     /// RDNA3 WMMA (attn_wmma).
     wmma: bool,
+    /// A one-element f32 buffer for kernel parameters that go unread.
+    ones_placeholder: gpu::Slice<f32>,
     /// The int8 MMQ kernels can run (mma.sync or WMMA).
     mmq: bool,
     /// Streaming multiprocessors, for sizing grids.
@@ -513,16 +525,18 @@ impl CudaBackend {
         let module = gpu::load_module(&ctx, compile_kernels(&arch.compile)?).map_err(err)?;
 
         let mut names: Vec<String> = [
-            "f32_to_f16", "f32_to_bf16", "half_to_f32", "rms_norm", "add_rms_norm", "rms_norm_add", "qkv_norm_rope_store", "rms_norm_rope", "rope_neox", "silu_mul", "gelu_mul", "gelu_mul_strided", "ple_gate_f32", "gelu", "mul_inplace", "scale_inplace", "softcap_inplace",
+            "f32_to_f16", "f32_to_bf16", "half_to_f32", "logit_adjust", "sample_rows", "rms_norm", "add_rms_norm", "rms_norm_add", "qkv_norm_rope_store", "rms_norm_rope", "rope_neox", "silu_mul", "gelu_mul", "gelu_mul_strided", "ple_gate_f32", "gelu", "mul_inplace", "scale_inplace", "softcap_inplace",
             "add_inplace", "gather_rows", "gather_strided", "kv_store", "kv_store_q8", "kv_copy_blocks", "kv_dequant_blocks", "kv_rotate_q", "attn_decode_combine", "paged_attention", "attn_prefill", "attn_prefill_tc", "quantize_q8", "repack_q8_0",
-            "repack_q4_k", "repack_q6_k", "mmq_q8", "mmq_q4", "mmq_q6", "mmq_sum_splits",
-            "mmq_glu_silu_q8", "mmq_glu_silu_q4", "mmq_glu_silu_q6", "mmq_glu_gelu_q8", "mmq_glu_gelu_q4", "mmq_glu_gelu_q6",
-            "matvec_glu_silu_q8", "matvec_glu_silu_q4", "matvec_glu_silu_q6", "matvec_glu_gelu_q8", "matvec_glu_gelu_q4", "matvec_glu_gelu_q6",
+            "repack_q4_k", "repack_q6_k", "repack_q5_k", "repack_iq4_xs", "mmq_sum_splits",
             "matvec_glu_silu_f32", "matvec_glu_silu_f16", "matvec_glu_silu_bf16", "matvec_glu_gelu_f32", "matvec_glu_gelu_f16", "matvec_glu_gelu_bf16",
-            "matvec_glu_norm_silu_q8", "matvec_glu_norm_silu_q4", "matvec_glu_norm_silu_q6", "matvec_glu_norm_gelu_q8", "matvec_glu_norm_gelu_q4", "matvec_glu_norm_gelu_q6",
         ]
         .map(String::from)
         .to_vec();
+        for fmt in Fmt::QUANT {
+            for k in ["mmq", "mmq_glu_silu", "mmq_glu_gelu", "matvec_glu_silu", "matvec_glu_gelu", "matvec_glu_norm_silu", "matvec_glu_norm_gelu"] {
+                names.push(format!("{k}_{}", fmt.suffix()));
+            }
+        }
         for fmt in Fmt::ALL {
             for k in ["matvec", "dequant_f16", "embed"] {
                 names.push(format!("{k}_{}", fmt.suffix()));
@@ -557,7 +571,7 @@ impl CudaBackend {
 
         let n_sms = gpu::sm_count(&ctx).map_err(err)?;
         let mut mmq_blocks_per_sm = HashMap::new();
-        for fmt in [Fmt::Q8, Fmt::Q4, Fmt::Q6] {
+        for fmt in Fmt::QUANT {
             let f = &funcs[format!("mmq_{}", fmt.suffix()).as_str()];
             let blocks = gpu::occupancy(f, MMQ_THREADS, 0).map_err(err)?;
             mmq_blocks_per_sm.insert(fmt, blocks.max(1) as usize);
@@ -579,6 +593,7 @@ impl CudaBackend {
         );
         let split_part = stream.alloc_zeros::<f32>(1).map_err(err)?;
         let kv_stage = (stream.alloc_zeros::<u8>(1).map_err(err)?, stream.alloc_zeros::<u8>(1).map_err(err)?);
+        let ones_placeholder = stream.clone_htod(&[1f32][..]).map_err(err)?;
         Ok(Self {
             stream,
             blas,
@@ -597,6 +612,7 @@ impl CudaBackend {
             max_smem,
             tensor_cores: arch.tensor_cores,
             wmma: arch.wmma,
+            ones_placeholder,
             mmq: arch.tensor_cores || arch.wmma,
             n_sms,
             mmq_blocks_per_sm,
@@ -742,6 +758,37 @@ impl CudaBackend {
                 launch!(self, "kv_copy_blocks", cfg, [&src, &dst, fi, ti, &src_stride, &dst_stride, &nb])?;
                 off += bytes as u64;
             }
+        }
+        Ok(())
+    }
+
+    /// End of a graph step (the model's last op before reading results):
+    /// finish a capture and launch the graph, or launch a replayed one.
+    fn end_graph_step(&self) -> Result<()> {
+        {
+            let mut g = self.graph.lock().unwrap();
+            match g.mode {
+                StepMode::Measure(key) => {
+                    let used = g.arena_off;
+                    g.measured.insert(key, used);
+                }
+                StepMode::Capture(key) => {
+                    let n = g.written.len();
+                    g.index_writes.insert(key, n);
+                    let graph = gpu::end_capture(&self.stream)
+                        .map_err(err)?
+                        .ok_or_else(|| Error::Backend("empty graph capture".into()))?;
+                    graph.launch().map_err(err)?;
+                    g.graphs.insert(key, Graph(graph));
+                }
+                StepMode::Replay(key) => {
+                    if !g.launched {
+                        g.graphs[&key].0.launch().map_err(err)?;
+                    }
+                }
+                StepMode::Eager => {}
+            }
+            g.mode = StepMode::Eager;
         }
         Ok(())
     }
@@ -1290,6 +1337,11 @@ impl Backend for CudaBackend {
                     let qh = qh.as_mut().unwrap();
                     launch!(self, "repack_q6_k", cfg, [&staging, &mut qs, qh, &mut sc, &r0, &ni, &k])?
                 }
+                Fmt::Q5 => {
+                    let qh = qh.as_mut().unwrap();
+                    launch!(self, "repack_q5_k", cfg, [&staging, &mut qs, qh, &mut sc, &r0, &ni, &k])?
+                }
+                Fmt::IQ4 => launch!(self, "repack_iq4_xs", cfg, [&staging, &mut qs, &mut sc, &r0, &ni, &k])?,
                 _ => unreachable!(),
             }
         }
@@ -1391,35 +1443,60 @@ impl Backend for CudaBackend {
 
     fn to_host(&self, buf: &CudaBuf, out: &mut [f32]) -> Result<()> {
         check_len("to_host", buf.len(), out.len())?;
-        // A graph step ends here: finish capture, launch the graph.
-        {
-            let mut g = self.graph.lock().unwrap();
-            match g.mode {
-                StepMode::Measure(key) => {
-                    let used = g.arena_off;
-                    g.measured.insert(key, used);
-                }
-                StepMode::Capture(key) => {
-                    let n = g.written.len();
-                    g.index_writes.insert(key, n);
-                    let graph = gpu::end_capture(&self.stream)
-                        .map_err(err)?
-                        .ok_or_else(|| Error::Backend("empty graph capture".into()))?;
-                    graph.launch().map_err(err)?;
-                    g.graphs.insert(key, Graph(graph));
-                }
-                StepMode::Replay(key) => {
-                    if !g.launched {
-                        g.graphs[&key].0.launch().map_err(err)?;
-                    }
-                }
-                StepMode::Eager => {}
-            }
-            g.mode = StepMode::Eager;
-        }
+        self.end_graph_step()?;
         // SAFETY: `buf` holds at least `out.len()` floats (checked above).
         unsafe { gpu::memcpy_dtoh_async(out, buf.ptr, &self.stream) }.map_err(err)?;
         self.stream.synchronize().map_err(err)
+    }
+
+    fn sample_rows(&self, logits: &CudaBuf, n_rows: usize, vocab: usize, rows: &[(u32, &RowSample)], out: &mut [u32]) -> Result<()> {
+        check_len("sample_rows", logits.len(), n_rows * vocab)?;
+        if rows.len() != out.len() || rows.iter().any(|&(r, _)| r as usize >= n_rows) {
+            return Err(Error::Shape("sample_rows: rows/out mismatch".into()));
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // Eager from here: the adjustment lists vary from step to step.
+        self.end_graph_step()?;
+        let mut cache = self.index_cache.lock().unwrap();
+        let (mut at, mut delta) = (Vec::new(), Vec::new());
+        for &(r, s) in rows {
+            for &(id, d) in s.adjust.iter().filter(|(id, _)| (*id as usize) < vocab) {
+                at.push(r * vocab as u32 + id);
+                delta.push(d.to_bits());
+            }
+        }
+        if !at.is_empty() {
+            self.sync_index(&mut cache, "sample_adj_at", &at)?;
+            self.sync_index(&mut cache, "sample_adj_d", &delta)?;
+            let (a, d, n) = (&cache["sample_adj_at"].dev, &cache["sample_adj_d"].dev, at.len() as i32);
+            launch!(self, "logit_adjust", grid_1d(at.len(), 256), [logits, a, d, &n])?;
+        }
+        let params: Vec<u32> = rows
+            .iter()
+            .flat_map(|&(r, s)| {
+                [s.temperature.to_bits(), s.top_k, s.top_p.to_bits(), s.seed as u32, (s.seed >> 32) as u32, s.counter as u32, (s.counter >> 32) as u32, r]
+            })
+            .collect();
+        self.sync_index(&mut cache, "sample_params", &params)?;
+        // The ids come back through an index buffer of the right size.
+        let ids = vec![0u32; rows.len()];
+        self.sync_index(&mut cache, "sample_out", &ids)?;
+        let (pp, po) = (&cache["sample_params"].dev, &cache["sample_out"].dev);
+        let cfg = LaunchConfig { grid_dim: (rows.len() as u32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 };
+        let v = vocab as i32;
+        launch!(self, "sample_rows", cfg, [logits, &v, pp, po])?;
+        let mut host = vec![0f32; rows.len()];
+        // SAFETY: `sample_out` holds at least rows.len() u32s (synced above).
+        unsafe { gpu::memcpy_dtoh_async(&mut host, po.device_ptr(&self.stream).0, &self.stream) }.map_err(err)?;
+        self.stream.synchronize().map_err(err)?;
+        // The cached host copy no longer matches the device contents.
+        cache.get_mut("sample_out").unwrap().host.clear();
+        for (o, h) in out.iter_mut().zip(host) {
+            *o = h.to_bits();
+        }
+        Ok(())
     }
 
     fn embed(&self, table: &CudaWeight, tokens: &[u32], out: &mut CudaBuf) -> Result<()> {
@@ -1469,10 +1546,11 @@ impl Backend for CudaBackend {
             i += group.len();
             let mut targets = MvTargets { count: group.len() as i32, ..Default::default() };
             // Warps per row: split k when one warp per row would leave SMs idle
-            // (e.g. Gemma's 256 x 2560 per-layer projections).
+            // (e.g. Gemma's 256 x 2560 per-layer projections), or always for
+            // long rows where the vendor prefers it (gpu::MATVEC_SPLIT_K).
             let rows: usize = group.iter().map(|&wi| ws[wi].rows).sum();
             // (kernels.cu instantiates kw = 1 and 4 = MATVEC_WARPS only.)
-            let kw = if rows < self.n_sms * 8 && k >= 1024 { MATVEC_WARPS as usize } else { 1 };
+            let kw = if (gpu::MATVEC_SPLIT_K || rows < self.n_sms * 8) && k >= 1024 { MATVEC_WARPS as usize } else { 1 };
             let rows_per_block = MATVEC_WARPS as usize / kw;
             let mut blocks = 0usize;
             for (slot, &wi) in group.iter().enumerate() {
@@ -1526,6 +1604,20 @@ impl Backend for CudaBackend {
             i += group.len();
 
             let mut targets = MvTargets { count: group.len() as i32, ..Default::default() };
+            // Split only if every lane of the 4 warps still gets a step (mv_dot
+            // steps whole units for Q4, half units otherwise).
+            let whole_units = matches!(fmt, Fmt::Q4 | Fmt::Q5 | Fmt::IQ4);
+            let steps = if whole_units { k / 32 } else { k / 16 };
+            // (kernels.cu instantiates kw = 1, 2 and 4 on HIP.) Two warps per
+            // row only for unit-stepping formats: +2% Llama-3.2-1B decode
+            // (2048-wide rows), but -1% on Qwen3-0.6B Q8 (1024-wide).
+            let kw = match steps / WARP as usize {
+                _ if !gpu::MATVEC_SPLIT_K => 1,
+                s if s >= 4 => 4,
+                s if s >= 2 && whole_units => 2,
+                _ => 1,
+            };
+            let rows_per_block = MATVEC_WARPS as usize / kw;
             let mut blocks = 0usize;
             for (slot, &wi) in group.iter().enumerate() {
                 let w = ws[wi];
@@ -1541,7 +1633,7 @@ impl Backend for CudaBackend {
                     n: w.rows as i32,
                     block_start: blocks as i32,
                 };
-                blocks += w.rows.div_ceil(MATVEC_WARPS as usize);
+                blocks += w.rows.div_ceil(rows_per_block);
             }
             let name = format!("matvec_{}", fmt.suffix());
             let prof = if self.profile.enabled {
@@ -1551,7 +1643,8 @@ impl Backend for CudaBackend {
                 String::new()
             };
             let cfg = LaunchConfig { grid_dim: (blocks as u32, 1, 1), block_dim: (MATVEC_WARPS * WARP, 1, 1), shared_mem_bytes: 0 };
-            launch!(self, name, cfg, [&targets, xq, xd, &ki, &mi], prof = prof)?;
+            let kwi = kw as i32;
+            launch!(self, name, cfg, [&targets, xq, xd, &ki, &mi, &kwi], prof = prof)?;
         }
         Ok(())
     }
@@ -1600,13 +1693,15 @@ impl Backend for CudaBackend {
             };
             let name = format!("matvec_glu_{a}_{}", gate.fmt.suffix());
             let prof = if self.profile.enabled { format!("{name} {n}x{k}") } else { String::new() };
+            // Rows split over warps as in matvec_many's float path.
+            let kw = if (gpu::MATVEC_SPLIT_K || n < self.n_sms * 8) && k >= 1024 { MATVEC_WARPS as usize } else { 1 };
             let cfg = LaunchConfig {
-                grid_dim: (n.div_ceil(MATVEC_WARPS as usize) as u32, 1, 1),
+                grid_dim: (n.div_ceil(MATVEC_WARPS as usize / kw) as u32, 1, 1),
                 block_dim: (MATVEC_WARPS * WARP, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let (ki, mi) = (k as i32, m as i32);
-            launch!(self, &name, cfg, [&tg, &tu, x, &ki, &mi, &mut *gate_buf], prof = prof)?;
+            let (ki, mi, kwi) = (k as i32, m as i32, kw as i32);
+            launch!(self, &name, cfg, [&tg, &tu, x, &ki, &mi, &mut *gate_buf, &kwi], prof = prof)?;
             return self.matmul(gate_buf, down, out, m);
         }
         self.matmul_many(x, &[gate, up], &mut [&mut *gate_buf, &mut *up_buf], m)?;
@@ -1783,8 +1878,7 @@ impl Backend for CudaBackend {
         q: &CudaBuf,
         k: &CudaBuf,
         v: &CudaBuf,
-        q_norm: &CudaWeight,
-        k_norm: &CudaWeight,
+        qk_norm: Option<(&CudaWeight, &CudaWeight)>,
         v_norm: Option<&CudaWeight>,
         qn: &mut CudaBuf,
         kv: &mut CudaKvCache,
@@ -1801,9 +1895,15 @@ impl Backend for CudaBackend {
         fn dense(w: &CudaWeight) -> Result<&gpu::Slice<f32>> {
             w.dense.as_ref().ok_or_else(|| Error::Shape("norm weight must be 1-D".into()))
         }
-        let (qw, kw) = (dense(q_norm)?, dense(k_norm)?);
-        check_len("qkv q_norm", qw.len(), head_dim)?;
-        check_len("qkv k_norm", kw.len(), head_dim)?;
+        // Without norms the kernel never reads qw/kw: any valid pointer will do.
+        let (qw, kw) = match qk_norm {
+            Some((q_norm, k_norm)) => (dense(q_norm)?, dense(k_norm)?),
+            None => (&self.ones_placeholder, &self.ones_placeholder),
+        };
+        if qk_norm.is_some() {
+            check_len("qkv q_norm", qw.len(), head_dim)?;
+            check_len("qkv k_norm", kw.len(), head_dim)?;
+        }
         let n = positions.len();
         check_len("qkv q", q.len().min(qn.len()), n * n_heads * head_dim)?;
         check_len("qkv k", k.len().min(v.len()), n * n_kv_heads * head_dim)?;
@@ -1835,11 +1935,11 @@ impl Backend for CudaBackend {
         // Unused pointers get valid placeholders.
         let vwp: u64 = vw.map_or(qw.device_ptr(&self.stream).0, |w| w.device_ptr(&self.stream).0);
         let fptr: u64 = factors.map_or(0, |f| f.device_ptr(&self.stream).0);
-        let (hv, hf) = (vw.is_some() as i32, factors.is_some() as i32);
+        let (hv, hf, hn) = (vw.is_some() as i32, factors.is_some() as i32, qk_norm.is_some() as i32);
         let (nt, nh, nkv, hd) = (n as i32, n_heads as i32, n_kv_heads as i32, head_dim as i32);
         let q8 = (kv.layout.dtype == KvType::Q8) as i32;
         let (kc, vc, ks, vs) = (&mut kv.k[layer], &mut kv.v[layer], &mut kv.ks[layer], &mut kv.vs[layer]);
-        launch!(self, "qkv_norm_rope_store", cfg, [q, k, v, qw, kw, &vwp, &hv, qn, kc, vc, pos, sl, &nt, &nh, &nkv, &hd, &eps, &theta, &fptr, &hf, ks, vs, &q8])
+        launch!(self, "qkv_norm_rope_store", cfg, [q, k, v, qw, kw, &hn, &vwp, &hv, qn, kc, vc, pos, sl, &nt, &nh, &nkv, &hd, &eps, &theta, &fptr, &hf, ks, vs, &q8])
     }
 
     fn silu_mul(&self, gate: &mut CudaBuf, up: &CudaBuf, len: usize) -> Result<()> {
@@ -2146,8 +2246,13 @@ impl Backend for CudaBackend {
         // buffers and run the f16 kernels on a remapped block table.
         let q8 = kv.layout.dtype == KvType::Q8;
         let staged = q8 && is_prefill && n_tok > MATVEC_MAX_M;
-        const AD_WARPS: usize = 8;
-        let ad_smem = (group * hdim + AD_WARPS * group * 2 + AD_WARPS * group * hdim) * 4;
+        // Decode attention warps: 8, or fewer where that needs more shared
+        // memory than the GPU has (512-wide heads on AMD's 64 KB: 8 warps
+        // take 74 KB, and the generic fallback ran Nemotron decode at 16k
+        // context at 5 tok/s). The kernel takes its warp count from the launch.
+        let ad_smem_for = |warps: usize| (group * hdim + warps * group * 2 + warps * group * hdim) * 4;
+        let ad_warps = [8, 4, 2].into_iter().find(|&w| ad_smem_for(w) <= self.max_smem).unwrap_or(8);
+        let ad_smem = ad_smem_for(ad_warps);
         let decode_kernel = (!is_prefill || n_tok <= MATVEC_MAX_M) && ATTN_DECODE_SHAPES.contains(&(group, hdim)) && ad_smem <= self.max_smem;
         // Keys in a q8 cache are rotated (see kv_rotate_q in kernels.cu):
         // queries get the same rotation (the decode kernel does its own).
@@ -2245,17 +2350,17 @@ impl Backend for CudaBackend {
         }
 
         // RDNA3 matrix cores: 4 waves of 16 query rows.
-        if is_prefill && self.wmma && WA_HEAD_DIMS.contains(&hdim) && group <= WA_ROWS && !FLAGS.no_fa {
-            let smem = wa_smem(hdim);
+        let (wa_rows, smem) = wa_cfg(hdim);
+        if is_prefill && self.wmma && WA_HEAD_DIMS.contains(&hdim) && group <= wa_rows && !FLAGS.no_fa {
             if smem <= self.max_smem {
-                let tile_tokens = WA_ROWS / group;
+                let tile_tokens = wa_rows / group;
                 let tiles = build_tiles(tile_tokens);
                 self.sync_index(&mut cache, "attn_tiles", &tiles)?;
                 let (pos, seq, tab, til) =
                     (&cache["positions"].dev, &cache["token_seq"].dev, &cache[tab_key].dev, &cache["attn_tiles"].dev);
                 let cfg = LaunchConfig {
                     grid_dim: ((tiles.len() / 2) as u32, meta.n_kv_heads as u32, 1),
-                    block_dim: (4 * WARP, 1, 1),
+                    block_dim: (8 * WARP, 1, 1),
                     shared_mem_bytes: smem as u32,
                 };
                 let tt = tile_tokens as i32;
@@ -2339,7 +2444,7 @@ impl Backend for CudaBackend {
             let splits = (2 * self.n_sms).div_ceil(meta.n_kv_heads).min(capacity / 256).clamp(1, 32);
             let cfg = LaunchConfig {
                 grid_dim: (n_tok as u32, meta.n_kv_heads as u32, splits as u32),
-                block_dim: (AD_WARPS as u32 * WARP, 1, 1),
+                block_dim: (ad_warps as u32 * WARP, 1, 1),
                 shared_mem_bytes: ad_smem as u32,
             };
             let (kc, vc, ks, vs) = (&kv.k[layer], &kv.v[layer], &kv.ks[layer], &kv.vs[layer]);

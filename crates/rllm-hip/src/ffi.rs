@@ -19,6 +19,10 @@ pub type GraphExec = *mut c_void;
 pub type MemPool = *mut c_void;
 pub type Program = *mut c_void;
 pub type BlasHandle = *mut c_void;
+pub type LtHandle = *mut c_void;
+pub type LtDesc = *mut c_void;
+pub type LtLayout = *mut c_void;
+pub type LtPref = *mut c_void;
 
 macro_rules! api {
     ($name:ident { $( $(#[$opt:ident])? fn $f:ident($($ty:ty),* $(,)?) -> $ret:ty; )* }) => {
@@ -110,6 +114,26 @@ api!(Blas {
     ) -> c_int;
 });
 
+api!(Lt {
+    fn hipblasLtCreate(*mut LtHandle) -> c_int;
+    fn hipblasLtDestroy(LtHandle) -> c_int;
+    fn hipblasLtMatmulDescCreate(*mut LtDesc, c_int, c_int) -> c_int;
+    fn hipblasLtMatmulDescDestroy(LtDesc) -> c_int;
+    fn hipblasLtMatmulDescSetAttribute(LtDesc, c_int, *const c_void, usize) -> c_int;
+    fn hipblasLtMatrixLayoutCreate(*mut LtLayout, c_int, u64, u64, i64) -> c_int;
+    fn hipblasLtMatrixLayoutDestroy(LtLayout) -> c_int;
+    fn hipblasLtMatmulPreferenceCreate(*mut LtPref) -> c_int;
+    fn hipblasLtMatmulPreferenceDestroy(LtPref) -> c_int;
+    fn hipblasLtMatmulPreferenceSetAttribute(LtPref, c_int, *const c_void, usize) -> c_int;
+    fn hipblasLtMatmulAlgoGetHeuristic(
+        LtHandle, LtDesc, LtLayout, LtLayout, LtLayout, LtLayout, LtPref, c_int, *mut c_void, *mut c_int,
+    ) -> c_int;
+    fn hipblasLtMatmul(
+        LtHandle, LtDesc, *const c_void, *const c_void, LtLayout, *const c_void, LtLayout, *const c_void,
+        *const c_void, LtLayout, *mut c_void, LtLayout, *const c_void, *mut c_void, usize, Stream,
+    ) -> c_int;
+});
+
 /// Directories to look in before the loader's default search:
 /// `$RLLM_HIP_LIB_DIR`, `$ROCM_PATH/lib`, `/opt/rocm/lib`.
 fn lib_dirs() -> Vec<PathBuf> {
@@ -146,5 +170,7 @@ pub static HIP: LazyLock<Result<Hip, String>> =
     LazyLock::new(|| unsafe { Hip::load(open(&["libamdhip64.so.7", "libamdhip64.so.6", "libamdhip64.so"])?) });
 pub static RTC: LazyLock<Result<Rtc, String>> =
     LazyLock::new(|| unsafe { Rtc::load(open(&["libhiprtc.so.7", "libhiprtc.so.6", "libhiprtc.so"])?) });
+pub static LT: LazyLock<Result<Lt, String>> =
+    LazyLock::new(|| unsafe { Lt::load(open(&["libhipblaslt.so.1", "libhipblaslt.so.0", "libhipblaslt.so"])?) });
 pub static BLAS: LazyLock<Result<Blas, String>> =
     LazyLock::new(|| unsafe { Blas::load(open(&["libhipblas.so.3", "libhipblas.so.2", "libhipblas.so"])?) });

@@ -20,7 +20,7 @@ use rllm_core::{Activation, AttnMeta, Backend, HostTensor, KvLayout, KvType};
 use rllm_gguf::{Gguf, Value};
 
 use crate::loader::{host_tensor, load_weight};
-use crate::{Batch, Model};
+use crate::{Batch, Model, StepOut};
 
 #[derive(Debug, Clone)]
 pub struct Gemma4Config {
@@ -271,7 +271,7 @@ impl<B: Backend> Gemma4<B> {
         })
     }
 
-    fn forward_impl(&self, b: &B, cache: &mut Cache<B>, batch: &Batch, block_size: usize) -> Result<Vec<f32>> {
+    fn forward_impl(&self, b: &B, cache: &mut Cache<B>, batch: &Batch, block_size: usize) -> Result<StepOut> {
         let c = &self.cfg;
         let n = batch.tokens.len();
         let d = c.hidden;
@@ -351,7 +351,7 @@ impl<B: Backend> Gemma4<B> {
                 let (swa, idx) = self.kv_index[li];
                 let kv = if swa { &mut cache.swa } else { &mut cache.global };
                 b.qkv_norm_rope_store(
-                    &q, &k, &v, &l.q_norm, k_norm, Some(ones), &mut qn, kv, idx, batch.positions, batch.slots,
+                    &q, &k, &v, Some((&l.q_norm, k_norm)), Some(ones), &mut qn, kv, idx, batch.positions, batch.slots,
                     c.n_heads, c.n_kv_heads, hd, c.rms_eps, theta, factors,
                 )?;
             } else {
@@ -407,16 +407,14 @@ impl<B: Backend> Gemma4<B> {
         if batch.hidden {
             let mut host = vec![0f32; m * d];
             b.to_host(&normed, &mut host)?;
-            return Ok(host);
+            return Ok(StepOut { rows: host, ids: Vec::new() });
         }
         let mut logits = b.alloc(m * c.vocab)?;
         b.matmul(&normed, self.output.as_ref().unwrap_or(&self.embed), &mut logits, m)?;
         if let Some(cap) = c.logit_softcap {
             b.softcap(&mut logits, cap, m * c.vocab)?;
         }
-        let mut host = vec![0f32; m * c.vocab];
-        b.to_host(&logits, &mut host)?;
-        Ok(host)
+        crate::finish_logits(b, &logits, m, c.vocab, batch)
     }
 }
 
@@ -452,7 +450,7 @@ impl<B: Backend> Model<B> for Gemma4<B> {
         Ok(b.kv_from_host(&mut cache.global, &store.global, host, dev)?)
     }
 
-    fn forward(&self, b: &B, cache: &mut Cache<B>, batch: &Batch, block_size: usize) -> Result<Vec<f32>> {
+    fn forward(&self, b: &B, cache: &mut Cache<B>, batch: &Batch, block_size: usize) -> Result<StepOut> {
         self.forward_impl(b, cache, batch, block_size)
     }
 

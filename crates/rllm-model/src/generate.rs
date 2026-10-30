@@ -2,7 +2,8 @@ use anyhow::Result;
 use rllm_core::{Backend, KvType};
 use rllm_kv::{BlockAllocator, BlockStore, SeqKv};
 
-use crate::{Batch, Model};
+use crate::{Batch, Model, StepOut};
+use rllm_core::RowSample;
 
 /// What a [`KvPool::step`] item wants back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +76,13 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
     /// final hidden states `[rows, hidden]` if `hidden`. All-or-nothing on
     /// block allocation: on error no sequence has grown.
     pub fn step(&mut self, items: &mut [StepItem], hidden: bool) -> Result<Vec<f32>> {
+        Ok(self.step_sampled(items, hidden, &[])?.rows)
+    }
+
+    /// [`Self::step`], sampling some wanted rows on the device: `sample` has
+    /// one entry per wanted row (in order), `Some` to sample that row
+    /// instead of returning its logits; empty to return every row.
+    pub fn step_sampled(&mut self, items: &mut [StepItem], hidden: bool, sample: &[Option<RowSample>]) -> Result<StepOut> {
         anyhow::ensure!(items.iter().all(|i| !i.tokens.is_empty()), "step: empty item");
         let need: usize = items.iter().map(|i| i.seq.blocks_needed(self.block_size, i.tokens.len())).sum();
         anyhow::ensure!(need <= self.alloc.n_free(), "KV cache out of blocks (need {need}, have {})", self.alloc.n_free());
@@ -110,10 +118,12 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
             logit_rows: &rows,
             hidden,
             cache_id: self.id,
+            sample,
         };
+        anyhow::ensure!(sample.is_empty() || sample.len() == rows.len(), "{} sample specs for {} rows", sample.len(), rows.len());
         let out = self.model.forward(self.backend, &mut self.kv, &batch, self.block_size)?;
         if items.iter().all(|i| i.want == Want::None) {
-            return Ok(Vec::new());
+            return Ok(StepOut::default());
         }
         Ok(out)
     }
@@ -251,7 +261,8 @@ impl<'m, B: Backend, M: Model<B>> Generator<'m, B, M> {
             logit_rows,
             hidden,
             cache_id: p.id,
+            sample: &[],
         };
-        p.model.forward(p.backend, &mut p.kv, &batch, p.block_size)
+        Ok(p.model.forward(p.backend, &mut p.kv, &batch, p.block_size)?.rows)
     }
 }

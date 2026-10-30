@@ -17,8 +17,8 @@ Legend: ✓ supported · ◐ partial or limited · ✗ not supported.
 |---|---|---|---|
 | Language, runtime | Rust, one binary | C/C++, one binary | Python + PyTorch |
 | Typical use | GGUF serving on NVIDIA and AMD | Local inference on almost any hardware | Datacenter serving at high concurrency |
-| Model architectures | 2 (Qwen3 dense, Gemma 4) | 100+ | 200+ (most Hugging Face architectures) |
-| Weight formats | GGUF: F32, F16, BF16, Q8_0, Q4_K, Q6_K | GGUF, all quant types | safetensors (FP16/BF16, FP8, AWQ, GPTQ, NVFP4, …), GGUF experimental |
+| Model architectures | 3 families (Qwen3 dense; Llama/Mistral; Gemma 4) | 100+ | 200+ (most Hugging Face architectures) |
+| Weight formats | GGUF: F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS | GGUF, all quant types | safetensors (FP16/BF16, FP8, AWQ, GPTQ, NVFP4, …), GGUF experimental |
 | Hardware | NVIDIA (CUDA), AMD RDNA3 (ROCm/HIP), CPU (reference speed) | CPU, CUDA, Metal, Vulkan, HIP, SYCL and more | NVIDIA, AMD, Intel, TPU, CPU and more |
 | Multi-GPU | ✗ | ✓ layer or row split | ✓ tensor, pipeline, data and expert parallel |
 | Build needs | Rust; no CUDA toolkit or ROCm SDK (kernels compile at runtime with NVRTC or hiprtc) | C++ toolchain, plus a CUDA toolkit for GPU builds | pip wheels |
@@ -91,9 +91,9 @@ Ordered roughly by how much each one limits what rllm can serve.
 
 | Gap | llama.cpp | vLLM | Notes |
 |---|---|---|---|
-| Only two architectures (Qwen3 dense, Gemma 4) | ✓ 100+ | ✓ 200+ | No Llama, Mistral, Phi, DeepSeek or Qwen3-MoE yet. |
+| Three architecture families (Qwen3 dense, Llama/Mistral, Gemma 4) | ✓ 100+ | ✓ 200+ | Llama 2/3 and Mistral load as GGUF `llama`; no Phi, DeepSeek, Qwen2 (attention biases) or Qwen3-MoE yet. |
 | MoE models | ✓ | ✓ | Planned for Phase 4 (`docs/plan.md`). |
-| Six weight types | ✓ every GGUF type (Q2_K–Q6_K, Q4_0/Q5_0, IQ*, MXFP4, …) | ✓ FP8, AWQ, GPTQ, NVFP4, … | Q4_K_M and Q8_0 files work; Q5_K_M, IQ4_XS and similar don't load. |
+| Eight weight types | ✓ every GGUF type (Q2_K–Q6_K, Q4_0/Q5_0, IQ*, MXFP4, …) | ✓ FP8, AWQ, GPTQ, NVFP4, … | Q4_K_M, Q5_K_M, Q6_K, IQ4_XS and Q8_0 files work; Q2_K/Q3_K, Q4_0/Q5_0 and the other IQ types don't load. |
 | safetensors / Hugging Face checkpoints | ✗ | ✓ | GGUF only. |
 | Multimodal (images, audio) | ✓ (libmtmd) | ✓ | Non-text input is rejected with 400. |
 | LoRA adapters | ✓ | ✓ multi-LoRA serving | |
@@ -116,7 +116,7 @@ Ordered roughly by how much each one limits what rllm can serve.
 
 | Gap | llama.cpp | vLLM | Notes |
 |---|---|---|---|
-| Throughput at very high concurrency | ◐ | ✓ | Not benchmarked against vLLM yet. rllm's graph-replayed steps hold up to 8 tokens, and `--parallel` defaults to 4. The Phase 2 exit criterion (concurrency 16/32/64 vs vLLM) is still open. |
+| Throughput at high concurrency | ◐ | ✓ | Measured (`compare.md`): Qwen3-0.6B BF16 at 16/32/64 clients reaches 0.96/0.82/0.76× vLLM; Qwen3-8B Q4_K_M vs vLLM's AWQ 0.53/0.54/0.60×. rllm leads at one client. The 8B gap is MMQ's fixed 64-token tile at 9–32 tokens per step. |
 | Learned draft heads (EAGLE, MTP) | ✗ | ✓ | rllm has a separate draft model and prompt lookup (n-gram). |
 | Prefix cache for the draft model | ✓ | ✓ | rllm's draft re-reads each request's whole prompt. |
 | Speculation in the CLI | ✓ | n/a | `rllm run` has no `--draft`; only the server does. |
@@ -134,16 +134,17 @@ Ordered roughly by how much each one limits what rllm can serve.
 | Case | rllm | llama.cpp |
 |---|---:|---:|
 | Qwen3-8B Q4_K_M, prompt processing (pp512) | 6640 tok/s | 9380 tok/s (1.4×) |
-| Qwen3-8B Q4_K_M, generation, empty context | 143 tok/s | 153 tok/s (1.07×) |
+| Qwen3-8B Q4_K_M, generation, empty context | 150 tok/s | 153 tok/s (1.02×) |
 | Qwen3-8B Q4_K_M, generation at 32k, f16 KV | 71.4 tok/s | 82.3 tok/s (1.15×) |
 | Qwen3-8B, prompt processing at 32k context | 2593 tok/s | 3261 tok/s (1.26×) |
 | CPU backend, prompt processing | 0.2–0.35× | 1× |
-| Strix Halo (gfx1151), Qwen3-8B Q4_K_M generation | 34.4 tok/s | 42.8 tok/s (1.25×) |
-| Strix Halo (gfx1151), Nemotron prompt processing (pp512) | 1934 tok/s | 2141 tok/s (1.11×) |
+| Strix Halo (gfx1151), Qwen3-8B Q4_K_M generation | 39.3 tok/s | 42.8 tok/s (1.09×) |
+| Strix Halo (gfx1151), Qwen3-8B prompt processing at 16k context | 727 tok/s | 788 tok/s (1.08×) |
 
 rllm leads or ties on Qwen3-0.6B and Nemotron, the models it was tuned on.
 The 8B gap is the next profiling target. On the Strix Halo, rllm's prompt
-processing leads on every Qwen3 model (1.02–1.39×); see `compare.md`.
+processing leads on every model tested (1.02–1.44×) and decode leads on the
+0.6B models; see `compare.md`.
 
 ## Summary
 
@@ -153,9 +154,9 @@ processing leads on every Qwen3 model (1.02–1.39×); see `compare.md`.
   - What it lacks is breadth: architectures, quant types, hardware backends, multi-GPU, partial offload, multimodal.
 - **Against vLLM**, rllm offers a single Rust binary that starts quickly, reads GGUF files and gives reproducible results.
   - vLLM is far ahead on model coverage, quantization formats, parallelism, hardware and advanced speculation.
-  - Throughput at high concurrency hasn't been compared yet.
+  - At 16–64 concurrent clients vLLM's throughput is 1.05–1.9× rllm's (rllm leads with one client and on time to first token for small models).
 - **Next steps that close the most gaps:**
-  1. Qwen3-8B kernel profiling.
-  2. More architectures (Llama, Mistral) and the remaining K-quants (Q5_K, Q3_K, Q2_K).
-  3. A vLLM benchmark at concurrency 16/32/64.
+  1. Batch-sized MMQ tiles for decode steps of 9–32 tokens (the remaining concurrency gap to vLLM).
+  2. Qwen3-8B kernel profiling (prefill on the Ada).
+  3. More architectures (Phi, Qwen2, Qwen3-MoE) and the remaining quant types (Q3_K, Q2_K, Q4_0/Q5_0, other IQ).
   4. Tensor parallelism once multi-GPU hardware is available.

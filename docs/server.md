@@ -36,6 +36,7 @@ r = client.chat.completions.create(model="my-model", messages=[{"role": "user", 
 | `--draft-tokens` | 5 | Most tokens the draft (or prompt lookup) proposes per step. |
 | `--prompt-lookup` | off | Speculative decoding without a draft model: propose the tokens that followed the latest few tokens' earlier occurrence in the prompt or output (see [Prompt lookup](#prompt-lookup)). |
 | `--host-cache-gb` | 0 | Pinned system memory (GiB) for the prefix cache's host tier: evicted prefixes move there and come back on a hit (see [Host tier](#host-tier)). |
+| `--host-sampling` | off | Sample every token on the CPU from full logits rows instead of on the GPU (see [How requests run](#how-requests-run)). |
 | `--api-key` | `$RLLM_API_KEY`, else none | Require `Authorization: Bearer <key>`. |
 | `--model-name` | file name without `.gguf` | Model id reported by `/v1/models` and in responses. |
 | `--strict-model` | off | Answer requests naming another model with 404 `model_not_found`, as OpenAI does. Off by default: any model name is served by the loaded model, so clients that hard-code e.g. `gpt-4o` still work. |
@@ -209,7 +210,7 @@ retrieval-embedding model.
   - Only whole 16-token blocks are shared, so the last few tokens before the difference are recomputed.
   - Least recently used entries are evicted when blocks run out: dropped, or with `--host-cache-gb` moved to system memory (see [Host tier](#host-tier)).
 - **When the KV cache is full.** Cached prefixes are evicted first. If that isn't enough, the newest running request is paused, and its blocks go into the prefix cache. It resumes later by recomputing (often reusing) its tokens. Clients only see a short stall.
-- **Sampling.** Each request's logits are processed on the host: logprobs, `logit_bias`, penalties, the JSON constraint, then sampling. With several requests in a step, this runs on one thread per request.
+- **Sampling.** Tokens are sampled on the GPU and only their ids are copied back: `logit_bias` and penalties are added to the logits there, then temperature 0 takes the argmax and anything else draws by the Gumbel-max trick (exact for softmax), with top_k and top_p cutting the candidates at thresholds found by bisection. Requests that need the full row (logprobs, a JSON constraint, draft verification) are processed on the host instead, one thread per request. Copying every row to the host had cost most of a step at high concurrency: Qwen3-0.6B with 64 clients went from 2524 to 8264 output tokens/s on the RTX 6000 Ada. `--host-sampling` keeps everything on the host. `seed` makes output reproducible either way, though the two paths draw differently.
 - **Numerics.** A request batched with others runs through the multi-row int8 kernels (the ones prefill uses), and a lone request through the single-row decode kernels.
   - Logprobs agree to about 0.01–0.02 on average, but greedy text can drift apart after a few dozen tokens.
   - Results are reproducible for the same mix of concurrent requests: every GPU reduction sums in a fixed order, so the same tokens give bit-identical logits on every run. (Prefill matmuls split along k used to `atomicAdd` their parts in whatever order they finished.)

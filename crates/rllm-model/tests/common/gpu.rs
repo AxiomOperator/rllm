@@ -68,7 +68,7 @@ fn prefill_is_deterministic() {
 
 /// A step of several tokens of one sequence (how speculative decoding
 /// verifies drafts) gives the same logits as feeding them one at a time, so
-/// greedy output doesn't change with a draft model. Bit for bit on Qwen3;
+/// greedy output doesn't change with a draft model. Bit for bit on Qwen3 and Llama;
 /// Gemma 4's single-token steps use fused kernels of their own, so there
 /// only closely (like batched requests vs one alone).
 #[test]
@@ -94,7 +94,7 @@ fn verification_steps_match_single_steps() {
             .zip(batched.chunks_exact(vocab))
             .filter(|(a, b)| rllm_model::sampler::argmax(a) == rllm_model::sampler::argmax(b))
             .count();
-        if g.get_str("general.architecture").unwrap() == "qwen3" {
+        if matches!(g.get_str("general.architecture").unwrap(), "qwen3" | "llama") {
             assert_eq!(diff, 0, "{kv}: {diff} of {} logits differ", singles.len());
         } else {
             // (Random tokens: near-ties may flip, so only the size is checked.)

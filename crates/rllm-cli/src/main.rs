@@ -88,6 +88,11 @@ enum Cmd {
         /// (GiB) and copy them back on a hit instead of recomputing.
         #[arg(long, default_value_t = 0.0)]
         host_cache_gb: f64,
+        /// Sample every token on the CPU from full logits rows. By default
+        /// tokens are sampled on the GPU where possible (not with logprobs or
+        /// a JSON constraint), so only token ids leave the device.
+        #[arg(long)]
+        host_sampling: bool,
         /// Save stored chat completions and responses to this JSON file (loaded at start).
         #[arg(long)]
         store_file: Option<PathBuf>,
@@ -138,6 +143,11 @@ enum Cmd {
         /// KV cache storage: f16 or q8.
         #[arg(long, default_value = "f16")]
         kv_type: KvType,
+        /// Also decode this many sequences together (tgN xB: total tokens/s
+        /// over all of them, as llama.cpp's batched-bench reports), sampling
+        /// greedily on the device as the server does.
+        #[arg(short, long, default_value_t = 1)]
+        batch: usize,
     },
     /// Compare against a llama.cpp reference dump (tools/llama-ref): same token
     /// ids in, logits compared at every position.
@@ -290,6 +300,7 @@ fn main() -> Result<()> {
             draft_tokens,
             prompt_lookup,
             host_cache_gb,
+            host_sampling,
             store_file,
             quiet,
         } => {
@@ -310,6 +321,7 @@ fn main() -> Result<()> {
                 draft_tokens,
                 prompt_lookup,
                 host_cache_bytes: (host_cache_gb.max(0.0) * (1u64 << 30) as f64) as usize,
+                host_sampling,
                 store_file,
                 log: !quiet,
             };
@@ -322,8 +334,8 @@ fn main() -> Result<()> {
         Cmd::Perplexity { model, file, device, ctx, chunks, kv_type } => {
             on_device!(device, b => perplexity(&b, &model, &file, ctx, chunks, kv_type))
         }
-        Cmd::Bench { model, device, n_prompt, n_gen, reps, depth, kv_type } => {
-            on_device!(device, b => bench(&b, &model, n_prompt, n_gen, reps, depth, kv_type))
+        Cmd::Bench { model, device, n_prompt, n_gen, reps, depth, kv_type, batch } => {
+            on_device!(device, b => bench(&b, &model, n_prompt, n_gen, reps, depth, kv_type, batch))
         }
         Cmd::CompareRef { model, reference, prompt_file, device, prefill_chunk } => {
             on_device!(device, b => compare_ref(&b, &model, &reference, prompt_file.as_deref(), prefill_chunk))
@@ -662,6 +674,7 @@ fn bench<B: Backend>(
     reps: usize,
     depth: usize,
     kv_type: KvType,
+    batch: usize,
 ) -> Result<()> {
     let g = Gguf::open(model_path)?;
     let model = AnyModel::load(backend, &g)?;
@@ -722,5 +735,39 @@ fn bench<B: Backend>(
     };
     measure(format!("pp{n_prompt}{at}"), n_prompt, true)?;
     measure(format!("tg{n_gen}{at}"), n_gen, false)?;
+    if batch > 1 && n_gen > 0 {
+        // `batch` sequences, each with `depth` tokens (at least 32) of
+        // context, decoding one token per step together.
+        let pre = depth.max(32);
+        let mut pool = rllm_model::KvPool::new(backend, &model, batch * (pre + n_gen + 16), 16, kv_type)?;
+        let mut rates = Vec::with_capacity(reps);
+        for i in 0..=reps {
+            let mut seqs: Vec<rllm_kv::SeqKv> = (0..batch).map(|_| rllm_kv::SeqKv::default()).collect();
+            for s in &mut seqs {
+                let p: Vec<u32> = (0..pre).map(|_| next_tok()).collect();
+                pool.step(&mut [rllm_model::StepItem { seq: s, tokens: &p, want: rllm_model::Want::Last }], false)?;
+            }
+            let mut next: Vec<[u32; 1]> = (0..batch).map(|_| [next_tok()]).collect();
+            // Greedy, sampled on the device as the server does.
+            let greedy = rllm_model::RowSample { temperature: 0.0, top_k: 0, top_p: 1.0, seed: 0, counter: 0, adjust: Vec::new() };
+            let sample = vec![Some(greedy); batch];
+            backend.synchronize()?;
+            let t0 = Instant::now();
+            for _ in 0..n_gen {
+                let mut items: Vec<rllm_model::StepItem> =
+                    seqs.iter_mut().zip(&next).map(|(s, t)| rllm_model::StepItem { seq: s, tokens: t, want: rllm_model::Want::Last }).collect();
+                let ids = pool.step_sampled(&mut items, false, &sample)?.ids;
+                next.iter_mut().zip(ids).for_each(|(n, id)| n[0] = id);
+            }
+            backend.synchronize()?;
+            if i > 0 {
+                rates.push((n_gen * batch) as f64 / t0.elapsed().as_secs_f64());
+            }
+            seqs.iter_mut().for_each(|s| s.free(&mut pool.alloc));
+        }
+        let mean = rates.iter().sum::<f64>() / rates.len() as f64;
+        let sd = (rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / rates.len() as f64).sqrt();
+        println!("| {name} | {} | tg{n_gen} x{batch}{at} | {mean:.2} ± {sd:.2} |", backend.name());
+    }
     Ok(())
 }

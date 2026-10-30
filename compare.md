@@ -527,13 +527,27 @@ holds an idle `llama-server` (gemma-4-31B, 56 GB; 0% GPU before the runs).
 
 ### Speed (tokens/s), 2026-10-30
 
+llama.cpp columns from back-to-back runs earlier the same day; rllm from
+the final build.
+
 | Model | pp512, llama.cpp | pp512, rllm | rllm ÷ llama.cpp | tg128, llama.cpp | tg128, rllm | rllm ÷ llama.cpp |
 |---|---:|---:|---:|---:|---:|---:|
-| Qwen3-0.6B Q8_0 | 12518.87 ± 1371.83 | 16637.95 ± 61.71 | **1.33×** | 223.86 ± 0.58 | 216.12 ± 0.04 | 0.97× |
-| Qwen3-0.6B Q4_K_M | 12256.07 ± 1047.65 | 17086.75 ± 92.49 | **1.39×** | 285.25 ± 0.54 | 297.80 ± 0.13 | **1.04×** |
-| Qwen3-0.6B BF16 | 11138.34 ± 998.76 | 15171.59 ± 43.68 | **1.36×** | 135.11 ± 0.04 | 103.69 ± 0.05 | 0.77× |
-| Qwen3-8B Q4_K_M | 1302.65 ± 16.23 | 1327.08 ± 1.60 | **1.02×** | 42.84 ± 0.02 | 34.40 ± 0.00 | 0.80× |
-| Nemotron 3.5 Bolt E4B Q8_0 | 2140.94 ± 62.85 | 1933.73 ± 6.01 | 0.90× | 37.75 ± 0.03 | 36.42 ± 0.00 | 0.96× |
+| Qwen3-0.6B Q8_0 | 12518.87 ± 1371.83 | 16985.93 ± 61.95 | **1.36×** | 223.86 ± 0.58 | 231.32 ± 0.00 | **1.03×** |
+| Qwen3-0.6B Q4_K_M | 12256.07 ± 1047.65 | 17641.81 ± 74.88 | **1.44×** | 285.25 ± 0.54 | 311.45 ± 0.14 | **1.09×** |
+| Qwen3-0.6B BF16 | 11138.34 ± 998.76 | 15670.04 ± 28.74 | **1.41×** | 135.11 ± 0.04 | 153.26 ± 0.05 | **1.13×** |
+| Qwen3-0.6B Q5_K_M | 12110.17 ± 1031.69 | 17345.95 ± 86.36 | **1.43×** | 268.81 ± 0.61 | 286.13 ± 0.15 | **1.06×** |
+| Qwen3-0.6B IQ4_XS | 12724.50 ± 1415.50 | 17278.64 ± 101.00 | **1.36×** | 299.23 ± 0.81 | 333.36 ± 0.12 | **1.11×** |
+| Qwen3-8B Q4_K_M | 1302.65 ± 16.23 | 1333.43 ± 1.78 | **1.02×** | 42.84 ± 0.02 | 39.34 ± 0.01 | 0.92× |
+| Nemotron 3.5 Bolt E4B Q8_0 | 2140.94 ± 62.85 | 2338.66 ± 3.15 | **1.09×** | 37.75 ± 0.03 | 36.15 ± 0.02 | 0.96× |
+| Llama-3.2-1B Q4_K_M | 7483.22 ± 479.55 | 7781.68 ± 26.80 | **1.04×** | 212.13 ± 0.10 | 190.40 ± 0.05 | 0.90× |
+| Mistral-7B v0.3 Q4_K_M | 1294.30 ± 9.19 | 1366.00 ± 1.56 | **1.06×** | 46.32 ± 0.04 | 43.20 ± 0.01 | 0.93× |
+
+At 16k tokens of context (one run each):
+
+| Model | pp512 @ d16384, llama.cpp | rllm | tg32 @ d16384, llama.cpp | rllm |
+|---|---:|---:|---:|---:|
+| Qwen3-8B Q4_K_M | 787.66 | 727.28 (0.92×) | 29.39 | 27.44 (0.93×) |
+| Nemotron E4B Q8_0 | 1363.62 | 1194.10 (0.88×) | 33.78 | 32.50 (0.96×) |
 
 How the HIP backend got there (Qwen3-8B pp512 / Nemotron pp512):
 
@@ -544,12 +558,17 @@ How the HIP backend got there (Qwen3-8B pp512 / Nemotron pp512):
 | BF16 weights through the f16 GEMM | | 1366 |
 | Prefill attention on RDNA3 matrix cores (`attn_wmma`) | 956 | |
 | Int8 MMQ on matrix cores (`wmma_s8`), as on NVIDIA | 1327 | 1934 |
+| `attn_wmma` for 512-wide heads (head dims split over waves) | | 2330 |
 
-Decode is bandwidth-bound: the big matvecs reach about 200 GB/s, close to
-what llama.cpp gets, but rllm's repacked Q4_K takes 5 bits per weight
-(f16 scale and min per 32) against GGUF's 4.5, so Qwen3-8B reads 11% more
-per token. BF16 decode uses the plain float matvec, which reaches only
-~125 GB/s here.
+And for decode and long contexts:
+
+| Change | Effect |
+|---|---|
+| Q4_K repacked at 4.625 bits per weight (was 5): 6-bit scales kept as bytes, d/dmin per super-block | Qwen3-8B tg128 34.4 → 35.8 (and 144 → 150 on the RTX 6000 Ada) |
+| Decode matvecs split each long row over 4 waves (2 for 2048-wide Q4 rows), as llama.cpp does | BF16 0.6B 104 → 153, Qwen3-8B 35.8 → 40.2, Q8 0.6B 216 → 236 |
+| `attn_wmma`: queries held as matrix fragments, one softmax reduction per 32-key chunk, 8 waves sharing each K/V chunk | Qwen3-8B pp512 @ 16k 579 → 735 |
+| Decode attention with fewer warps where 8 don't fit in 64 KB of LDS (512-wide heads) | Nemotron tg32 @ 16k 5.0 → 32.5 |
+| hipBLASLt for 16-bit-output GEMMs from 4096 × 4096 weights up (1.5× hipBLAS there; slower on small ones) | Qwen3-8B pp512 with MMQ off 935 → 1232 |
 
 ### Correctness on gfx1151
 
@@ -566,10 +585,80 @@ reference:
 | Nemotron E4B Q8_0, f16 | 5.2e-2 | 4.1e-2 | 0/9 |
 | Nemotron E4B Q8_0, q8 | 4.8e-2 | 6.8e-2 | 0/9 |
 
-All 13 GPU-vs-CPU kernel parity tests (`cargo test -p rllm-hip`) pass, and
+All 14 GPU-vs-CPU kernel parity tests (`cargo test -p rllm-hip`) pass, as do
+the model tests (`--test gpu_hip`: determinism, verification steps,
+q8 vs f16, host tier) on Qwen3, Llama and Nemotron, and
 the server checks used on the Ada (a 30k-token prompt with 7 concurrent
 requests; prompt lookup; draft model; host-tier offload and restore) pass
 on gfx1151.
+
+## More weight types and model families
+
+**Q5_K and IQ4_XS** (Q5_K_M and IQ4_XS files) join Q4_K, Q6_K and Q8_0. On
+the device Q5_K is Q4_K's layout plus one high bit per weight (5.625 bits);
+IQ4_XS keeps its 4-bit codebook indices and a scale per 32 (4.5 bits, as in
+GGUF), decoded four at a time with a byte permute (`__byte_perm` /
+`v_perm_b32`). Both use the matvec, MMQ and dequantize paths of the other
+K-quants, and both backends' parity tests cover them.
+
+**Llama and Mistral** (GGUF architecture `llama`): the Qwen3 decoder without
+Q/K norms. Llama's GGUF stores Q and K for ggml's adjacent-pair RoPE; rllm
+reorders those rows at load time so its NeoX-style RoPE kernels apply
+unchanged. Llama 3's `rope_freqs` scaling, its `llama-bpe` tokenizer and its
+`strftime_now` template call are supported, as is the SentencePiece
+tokenizer of Llama 2 / Mistral (merges derived from the token scores).
+
+Perplexity (wikitext-2, ctx 512, first 32 chunks), rllm against llama.cpp
+on the same GPU:
+
+| Model | Strix Halo: rllm | llama.cpp ROCm | RTX 6000 Ada: rllm | llama.cpp CUDA |
+|---|---:|---:|---:|---:|
+| Qwen3-0.6B Q5_K_M | 19.095 | 19.241 | 19.092 | 19.239 |
+| Qwen3-0.6B IQ4_XS | 20.304 | 20.312 | 20.302 | 20.315 |
+| Llama-3.2-1B-Instruct Q4_K_M | 14.547 | 14.560 | 14.550 | 14.556 |
+| Mistral-7B-Instruct-v0.3 Q4_K_M | 5.952 | 5.962 | | |
+| Mistral-7B-Instruct-v0.3 IQ4_XS | 5.927 | 5.929 | | |
+
+All within ±0.16–0.74 (the estimates' own error). RTX 6000 Ada speed for the
+new types and Llama: Qwen3-0.6B Q5_K_M 80036 / 763 tok/s (pp512 / tg128;
+llama.cpp 47077 / 698), IQ4_XS 70867 / 827 (49568 / 727), Llama-3.2-1B
+51278 / 651 (48244 / 707).
+
+## Concurrency: `rllm serve` vs vLLM (RTX 6000 Ada)
+
+vLLM 0.32.0 (PyTorch 2.13, CUDA 13) in a Python 3.12 venv on the Ada box,
+`vllm serve <model> --gpu-memory-utilization 0.28 --max-model-len 2048
+--max-num-seqs 64`; rllm `serve --ctx 2048 --parallel 64 --kv-tokens 49152`.
+The client (`bench_conc.py`, stdlib only) runs N streaming clients, 3N
+requests, each a ~130-token prompt and exactly 192 greedy output tokens
+(end-of-turn tokens biased away). An idle llama-server holds 32 GB of the
+GPU throughout.
+
+| Output tokens/s | c1 | c16 | c32 | c64 |
+|---|---:|---:|---:|---:|
+| Qwen3-0.6B BF16, vLLM | 445 | 4619 | 8136 | 11324 |
+| Qwen3-0.6B BF16, rllm before | 481 | 3206 | 4350 | 2537 |
+| Qwen3-0.6B BF16, rllm | **502** | 4452 | 6695 | 8625 |
+| Qwen3-8B AWQ (4-bit), vLLM | 142 | 1733 | 2749 | 3472 |
+| Qwen3-8B Q4_K_M, rllm | **147** | 912 | 1480 | 2093 |
+
+Mean time to first token at c64: rllm 45 ms vs vLLM 91 ms (0.6B); 602 vs
+541 ms (8B). What changed, and what is left:
+- **Sampling on the device.** Each step used to copy every sequence's full
+  logits row to the host (64 × 151936 floats, 39 MB, into a fresh pageable
+  buffer) and sample there; at 64 sequences that took most of the 24 ms
+  step. Tokens are now sampled on the GPU (`sample_rows`: Gumbel-max, with
+  top_k / top_p thresholds by bisection, logit bias and penalties applied
+  first) and only ids come back; logprobs, JSON-constrained and draft
+  verification rows still go to the host. `--host-sampling` restores the
+  old path (2524 tok/s at c64).
+- **Graphs for larger decode steps:** pure decode steps of up to 64 tokens
+  are recorded and replayed (was 8): +18–21% at 16–32 sequences.
+- **Left (8B):** from 9 sequences on, decode leaves the matvec kernels for
+  MMQ, whose 64-token tiles waste most of their work at 9–32 tokens
+  (8 sequences: 905 tok/s; 9: 610). llama.cpp sizes its MMQ tile to the
+  batch; rllm doesn't yet. vLLM's AWQ kernels are also a different
+  quantization (no K-quant scales to unpack).
 
 ## Known gaps
 
@@ -602,13 +691,13 @@ on gfx1151.
 - **Several backends in one process:** two `CudaBackend`s recording CUDA
   graphs at once (only possible in tests) disturb each other's decode
   steps, so the GPU tests take a lock. The binaries create one backend.
-- **AMD (gfx1151):** decode trails llama.cpp on Qwen3-8B (0.80×, the
-  wider Q4_K repack) and BF16 (0.77×, the float matvec); Nemotron prefill is
-  0.90×. hipBLAS on gfx1151 is 4× slower with f32 output, so GEMMs write f16
-  scaled by 1/256 and widen it (overflow past 1.7e7). Prefill attention on
-  Gemma's 512-wide heads still takes the plain kernel (`attn_wmma` covers
-  64/128/256). Only gfx11 (RDNA3) has the WMMA kernels; other AMD targets
-  run the plain kernels and are untested.
+- **AMD (gfx1151):** decode trails llama.cpp by 4–10% on the 7–8B models
+  and Llama-3.2-1B, and prefill at 16k context by 8–12%. hipBLAS on gfx1151
+  is 4× slower with f32 output, so GEMMs write f16 scaled by 1/256 and widen
+  it (overflow past 1.7e7). Only gfx11 (RDNA3) has the WMMA kernels; other
+  AMD targets run the plain kernels and are untested.
+- **Batched decode of 9–32 sequences:** MMQ's fixed 64-token tile (see the
+  vLLM comparison above).
 - **Q4_K on CPU:** emulating llama.cpp's activation rounding doesn't narrow the
   gap. llama.cpp uses repacked Q4_K kernels on AVX2, whose rounding isn't
   mirrored. The gap is still within llama.cpp's own noise floor.

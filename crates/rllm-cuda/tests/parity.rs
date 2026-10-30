@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use half::{bf16, f16};
-use rllm_core::{AttnMeta, Backend, DType, HostBytes, HostTensor, KvLayout};
+use rllm_core::{AttnMeta, Backend, DType, HostBytes, HostTensor, KvLayout, KvType};
 use rllm_cpu::CpuBackend;
 use rllm_cuda::CudaBackend;
 
@@ -249,7 +249,7 @@ fn elementwise_ops() {
 #[test]
 fn paged_attention_mixed_batch() {
     for (head_dim, window) in [(128, 0), (256, 3), (512, 0), (512, 5)] {
-        attention_case(head_dim, window, false);
+        attention_case(head_dim, window, Step::Mixed, KvType::F16);
     }
 }
 
@@ -257,16 +257,38 @@ fn paged_attention_mixed_batch() {
 #[test]
 fn paged_attention_decode_only() {
     for (head_dim, window) in [(128, 0), (256, 4), (512, 0)] {
-        attention_case(head_dim, window, true);
+        attention_case(head_dim, window, Step::Decode, KvType::F16);
     }
 }
 
-fn attention_case(head_dim: usize, window: usize, decode_only: bool) {
+/// A q8 cache through every attention path: decode, a small mixed step (the
+/// decode kernel reading int8), and a long prefill (blocks expanded to f16).
+/// The CPU emulates q8's rounding (with the key rotation).
+#[test]
+fn paged_attention_q8_cache() {
+    for (head_dim, window) in [(64, 0), (128, 0), (256, 3), (512, 0)] {
+        for step in [Step::Decode, Step::Mixed, Step::Long] {
+            attention_case(head_dim, window, step, KvType::Q8);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Step {
+    /// One token per sequence.
+    Decode,
+    /// A 3-token prefill chunk and a decode token.
+    Mixed,
+    /// An 11-token step (beyond the decode-sized steps).
+    Long,
+}
+
+fn attention_case(head_dim: usize, window: usize, step: Step, kv: KvType) {
     let Some(gpu) = cuda() else { return };
     let cpu = CpuBackend::new();
     let mut rng = Rng(99);
     let (n_heads, n_kv_heads, block_size) = (8, 2, 4);
-    let layout = KvLayout { n_layers: 1, n_blocks: 16, block_size, n_kv_heads, head_dim };
+    let layout = KvLayout { n_layers: 1, n_blocks: 16, block_size, n_kv_heads, head_dim, dtype: kv };
     let kv_w = layout.slot_width();
     let block_tables = vec![vec![9, 2, 14, 5], vec![0, 11, 3]];
     let slot = |seq: usize, p: usize| block_tables[seq][p / block_size] * block_size as u32 + (p % block_size) as u32;
@@ -280,10 +302,14 @@ fn attention_case(head_dim: usize, window: usize, decode_only: bool) {
     cpu.kv_store(&mut kc, 0, &upload(&cpu, &k), &upload(&cpu, &v), &slots).unwrap();
     gpu.kv_store(&mut kg, 0, &upload(&gpu, &k), &upload(&gpu, &v), &slots).unwrap();
 
-    // This step: seq 0 tokens at positions 7, 8, 9 (prefill chunk), seq 1 at position 8 (decode).
-    // Decode-only: one token each, seq 0 at position 9, seq 1 at position 8.
-    let (token_seq, positions): (Vec<u32>, Vec<u32>) =
-        if decode_only { (vec![0, 1], vec![9, 8]) } else { (vec![0, 0, 0, 1], vec![7, 8, 9, 8]) };
+    // Mixed: seq 0 tokens at positions 7, 8, 9 (prefill chunk), seq 1 at position 8 (decode).
+    // Decode: one token each, seq 0 at position 9, seq 1 at position 8.
+    // Long: all of seq 0 (positions 0..=9), seq 1 at position 8.
+    let (token_seq, positions): (Vec<u32>, Vec<u32>) = match step {
+        Step::Decode => (vec![0, 1], vec![9, 8]),
+        Step::Mixed => (vec![0, 0, 0, 1], vec![7, 8, 9, 8]),
+        Step::Long => ((0..10).map(|_| 0).chain([1]).collect(), (0..10).chain([8]).collect()),
+    };
     let n_q = token_seq.len();
     let q = rng.vec(n_q * n_heads * head_dim);
     let meta = AttnMeta {
@@ -301,12 +327,13 @@ fn attention_case(head_dim: usize, window: usize, decode_only: bool) {
     let (mut oc, mut og) = (cpu.alloc(n).unwrap(), gpu.alloc(n).unwrap());
     cpu.attention(&upload(&cpu, &q), &kc, 0, &meta, &mut oc).unwrap();
     gpu.attention(&upload(&gpu, &q), &kg, 0, &meta, &mut og).unwrap();
-    // Prefill tokens go through the tensor-core kernel (f16 Q/K/P/V, f32 accumulate).
+    // Prefill tokens go through the tensor-core kernel (f16 Q/K/P/V, f32
+    // accumulate). With q8, an int8 step can round differently on each side.
     assert_close(
-        &format!("paged_attention hd={head_dim} window={window} decode_only={decode_only}"),
+        &format!("paged_attention hd={head_dim} window={window} {step:?} {kv}"),
         &download(&cpu, &oc, n),
         &download(&gpu, &og, n),
-        2e-3,
+        if kv == KvType::Q8 { 5e-3 } else { 2e-3 },
     );
 }
 
@@ -344,7 +371,7 @@ fn qkv_norm_rope_store_matches() {
     let mut rng = Rng(11);
     let (n_heads, n_kv, hd, bs) = (8, 2, 128, 4);
     for (v_norm, partial) in [(false, false), (true, true)] {
-        let layout = KvLayout { n_layers: 1, n_blocks: 4, block_size: bs, n_kv_heads: n_kv, head_dim: hd };
+        let layout = KvLayout { n_layers: 1, n_blocks: 4, block_size: bs, n_kv_heads: n_kv, head_dim: hd, dtype: KvType::F16 };
         let (mut kc, mut kg) = (cpu.alloc_kv(layout).unwrap(), gpu.alloc_kv(layout).unwrap());
         let n = 5;
         let positions: Vec<u32> = (0..n as u32).collect();

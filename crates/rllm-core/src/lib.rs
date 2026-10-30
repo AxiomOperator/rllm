@@ -75,6 +75,38 @@ impl HostTensor {
     }
 }
 
+/// How the KV cache stores keys and values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KvType {
+    /// 16-bit floats.
+    #[default]
+    F16,
+    /// 8-bit integers with one f16 scale per 32 values (GGUF's q8_0 layout):
+    /// about half the memory of f16.
+    Q8,
+}
+
+impl std::str::FromStr for KvType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "f16" => Ok(Self::F16),
+            "q8" | "q8_0" => Ok(Self::Q8),
+            _ => Err(format!("unknown KV cache type {s:?} (expected f16 or q8)")),
+        }
+    }
+}
+
+impl std::fmt::Display for KvType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::F16 => "f16",
+            Self::Q8 => "q8",
+        })
+    }
+}
+
 /// Shape of the paged KV cache.
 ///
 /// Each layer has a K and a V pool of `n_blocks * block_size` slots; a slot
@@ -86,6 +118,7 @@ pub struct KvLayout {
     pub block_size: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
+    pub dtype: KvType,
 }
 
 impl KvLayout {

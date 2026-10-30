@@ -21,7 +21,7 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
 use rllm_core::quant::dequantize_row;
-use rllm_core::{Activation, AttnMeta, Backend, DType, Error, HostTensor, KvLayout, Result};
+use rllm_core::{Activation, AttnMeta, Backend, DType, Error, HostTensor, KvLayout, KvType, Result};
 
 const KERNELS: &str = include_str!("../kernels/kernels.cu");
 /// Must match MV_MAX_M in kernels.cu.
@@ -295,6 +295,10 @@ pub struct CudaBackend {
     /// int8 output of the fused gate/up MMQ (it can't write `qscratch`, which
     /// holds its own input). Prefill only.
     glu_scratch: Mutex<(CudaSlice<i8>, CudaSlice<f32>, CudaSlice<f32>)>,
+    /// Split-K partial outputs of the MMQ matmuls, `[splits, m, n]`.
+    split_part: Mutex<CudaSlice<f32>>,
+    /// f16 copies of the q8 KV blocks a prefill step reads (K, V).
+    kv_stage: Mutex<(CudaSlice<u8>, CudaSlice<u8>)>,
     /// (buffer pointer, length, in `glu_scratch`) whose int8 form is held in
     /// scratch, written by the producing kernel. Cleared by every other launch.
     prequant: Mutex<Option<(u64, usize, bool)>>,
@@ -431,11 +435,15 @@ struct IndexBuf {
     copied: Option<cudarc::driver::CudaEvent>,
 }
 
-/// Paged KV cache, f16 (stored as raw bits).
+/// Paged KV cache: per layer, K and V as raw bytes (f16 bits, or int8 for
+/// q8 with f16 scales per 32 values in `ks`/`vs`; one-element placeholders
+/// for f16, so kernels always get valid pointers).
 pub struct CudaKvCache {
     layout: KvLayout,
-    k: Vec<CudaSlice<u16>>,
-    v: Vec<CudaSlice<u16>>,
+    k: Vec<CudaSlice<u8>>,
+    v: Vec<CudaSlice<u8>>,
+    ks: Vec<CudaSlice<u16>>,
+    vs: Vec<CudaSlice<u16>>,
 }
 
 impl CudaBackend {
@@ -454,8 +462,8 @@ impl CudaBackend {
 
         let mut names: Vec<String> = [
             "f32_to_f16", "f32_to_bf16", "rms_norm", "add_rms_norm", "rms_norm_add", "qkv_norm_rope_store", "rms_norm_rope", "rope_neox", "silu_mul", "gelu_mul", "gelu_mul_strided", "ple_gate_f32", "gelu", "mul_inplace", "scale_inplace", "softcap_inplace",
-            "add_inplace", "gather_rows", "gather_strided", "kv_store", "paged_attention", "attn_prefill", "attn_prefill_tc", "quantize_q8", "repack_q8_0",
-            "repack_q4_k", "repack_q6_k", "mmq_q8", "mmq_q4", "mmq_q6",
+            "add_inplace", "gather_rows", "gather_strided", "kv_store", "kv_store_q8", "kv_dequant_blocks", "kv_rotate_q", "attn_decode_combine", "paged_attention", "attn_prefill", "attn_prefill_tc", "quantize_q8", "repack_q8_0",
+            "repack_q4_k", "repack_q6_k", "mmq_q8", "mmq_q4", "mmq_q6", "mmq_sum_splits",
             "mmq_glu_silu_q8", "mmq_glu_silu_q4", "mmq_glu_silu_q6", "mmq_glu_gelu_q8", "mmq_glu_gelu_q4", "mmq_glu_gelu_q6",
             "matvec_glu_silu_q8", "matvec_glu_silu_q4", "matvec_glu_silu_q6", "matvec_glu_gelu_q8", "matvec_glu_gelu_q4", "matvec_glu_gelu_q6",
             "matvec_glu_silu_f32", "matvec_glu_silu_f16", "matvec_glu_silu_bf16", "matvec_glu_gelu_f32", "matvec_glu_gelu_f16", "matvec_glu_gelu_bf16",
@@ -475,6 +483,7 @@ impl CudaBackend {
         // Templated decode attention instantiations (see INSTANTIATE_AD in kernels.cu).
         for (g, hd) in ATTN_DECODE_SHAPES {
             names.push(format!("attn_decode_g{g}_d{hd}"));
+            names.push(format!("attn_decode_q8_g{g}_d{hd}"));
         }
         // FlashAttention prefill instantiations (INSTANTIATE_FA).
         for hd in FA_HEAD_DIMS {
@@ -486,7 +495,7 @@ impl CudaBackend {
             .collect::<Result<HashMap<_, _>>>()?;
         let attn_smem_fns: Vec<String> = ["attn_prefill".to_string(), "attn_prefill_tc".to_string()]
             .into_iter()
-            .chain(ATTN_DECODE_SHAPES.iter().map(|(g, hd)| format!("attn_decode_g{g}_d{hd}")))
+            .chain(ATTN_DECODE_SHAPES.iter().flat_map(|(g, hd)| [format!("attn_decode_g{g}_d{hd}"), format!("attn_decode_q8_g{g}_d{hd}")]))
             .chain(FA_HEAD_DIMS.iter().map(|hd| format!("attn_fa_d{hd}")))
             .collect();
         for f in &attn_smem_fns {
@@ -536,6 +545,8 @@ impl CudaBackend {
             stream.alloc_zeros::<f32>(1).map_err(err)?,
             stream.alloc_zeros::<f32>(1).map_err(err)?,
         );
+        let split_part = stream.alloc_zeros::<f32>(1).map_err(err)?;
+        let kv_stage = (stream.alloc_zeros::<u8>(1).map_err(err)?, stream.alloc_zeros::<u8>(1).map_err(err)?);
         Ok(Self {
             stream,
             blas,
@@ -546,6 +557,8 @@ impl CudaBackend {
             scratch: Mutex::new(scratch),
             qscratch: Mutex::new(qscratch),
             glu_scratch: Mutex::new(glu_scratch),
+            split_part: Mutex::new(split_part),
+            kv_stage: Mutex::new(kv_stage),
             prequant: Mutex::new(None),
             decode_step: std::sync::atomic::AtomicBool::new(false),
             has_quant_weights: std::sync::atomic::AtomicBool::new(false),
@@ -998,19 +1011,26 @@ impl CudaBackend {
                 // Must match MMQ_BM / MMQ_BN / MMQ_CU / MMQ_THREADS in kernels.cu.
                 // Split k to minimize wave quantization: with `slots` resident
                 // blocks, s splits take ceil(tiles*s/slots) waves of 1/s-sized
-                // blocks. Extra splits cost atomics and an output memset.
+                // blocks. Extra splits cost an output memset and atomics (2) or
+                // writing and summing partial outputs (more; see mmq in kernels.cu).
                 let tiles = w.rows.div_ceil(MMQ_BM) * m.div_ceil(MMQ_BN);
                 let slots = self.n_sms * self.mmq_blocks_per_sm[&w.fmt];
                 let max_splits = (k / 32).div_ceil(4).min(8);
                 // Per extra split: 5% at k = 2560 (measured best on Nemotron prefill;
                 // 0.02 and 0.1 were both slower end to end), scaled by 2560 / k since
-                // the memset and atomics are fixed per output while the work grows with k.
+                // the partial-sum traffic is fixed per output while the work grows with k.
                 let penalty = 0.05 * 2560.0 / k as f64;
                 let cost = |s: usize| (tiles * s).div_ceil(slots) as f64 / s as f64 * (1.0 + penalty * (s - 1) as f64);
                 let splits = (1..=max_splits).min_by(|&a, &b| cost(a).total_cmp(&cost(b))).unwrap_or(1);
-                if splits > 1 && !self.replaying() {
-                    unsafe { cudarc::driver::result::memset_d8_async(out.ptr, 0, m * w.rows * 4, self.stream.cu_stream()) }
+                let mut part = self.split_part.lock().unwrap();
+                let len = m * w.rows;
+                if splits == 2 && !self.replaying() {
+                    unsafe { cudarc::driver::result::memset_d8_async(out.ptr, 0, len * 4, self.stream.cu_stream()) }
                         .map_err(err)?;
+                }
+                if splits > 2 && part.len() < splits * len {
+                    *part = unsafe { self.stream.alloc::<f32>(splits * len) }.map_err(err)?;
+                    self.invalidate_graphs();
                 }
                 let cfg = LaunchConfig {
                     grid_dim: ((m as u32).div_ceil(MMQ_BN as u32), (w.rows as u32).div_ceil(MMQ_BM as u32), splits as u32),
@@ -1019,7 +1039,12 @@ impl CudaBackend {
                 };
                 let ni = w.rows as i32;
                 let (sq, sh, ss) = w.strides();
-                launch!(self, name, cfg, [&w.qs, w.qh(), w.sc(), xq, xd, xs, &mut **out, &ni, &ki, &mi, &sq, &sh, &ss], prof = prof)?;
+                launch!(self, name, cfg, [&w.qs, w.qh(), w.sc(), xq, xd, xs, &mut **out, &mut *part, &ni, &ki, &mi, &sq, &sh, &ss], prof = prof)?;
+                if splits > 2 {
+                    // Fixed summation order: the same output every run.
+                    let (si, li) = (splits as i32, len as i64);
+                    launch!(self, "mmq_sum_splits", grid_1d(len.div_ceil(4), 256), [&*part, &mut **out, &si, &li])?;
+                }
             }
         }
         let mut x_conv = None;
@@ -1279,8 +1304,13 @@ impl Backend for CudaBackend {
             return Err(Error::Unsupported(format!("head_dim {} (need a multiple of 32, <= {ATTN_MAX_D})", layout.head_dim)));
         }
         let n = layout.n_blocks * layout.block_size * layout.slot_width();
-        let mk = || (0..layout.n_layers).map(|_| self.stream.alloc_zeros::<u16>(n).map_err(err)).collect::<Result<Vec<_>>>();
-        Ok(CudaKvCache { layout, k: mk()?, v: mk()? })
+        let (bytes, scales) = match layout.dtype {
+            KvType::F16 => (2 * n, 1),
+            KvType::Q8 => (n, n / 32),
+        };
+        let mk = || (0..layout.n_layers).map(|_| self.stream.alloc_zeros::<u8>(bytes).map_err(err)).collect::<Result<Vec<_>>>();
+        let mk_s = || (0..layout.n_layers).map(|_| self.stream.alloc_zeros::<u16>(scales).map_err(err)).collect::<Result<Vec<_>>>();
+        Ok(CudaKvCache { layout, k: mk()?, v: mk()?, ks: mk_s()?, vs: mk_s()? })
     }
 
     fn to_host(&self, buf: &CudaBuf, out: &mut [f32]) -> Result<()> {
@@ -1732,8 +1762,9 @@ impl Backend for CudaBackend {
         let fptr: u64 = factors.map_or(0, |f| f.device_ptr(&self.stream).0);
         let (hv, hf) = (vw.is_some() as i32, factors.is_some() as i32);
         let (nt, nh, nkv, hd) = (n as i32, n_heads as i32, n_kv_heads as i32, head_dim as i32);
-        let (kc, vc) = (&mut kv.k[layer], &mut kv.v[layer]);
-        launch!(self, "qkv_norm_rope_store", cfg, [q, k, v, qw, kw, &vwp, &hv, qn, kc, vc, pos, sl, &nt, &nh, &nkv, &hd, &eps, &theta, &fptr, &hf])
+        let q8 = (kv.layout.dtype == KvType::Q8) as i32;
+        let (kc, vc, ks, vs) = (&mut kv.k[layer], &mut kv.v[layer], &mut kv.ks[layer], &mut kv.vs[layer]);
+        launch!(self, "qkv_norm_rope_store", cfg, [q, k, v, qw, kw, &vwp, &hv, qn, kc, vc, pos, sl, &nt, &nh, &nkv, &hd, &eps, &theta, &fptr, &hf, ks, vs, &q8])
     }
 
     fn silu_mul(&self, gate: &mut CudaBuf, up: &CudaBuf, len: usize) -> Result<()> {
@@ -1971,7 +2002,19 @@ impl Backend for CudaBackend {
         let s = &cache["slots"].dev;
         let (nt, wi) = (slots.len() as i32, w as i32);
         let (kc, vc) = (&mut kv.k[layer], &mut kv.v[layer]);
-        launch!(self, "kv_store", grid_1d(slots.len() * w, 256), [k, v, s, kc, vc, &nt, &wi])
+        match kv.layout.dtype {
+            KvType::F16 => launch!(self, "kv_store", grid_1d(slots.len() * w, 256), [k, v, s, kc, vc, &nt, &wi]),
+            KvType::Q8 => {
+                let (ks, vs) = (&mut kv.ks[layer], &mut kv.vs[layer]);
+                let (nkv, hd) = (kv.layout.n_kv_heads as i32, kv.layout.head_dim as i32);
+                let cfg = LaunchConfig {
+                    grid_dim: ((slots.len() * kv.layout.n_kv_heads) as u32, 1, 1),
+                    block_dim: ((kv.layout.head_dim / 2).next_multiple_of(WARP as usize) as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                launch!(self, "kv_store_q8", cfg, [k, v, s, kc, ks, vc, vs, &nkv, &hd])
+            }
+        }
     }
 
     fn attention(&self, q: &CudaBuf, kv: &CudaKvCache, layer: usize, meta: &AttnMeta, out: &mut CudaBuf) -> Result<()> {
@@ -2021,6 +2064,80 @@ impl Backend for CudaBackend {
         };
         let is_prefill = (1..n_tok).any(|i| meta.token_seq[i] == meta.token_seq[i - 1]);
 
+        // A q8 cache: the prefill kernels read f16. Small steps (decode,
+        // speculative verification; CUDA-graph sized) read the int8 cache
+        // with the decode kernels, which handle any mix of tokens. Larger
+        // prefill steps expand the blocks they attend to into f16 staging
+        // buffers and run the f16 kernels on a remapped block table.
+        let q8 = kv.layout.dtype == KvType::Q8;
+        let staged = q8 && is_prefill && n_tok > MATVEC_MAX_M;
+        const AD_WARPS: usize = 8;
+        let ad_smem = (group * hdim + AD_WARPS * group * 2 + AD_WARPS * group * hdim) * 4;
+        let decode_kernel = (!is_prefill || n_tok <= MATVEC_MAX_M) && ATTN_DECODE_SHAPES.contains(&(group, hdim)) && ad_smem <= self.max_smem;
+        // Keys in a q8 cache are rotated (see kv_rotate_q in kernels.cu):
+        // queries get the same rotation (the decode kernel does its own).
+        let q_rot = if q8 && !decode_kernel {
+            drop(cache);
+            let mut r = self.alloc(n_tok * w)?;
+            let hd = meta.head_dim as i32;
+            let cfg = LaunchConfig {
+                grid_dim: ((n_tok * meta.n_heads) as u32, 1, 1),
+                block_dim: ((meta.head_dim / 2).next_multiple_of(WARP as usize) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            launch!(self, "kv_rotate_q", cfg, [q, &mut r, &hd])?;
+            cache = self.index_cache.lock().unwrap();
+            Some(r)
+        } else {
+            None
+        };
+        let q = q_rot.as_ref().unwrap_or(q);
+        let mut stage = if staged { Some(self.kv_stage.lock().unwrap()) } else { None };
+        if let Some(stage) = &mut stage {
+            let bs = meta.block_size;
+            // Positions each sequence attends to in this step.
+            let mut range = vec![(u32::MAX, 0u32); meta.block_tables.len()];
+            for (&sq, &pos) in meta.token_seq.iter().zip(meta.positions) {
+                let lo = if meta.window > 0 { (pos + 1).saturating_sub(meta.window as u32) } else { 0 };
+                let r = &mut range[sq as usize];
+                *r = (r.0.min(lo), r.1.max(pos));
+            }
+            let mut list: Vec<u32> = Vec::new();
+            let mut index: HashMap<u32, u32> = HashMap::new();
+            let mut staged_tables = vec![0u32; tables.len()];
+            for (sq, &(lo, hi)) in range.iter().enumerate() {
+                if lo > hi {
+                    continue;
+                }
+                for b in lo as usize / bs..=hi as usize / bs {
+                    let blk = tables[sq * max_blocks + b];
+                    staged_tables[sq * max_blocks + b] = *index.entry(blk).or_insert_with(|| {
+                        list.push(blk);
+                        list.len() as u32 - 1
+                    });
+                }
+            }
+            self.sync_index(&mut cache, "stage_blocks", &list)?;
+            self.sync_index(&mut cache, "stage_tables", &staged_tables)?;
+            let per_block = bs * kv.layout.slot_width();
+            let need = list.len() * per_block * 2;
+            if stage.0.len() < need {
+                stage.0 = unsafe { self.stream.alloc::<u8>(need) }.map_err(err)?;
+                stage.1 = unsafe { self.stream.alloc::<u8>(need) }.map_err(err)?;
+            }
+            let (nl, pb) = (list.len() as i32, per_block as i64);
+            let (ko, vo) = { let st = &mut **stage; (&mut st.0, &mut st.1) };
+            let blocks = &cache["stage_blocks"].dev;
+            let (kc, vc, ks, vs) = (&kv.k[layer], &kv.v[layer], &kv.ks[layer], &kv.vs[layer]);
+            launch!(self, "kv_dequant_blocks", grid_1d(list.len() * per_block / 8, 256), [kc, ks, vc, vs, ko, vo, blocks, &nl, &pb])?;
+        }
+        // The cache the prefill kernels read, and its block tables.
+        let (pkc, pvc, tab_key) = match &stage {
+            Some(st) => (&st.0, &st.1, "stage_tables"),
+            None => (&kv.k[layer], &kv.v[layer], "block_tables"),
+        };
+        let is_prefill = is_prefill && !decode_kernel && (!q8 || staged);
+
         // FlashAttention-2 style kernel (cp.async ring, ldmatrix), 4 warps.
         if is_prefill && self.tensor_cores && FA_HEAD_DIMS.contains(&hdim) && !FLAGS.no_fa {
             let (dw, rg, _bk, smem) = fa_cfg(hdim);
@@ -2035,10 +2152,10 @@ impl Backend for CudaBackend {
                     shared_mem_bytes: smem as u32,
                 };
                 let tt = tile_tokens as i32;
-                let (kc, vc) = (&kv.k[layer], &kv.v[layer]);
+                let (kc, vc) = (pkc, pvc);
                 let name = format!("attn_fa_d{hdim}");
                 let (pos, seq, tab, til) =
-                    (&cache["positions"].dev, &cache["token_seq"].dev, &cache["block_tables"].dev, &cache["attn_tiles"].dev);
+                    (&cache["positions"].dev, &cache["token_seq"].dev, &cache[tab_key].dev, &cache["attn_tiles"].dev);
                 // int8 copy of the output for the output projection (when a
                 // quantized consumer will use it; see fuse_quant_useful). The
                 // epilogue work only pays off on big GPUs: measured +2% Nemotron
@@ -2069,14 +2186,14 @@ impl Backend for CudaBackend {
                 let tiles = build_tiles(tile_tokens);
                 self.sync_index(&mut cache, "attn_tiles", &tiles)?;
                 let (pos, seq, tab, til) =
-                    (&cache["positions"].dev, &cache["token_seq"].dev, &cache["block_tables"].dev, &cache["attn_tiles"].dev);
+                    (&cache["positions"].dev, &cache["token_seq"].dev, &cache[tab_key].dev, &cache["attn_tiles"].dev);
                 let cfg = LaunchConfig {
                     grid_dim: ((tiles.len() / 2) as u32, meta.n_kv_heads as u32, 1),
                     block_dim: ((row_groups * dw) as u32 * WARP, 1, 1),
                     shared_mem_bytes: smem as u32,
                 };
                 let (tt, dwi) = (tile_tokens as i32, dw as i32);
-                let (kc, vc) = (&kv.k[layer], &kv.v[layer]);
+                let (kc, vc) = (pkc, pvc);
                 return launch!(self, "attn_prefill_tc", cfg, [q, kc, vc, out, til, seq, pos, tab, &mb, &nh, &nkv, &hd, &bs, &meta.scale, &window, &tt, &dwi]);
             }
         }
@@ -2095,14 +2212,14 @@ impl Backend for CudaBackend {
                 let tiles = build_tiles(tile_tokens);
                 self.sync_index(&mut cache, "attn_tiles", &tiles)?;
                 let (pos, seq, tab, til) =
-                    (&cache["positions"].dev, &cache["token_seq"].dev, &cache["block_tables"].dev, &cache["attn_tiles"].dev);
+                    (&cache["positions"].dev, &cache["token_seq"].dev, &cache[tab_key].dev, &cache["attn_tiles"].dev);
                 let cfg = LaunchConfig {
                     grid_dim: ((tiles.len() / 2) as u32, meta.n_kv_heads as u32, 1),
                     block_dim: (rows as u32 * WARP, 1, 1),
                     shared_mem_bytes: smem_for(bk) as u32,
                 };
                 let (tt, bki) = (tile_tokens as i32, bk as i32);
-                let (kc, vc) = (&kv.k[layer], &kv.v[layer]);
+                let (kc, vc) = (pkc, pvc);
                 return launch!(self, "attn_prefill", cfg, [q, kc, vc, out, til, seq, pos, tab, &mb, &nh, &nkv, &hd, &bs, &meta.scale, &window, &tt, &bki]);
             }
         }
@@ -2110,22 +2227,43 @@ impl Backend for CudaBackend {
         let (pos, seq, tab) = (&cache["positions"].dev, &cache["token_seq"].dev, &cache["block_tables"].dev);
 
         // Decode kernel: one block per (token, KV head) serving the whole GQA group.
-        const AD_WARPS: usize = 8;
-        let ad_smem = (group * hdim + AD_WARPS * group * 2 + AD_WARPS * group * hdim) * 4;
-        if ATTN_DECODE_SHAPES.contains(&(group, hdim)) && ad_smem <= self.max_smem {
+        if decode_kernel {
+            // Split long contexts over several blocks per (token, KV head)
+            // until the grid covers the GPU about twice (at least 256
+            // positions per split). Sized from the padded block-table width,
+            // not the exact context, so a CUDA graph's shape stays valid
+            // while the context grows.
+            let pairs = n_tok * meta.n_kv_heads;
+            let capacity = max_blocks * meta.block_size;
+            let splits = (2 * self.n_sms).div_ceil(pairs).min(capacity / 256).clamp(1, 32);
             let cfg = LaunchConfig {
-                grid_dim: (n_tok as u32, meta.n_kv_heads as u32, 1),
+                grid_dim: (n_tok as u32, meta.n_kv_heads as u32, splits as u32),
                 block_dim: (AD_WARPS as u32 * WARP, 1, 1),
                 shared_mem_bytes: ad_smem as u32,
             };
-            let (kc, vc) = (&kv.k[layer], &kv.v[layer]);
-            let name = format!("attn_decode_g{group}_d{hdim}");
+            let (kc, vc, ks, vs) = (&kv.k[layer], &kv.v[layer], &kv.ks[layer], &kv.vs[layer]);
             let len = n_tok * w;
             drop(cache);
             let qo = self.qout(len)?;
+            // Split states (unused with one split: the kernel writes `out`).
+            let mut part = if splits > 1 { Some(self.alloc(pairs * splits * group * (hdim + 2))?) } else { None };
+            let part_ptr: u64 = part.as_ref().map_or(out.ptr, |p| p.ptr);
             let cache = self.index_cache.lock().unwrap();
             let (pos, seq, tab) = (&cache["positions"].dev, &cache["token_seq"].dev, &cache["block_tables"].dev);
-            launch!(self, name, cfg, [q, kc, vc, out, seq, pos, tab, &mb, &nh, &nkv, &bs, &meta.scale, &window, &qo])?;
+            // The fused int8 output comes from whichever kernel writes `out`.
+            let qo_attn = if splits > 1 { QOut::default() } else { qo };
+            if q8 {
+                let name = format!("attn_decode_q8_g{group}_d{hdim}");
+                launch!(self, name, cfg, [q, kc, vc, out, seq, pos, tab, &mb, &nh, &nkv, &bs, &meta.scale, &window, &qo_attn, ks, vs, &part_ptr])?;
+            } else {
+                let name = format!("attn_decode_g{group}_d{hdim}");
+                launch!(self, name, cfg, [q, kc, vc, out, seq, pos, tab, &mb, &nh, &nkv, &bs, &meta.scale, &window, &qo_attn, &part_ptr])?;
+            }
+            if let Some(part) = &mut part {
+                let (si, gi) = (splits as i32, group as i32);
+                let cfg = LaunchConfig { grid_dim: (n_tok as u32, meta.n_kv_heads as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                launch!(self, "attn_decode_combine", cfg, [part, out, &si, &gi, &hd, &nh, &nkv, &qo])?;
+            }
             self.set_prequant(&qo, out.ptr, len);
             return Ok(());
         }
@@ -2135,8 +2273,9 @@ impl Backend for CudaBackend {
             block_dim: (ATTN_WARPS * WARP, 1, 1),
             shared_mem_bytes: 0,
         };
-        let (kc, vc) = (&kv.k[layer], &kv.v[layer]);
-        launch!(self, "paged_attention", cfg, [q, kc, vc, out, seq, pos, tab, &mb, &nh, &nkv, &hd, &bs, &meta.scale, &window])
+        let (kc, vc, ks, vs) = (&kv.k[layer], &kv.v[layer], &kv.ks[layer], &kv.vs[layer]);
+        let q8i = q8 as i32;
+        launch!(self, "paged_attention", cfg, [q, kc, vc, out, seq, pos, tab, &mb, &nh, &nkv, &hd, &bs, &meta.scale, &window, ks, vs, &q8i])
     }
 
     fn synchronize(&self) -> Result<()> {

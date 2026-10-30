@@ -677,17 +677,80 @@ extern "C" __global__ void rms_norm_rope(const float* __restrict__ x, const floa
 }
 
 // Fused Q/K/V prep for one layer. Blocks [0, n_tok*n_heads) handle query
+// q8 KV cache: int8 values with one f16 scale per 32 consecutive values of a
+// slot (the q8_0 layout; head_dim is a multiple of 32, so a group never spans
+// two heads). Value i of the cache is c[i] * sc[i / 32].
+//
+// Keys are stored rotated: each head's vector times an orthonormal
+// Walsh-Hadamard matrix H (over chunks of kv_rot_size(head_dim) dims), and
+// queries get the same rotation before attention, so q.k is unchanged. The
+// rotation spreads a few large channels over the whole group, which int8
+// with a per-group scale otherwise represents badly (Qwen3-0.6B perplexity:
+// +1.4% unrotated; llama.cpp rotates the same way). Values aren't rotated:
+// quantizing them costs little (+0.02%).
+#define KV_MAX_D 512
+
+// Largest power of two dividing head_dim: the Hadamard size.
+__device__ __forceinline__ int kv_rot_size(int head_dim) { return head_dim & -head_dim; }
+
+// In-place orthonormal fast Walsh-Hadamard transform of row[0..n) in shared
+// memory, independently over chunks of `size`. All threads of the block call it.
+__device__ void fwht_smem(float* row, int n, int size) {
+    for (int h = 1; h < size; h *= 2) {
+        __syncthreads();
+        for (int p = threadIdx.x; p < n / 2; p += blockDim.x) {
+            const int lo = (p / h) * 2 * h + p % h, hi = lo + h;
+            const float a = row[lo], b = row[hi];
+            row[lo] = a + b;
+            row[hi] = a - b;
+        }
+    }
+    __syncthreads();
+    const float sc = rsqrtf((float)size);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) row[i] *= sc;
+    __syncthreads();
+}
+
+// Queries for a q8 cache: y = H x per head (see above). One block per head row.
+extern "C" __global__ void kv_rotate_q(const float* __restrict__ x, float* __restrict__ y, int head_dim) {
+    __shared__ float row[KV_MAX_D];
+    const long base = (long)blockIdx.x * head_dim;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) row[i] = x[base + i];
+    fwht_smem(row, head_dim, kv_rot_size(head_dim));
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) y[base + i] = row[i];
+}
+
+// Quantize one group of 32 held by a warp (lane = element) to cache index dst.
+__device__ __forceinline__ void kv_q8_store(float x, i8* __restrict__ c, f16_bits* __restrict__ sc, long dst) {
+    const float d = warp_max(fabsf(x)) / 127.f;
+    c[dst] = (i8)(d > 0.f ? __float2int_rn(x / d) : 0);
+    if ((threadIdx.x & (WARP_SIZE - 1)) == 0) sc[dst / 32] = f32_to_f16_bits(d);
+}
+
+// Quantize row[0..n) from shared memory into the cache at dst, one group per warp.
+__device__ void kv_q8_store_row(const float* row, int n, i8* c, f16_bits* sc, long dst) {
+    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    for (int g = warp; g < n / 32; g += blockDim.x / WARP_SIZE) kv_q8_store(row[g * 32 + lane], c, sc, dst + g * 32 + lane);
+}
+
+__device__ __forceinline__ float kv_at(const void* c, const f16_bits* sc, long i, bool q8) {
+    return q8 ? (float)((const i8*)c)[i] * f16_to_f32(sc[i / 32]) : f16_to_f32(((const f16_bits*)c)[i]);
+}
+
 // heads: qn = rope(rmsnorm(q) * qw). Blocks after that handle KV heads: K gets
 // the same treatment with kw, V is optionally RMS-normalized with vw, and both
-// go to the f16 cache at the token's slot. Thread i handles pair (i, i+hd/2).
+// go to the cache at the token's slot (f16, or q8 when `q8`: kc/vc are then
+// int8 with scales ksc/vsc). Thread i handles pair (i, i+hd/2).
 extern "C" __global__ void qkv_norm_rope_store(const float* __restrict__ q, const float* __restrict__ k,
                                                const float* __restrict__ v, const float* __restrict__ qw,
                                                const float* __restrict__ kw, const float* __restrict__ vw,
-                                               int has_vnorm, float* __restrict__ qn, f16_bits* __restrict__ kc,
-                                               f16_bits* __restrict__ vc, const u32* __restrict__ positions,
+                                               int has_vnorm, float* __restrict__ qn, void* __restrict__ kc,
+                                               void* __restrict__ vc, const u32* __restrict__ positions,
                                                const u32* __restrict__ slots, int n_tok, int n_heads,
                                                int n_kv_heads, int head_dim, float eps, float theta,
-                                               const float* __restrict__ freq_factors, int has_factors) {
+                                               const float* __restrict__ freq_factors, int has_factors,
+                                               f16_bits* __restrict__ ksc, f16_bits* __restrict__ vsc, int q8) {
+    __shared__ float row_buf[KV_MAX_D];
     __shared__ float scratch[1024 / WARP_SIZE];
     const int half = head_dim / 2, i = threadIdx.x;
     const bool is_q = blockIdx.x < n_tok * n_heads;
@@ -720,9 +783,17 @@ extern "C" __global__ void qkv_norm_rope_store(const float* __restrict__ q, cons
     }
     const int kvh = row % n_kv_heads;
     const long dst = (long)slots[t] * n_kv_heads * head_dim + (long)kvh * head_dim;
-    if (i < half) {
-        kc[dst + i] = f32_to_f16_bits(ra);
-        kc[dst + i + half] = f32_to_f16_bits(rb);
+    if (q8) {
+        if (i < half) {
+            row_buf[i] = ra;
+            row_buf[i + half] = rb;
+        }
+        fwht_smem(row_buf, head_dim, kv_rot_size(head_dim));
+        kv_q8_store_row(row_buf, head_dim, (i8*)kc, ksc, dst);
+        __syncthreads();
+    } else if (i < half) {
+        ((f16_bits*)kc)[dst + i] = f32_to_f16_bits(ra);
+        ((f16_bits*)kc)[dst + i + half] = f32_to_f16_bits(rb);
     }
     const float* vr = v + (long)row * head_dim;
     float va = i < half ? vr[i] : 0.f, vb = i < half ? vr[i + half] : 0.f;
@@ -733,9 +804,16 @@ extern "C" __global__ void qkv_norm_rope_store(const float* __restrict__ q, cons
             vb *= vs * vw[i + half];
         }
     }
-    if (i < half) {
-        vc[dst + i] = f32_to_f16_bits(va);
-        vc[dst + i + half] = f32_to_f16_bits(vb);
+    if (q8) {
+        if (i < half) {
+            row_buf[i] = va;
+            row_buf[i + half] = vb;
+        }
+        __syncthreads();
+        kv_q8_store_row(row_buf, head_dim, (i8*)vc, vsc, dst);
+    } else if (i < half) {
+        ((f16_bits*)vc)[dst + i] = f32_to_f16_bits(va);
+        ((f16_bits*)vc)[dst + i + half] = f32_to_f16_bits(vb);
     }
 }
 
@@ -1081,7 +1159,8 @@ extern "C" __global__ void gather_strided(const float* __restrict__ x, float* __
 }
 
 // ---------------------------------------------------------------------------
-// Paged KV cache. K and V are stored as f16: [slot][kv_heads * head_dim].
+// Paged KV cache. K and V are stored as f16 (or q8, see kv_q8_store):
+// [slot][kv_heads * head_dim].
 
 extern "C" __global__ void kv_store(const float* __restrict__ k, const float* __restrict__ v,
                                     const u32* __restrict__ slots, f16_bits* kc, f16_bits* vc, int n_tok,
@@ -1094,6 +1173,46 @@ extern "C" __global__ void kv_store(const float* __restrict__ k, const float* __
     vc[dst] = f32_to_f16_bits(v[i]);
 }
 
+// q8 version (keys rotated, see kv_rotate_q). One block per (token, KV head).
+extern "C" __global__ void kv_store_q8(const float* __restrict__ k, const float* __restrict__ v,
+                                       const u32* __restrict__ slots, i8* kc, f16_bits* ksc, i8* vc, f16_bits* vsc,
+                                       int n_kv_heads, int head_dim) {
+    __shared__ float row[KV_MAX_D];
+    const int t = blockIdx.x / n_kv_heads, h = blockIdx.x % n_kv_heads;
+    const long src = (long)blockIdx.x * head_dim;
+    const long dst = ((long)slots[t] * n_kv_heads + h) * head_dim;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) row[i] = k[src + i];
+    fwht_smem(row, head_dim, kv_rot_size(head_dim));
+    kv_q8_store_row(row, head_dim, kc, ksc, dst);
+    __syncthreads();
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) row[i] = v[src + i];
+    __syncthreads();
+    kv_q8_store_row(row, head_dim, vc, vsc, dst);
+}
+
+// Prefill on a q8 cache: expand the blocks a step reads into f16 staging
+// buffers (block j of `blocks` becomes staging block j), so the f16 prefill
+// kernels run unchanged on a remapped block table. 8 values per thread.
+extern "C" __global__ void kv_dequant_blocks(const i8* __restrict__ kc, const f16_bits* __restrict__ ksc,
+                                             const i8* __restrict__ vc, const f16_bits* __restrict__ vsc,
+                                             f16_bits* __restrict__ ko, f16_bits* __restrict__ vo,
+                                             const u32* __restrict__ blocks, int n_list, long per_block) {
+    long i = ((long)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (i >= n_list * per_block) return;
+    long src = (long)blocks[i / per_block] * per_block + i % per_block;
+    const float dk = f16_to_f32(ksc[src / 32]), dv = f16_to_f32(vsc[src / 32]);
+    uint2 kq = *(const uint2*)(kc + src), vq = *(const uint2*)(vc + src);
+    const i8 *kb = (const i8*)&kq, *vb = (const i8*)&vq;
+    f16_bits kh[8], vh[8];
+#pragma unroll
+    for (int e = 0; e < 8; e++) {
+        kh[e] = f32_to_f16_bits(kb[e] * dk);
+        vh[e] = f32_to_f16_bits(vb[e] * dv);
+    }
+    *(uint4*)(ko + i) = *(const uint4*)kh;
+    *(uint4*)(vo + i) = *(const uint4*)vh;
+}
+
 // Paged causal attention, one block per (token, head), ATTN_WARPS warps.
 // Each warp walks a strided subset of context positions with an online
 // softmax; the warps' partial results are merged at the end.
@@ -1102,12 +1221,13 @@ extern "C" __global__ void kv_store(const float* __restrict__ k, const float* __
 #define ATTN_WARPS 4
 #define ATTN_MAX_D 512
 
-extern "C" __global__ void paged_attention(const float* __restrict__ q, const f16_bits* __restrict__ kc,
-                                           const f16_bits* __restrict__ vc, float* __restrict__ out,
+extern "C" __global__ void paged_attention(const float* __restrict__ q, const void* __restrict__ kc,
+                                           const void* __restrict__ vc, float* __restrict__ out,
                                            const u32* __restrict__ token_seq, const u32* __restrict__ positions,
                                            const u32* __restrict__ block_tables, int max_blocks, int n_heads,
                                            int n_kv_heads, int head_dim, int block_size, float scale,
-                                           int window) {
+                                           int window, const f16_bits* __restrict__ ksc,
+                                           const f16_bits* __restrict__ vsc, int q8) {
     const int PER = ATTN_MAX_D / WARP_SIZE;
     __shared__ float s_m[ATTN_WARPS], s_l[ATTN_WARPS];
     __shared__ float s_acc[ATTN_WARPS][ATTN_MAX_D];
@@ -1130,16 +1250,14 @@ extern "C" __global__ void paged_attention(const float* __restrict__ q, const f1
     float m = NEG_INF, l = 0.f;
     for (int p = start + warp; p < ctx; p += ATTN_WARPS) {
         long base = ((long)table[p / block_size] * block_size + p % block_size) * kv_w + kv_off;
-        const f16_bits* kp = kc + base;
         float s = 0.f;
-        for (int i = 0; i < per; i++) s += qr[i] * f16_to_f32(kp[lane + i * WARP_SIZE]);
+        for (int i = 0; i < per; i++) s += qr[i] * kv_at(kc, ksc, base + lane + i * WARP_SIZE, q8);
         s = warp_sum(s);
         float m_new = fmaxf(m, s);
         float corr = __expf(m - m_new);
         float e = __expf(s - m_new);
         l = l * corr + e;
-        const f16_bits* vp = vc + base;
-        for (int i = 0; i < per; i++) acc[i] = acc[i] * corr + e * f16_to_f32(vp[lane + i * WARP_SIZE]);
+        for (int i = 0; i < per; i++) acc[i] = acc[i] * corr + e * kv_at(vc, vsc, base + lane + i * WARP_SIZE, q8);
         m = m_new;
     }
     if (lane == 0) {
@@ -1534,7 +1652,12 @@ __device__ __forceinline__ void ldmatrix_x4_trans(u32* r, const void* row_addr) 
 //   Q4: dx * (d * sum(q qx) - m * sum(qx))       (value = d q - m)
 //   Q6: dx * (d_lo * sum_lo + d_hi * sum_hi)     (one scale per 16)
 // Split-K: gridDim.z blocks share one output tile, each covering a slice of
-// the units, and accumulate with atomicAdd into a zeroed output.
+// the units. Two splits atomicAdd into a zeroed output: x + y == y + x, so
+// the result doesn't depend on which lands first. With more, the order of
+// atomic adds (and so the rounding) would vary between runs; instead each
+// split writes its partial tile to `part + z * m * n` and mmq_sum_splits adds
+// them in split order. (Summing in the last block to finish each tile, as a
+// stream-k fixup, measured 13% slower: it costs registers and occupancy.)
 //
 // GLU (gate/up of a gated FFN, ACT 0 = SiLU, 1 = GELU-tanh): a block's 128
 // rows are 64 gate rows (qs/qh/sc) and the same 64 up rows (qs2/qh2/sc2), so
@@ -1558,8 +1681,8 @@ __device__ __forceinline__ float i2f_small(int i) {
 template <int F, bool GLU, int ACT>
 __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const u8* __restrict__ sc,
                     const i8* __restrict__ xq, const float* __restrict__ xd, const float* __restrict__ xs,
-                    float* __restrict__ out, int n, int k, int m, long qs_row, long qh_row, long sc_row,
-                    const u8* __restrict__ qs2, const u8* __restrict__ qh2, const u8* __restrict__ sc2, QOut qo,
+                    float* __restrict__ out, float* __restrict__ part, int n, int k, int m, long qs_row,
+                    long qh_row, long sc_row, const u8* __restrict__ qs2, const u8* __restrict__ qh2, const u8* __restrict__ sc2, QOut qo,
                     int write_out) {
     // One buffer, so the GLU epilogue can reuse all of it. Am and Bsum are
     // Q4-only; leaving them out keeps Q8/Q6 at 32 KB (3 blocks per SM).
@@ -1833,7 +1956,9 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
             for (int e = 0; e < 4; e++) {
                 int rr = row + (e >= 2 ? 8 : 0), tt = tok + (e & 1);
                 if (rr < n && tt < m) {
-                    if (splits > 1)
+                    if (splits > 2)
+                        part[(long)blockIdx.z * m * n + (long)tt * n + rr] = acc[mt][nt][e];
+                    else if (splits == 2)
                         atomicAdd(out + (long)tt * n + rr, acc[mt][nt][e]);
                     else
                         out[(long)tt * n + rr] = acc[mt][nt][e];
@@ -1845,53 +1970,86 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
 
 #define INSTANTIATE_MMQ(NAME, F)                                                                              \
     extern "C" __global__ void mmq_##NAME(const u8* qs, const u8* qh, const u8* sc, const i8* xq,              \
-                                          const float* xd, const float* xs, float* out, int n, int k, int m,   \
-                                          long qs_row, long qh_row, long sc_row) {                             \
-        mmq<F, false, 0>(qs, qh, sc, xq, xd, xs, out, n, k, m, qs_row, qh_row, sc_row, nullptr, nullptr, nullptr, \
-                         QOut{}, 0);                                                                           \
+                                          const float* xd, const float* xs, float* out, float* part, int n,    \
+                                          int k, int m, long qs_row, long qh_row, long sc_row) {               \
+        mmq<F, false, 0>(qs, qh, sc, xq, xd, xs, out, part, n, k, m, qs_row, qh_row, sc_row, nullptr, nullptr, \
+                         nullptr, QOut{}, 0);                                                                  \
     }                                                                                                          \
     extern "C" __global__ void mmq_glu_silu_##NAME(                                                            \
         const u8* qs, const u8* qh, const u8* sc, const i8* xq, const float* xd, const float* xs, float* out,  \
         int n, int k, int m, long qs_row, long qh_row, long sc_row, const u8* qs2, const u8* qh2,             \
         const u8* sc2, QOut qo, int write_out) {                                                               \
-        mmq<F, true, 0>(qs, qh, sc, xq, xd, xs, out, n, k, m, qs_row, qh_row, sc_row, qs2, qh2, sc2, qo,       \
+        mmq<F, true, 0>(qs, qh, sc, xq, xd, xs, out, nullptr, n, k, m, qs_row, qh_row, sc_row, qs2, qh2, sc2, qo,       \
                         write_out);                                                                            \
     }                                                                                                          \
     extern "C" __global__ void mmq_glu_gelu_##NAME(                                                            \
         const u8* qs, const u8* qh, const u8* sc, const i8* xq, const float* xd, const float* xs, float* out,  \
         int n, int k, int m, long qs_row, long qh_row, long sc_row, const u8* qs2, const u8* qh2,             \
         const u8* sc2, QOut qo, int write_out) {                                                               \
-        mmq<F, true, 1>(qs, qh, sc, xq, xd, xs, out, n, k, m, qs_row, qh_row, sc_row, qs2, qh2, sc2, qo,       \
+        mmq<F, true, 1>(qs, qh, sc, xq, xd, xs, out, nullptr, n, k, m, qs_row, qh_row, sc_row, qs2, qh2, sc2, qo,       \
                         write_out);                                                                            \
     }
 INSTANTIATE_MMQ(q8, FMT_Q8)
 INSTANTIATE_MMQ(q4, FMT_Q4)
 INSTANTIATE_MMQ(q6, FMT_Q6)
 
+// out[i] = part[0][i] + part[1][i] + ... in split order (see mmq's split-K).
+extern "C" __global__ void mmq_sum_splits(const float* __restrict__ part, float* __restrict__ out, int splits,
+                                          long len) {
+    long i = ((long)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i >= len) return;
+    if ((len & 3) == 0) {  // float4 rows stay aligned in every split
+        float4 a = __ldcs((const float4*)(part + i));
+        for (int z = 1; z < splits; z++) {
+            float4 b = __ldcs((const float4*)(part + (long)z * len + i));
+            a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w;
+        }
+        *(float4*)(out + i) = a;
+        return;
+    }
+    for (long j = i; j < min(i + 4, len); j++) {
+        float a = part[j];
+        for (int z = 1; z < splits; z++) a += part[(long)z * len + j];
+        out[j] = a;
+    }
+}
+
+
 
 // ---------------------------------------------------------------------------
 // Paged attention for decode (one query token per sequence).
 //
-// Grid: (tokens, kv heads); block: AD_WARPS warps. Each block serves all G
-// query heads that share its KV head, so every K/V row is read once.
+// Grid: (tokens, kv heads, splits); block: AD_WARPS warps. Each block serves
+// all G query heads that share its KV head, so every K/V row is read once.
 // Scores: each warp takes 32 positions at a time, lane = position, computing
 // full dot products against q in shared memory (one max/sum reduction per 32
 // positions). Values: lane = head dims, coalesced V row reads, probabilities
 // broadcast with shuffles. Warps' partial softmax states merge at the end.
 // Templated on G (group size) and HD (head dim) so all per-thread arrays stay
 // in registers.
+//
+// Split context (flash-decoding): with few (token, KV head) pairs and a long
+// context, one block per pair leaves most SMs idle. Then `splits` > 1 blocks
+// each take a 32-aligned share of the positions and write their unnormalized
+// state to `part` ([token][kv head][split] x (acc [G][HD], m [G], l [G]));
+// attn_decode_combine merges the splits in order.
 // Dynamic smem: q [G][HD] f32 | per warp: m, l [G] + acc [G][HD]
 #define AD_WARPS 8
 
-template <int G, int HD>
-__device__ void attn_decode(const float* __restrict__ q, const f16_bits* __restrict__ kc,
-                            const f16_bits* __restrict__ vc, float* __restrict__ out,
+// Q8: the cache is int8 with per-32 scales ksc/vsc (see kv_q8_store). For V
+// each lane owns PER consecutive dims (one vector load and one scale per
+// position) instead of dims lane + 32 i. Queries are rotated here to match
+// the keys (see kv_rotate_q).
+template <int G, int HD, bool Q8>
+__device__ void attn_decode(const float* __restrict__ q, const void* __restrict__ kc,
+                            const void* __restrict__ vc, float* __restrict__ out,
                             const u32* __restrict__ token_seq, const u32* __restrict__ positions,
                             const u32* __restrict__ block_tables, int max_blocks, int n_heads, int n_kv_heads,
-                            int block_size, float scale, int window, QOut qo) {
+                            int block_size, float scale, int window, QOut qo, const f16_bits* __restrict__ ksc,
+                            const f16_bits* __restrict__ vsc, float* __restrict__ part) {
     constexpr int PER = HD / WARP_SIZE;
     extern __shared__ float ad_smem[];
-    const int t = blockIdx.x, kvh = blockIdx.y;
+    const int t = blockIdx.x, kvh = blockIdx.y, split = blockIdx.z, splits = gridDim.z;
     const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE, warps = blockDim.x / WARP_SIZE;
     float* sq = ad_smem;                // [G][HD]
     float* sml = sq + G * HD;           // [warps][G][2]
@@ -1901,10 +2059,14 @@ __device__ void attn_decode(const float* __restrict__ q, const f16_bits* __restr
         int g = i / HD, dd = i % HD;
         sq[i] = q[((long)t * n_heads + kvh * G + g) * HD + dd] * scale;
     }
+    if (Q8) fwht_smem(sq, G * HD, kv_rot_size(HD));
     __syncthreads();
 
     const int ctx = positions[t] + 1;
     const int start = (window > 0 && ctx > window) ? ctx - window : 0;
+    // This block's positions: a 32-aligned share of start..ctx.
+    const int share = ((ctx - start + splits - 1) / splits + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE;
+    const int lo = start + split * share, hi = min(ctx, lo + share);
     const u32* table = block_tables + (long)token_seq[t] * max_blocks;
     const int kv_w = n_kv_heads * HD;
 
@@ -1917,26 +2079,48 @@ __device__ void attn_decode(const float* __restrict__ q, const f16_bits* __restr
         for (int i = 0; i < PER; i++) acc[g][i] = 0.f;
     }
 
-    for (int p0 = start + warp * WARP_SIZE; p0 < ctx; p0 += warps * WARP_SIZE) {
+    for (int p0 = lo + warp * WARP_SIZE; p0 < hi; p0 += warps * WARP_SIZE) {
         const int p = p0 + lane;
-        const bool valid = p < ctx;
+        const bool valid = p < hi;
         float s[G];
 #pragma unroll
         for (int g = 0; g < G; g++) s[g] = 0.f;
         if (valid) {
-            const f16_bits* kr = kc + ((long)table[p / block_size] * block_size + p % block_size) * kv_w + kvh * HD;
+            const long kb = ((long)table[p / block_size] * block_size + p % block_size) * kv_w + kvh * HD;
+            if (Q8) {
+                // One group (32 bytes, one scale) per step: int8 dot, then scale.
+#pragma unroll 2
+                for (int d = 0; d < HD; d += 32) {
+                    const uint4* kp = (const uint4*)((const i8*)kc + kb + d);
+                    uint4 k0 = kp[0], k1 = kp[1];
+                    const float dk = f16_to_f32(ksc[(kb + d) / 32]);
+                    const i8* kq0 = (const i8*)&k0;
+                    const i8* kq1 = (const i8*)&k1;
+#pragma unroll
+                    for (int g = 0; g < G; g++) {
+                        const float* qg = sq + g * HD + d;
+                        float a = 0.f;
+#pragma unroll
+                        for (int e = 0; e < 16; e++) a += qg[e] * kq0[e];
+#pragma unroll
+                        for (int e = 0; e < 16; e++) a += qg[16 + e] * kq1[e];
+                        s[g] += a * dk;
+                    }
+                }
+            } else {
 #pragma unroll 4
-            for (int d = 0; d < HD; d += 8) {
-                uint4 kv = *(const uint4*)(kr + d);
-                const f16_bits* kh = (const f16_bits*)&kv;
-                float kf[8];
+                for (int d = 0; d < HD; d += 8) {
+                    uint4 kv = *(const uint4*)((const f16_bits*)kc + kb + d);
+                    const f16_bits* kh = (const f16_bits*)&kv;
+                    float kf[8];
 #pragma unroll
-                for (int e = 0; e < 8; e++) kf[e] = f16_to_f32(kh[e]);
+                    for (int e = 0; e < 8; e++) kf[e] = f16_to_f32(kh[e]);
 #pragma unroll
-                for (int g = 0; g < G; g++) {
-                    const float* qg = sq + g * HD + d;
+                    for (int g = 0; g < G; g++) {
+                        const float* qg = sq + g * HD + d;
 #pragma unroll
-                    for (int e = 0; e < 8; e++) s[g] += qg[e] * kf[e];
+                        for (int e = 0; e < 8; e++) s[g] += qg[e] * kf[e];
+                    }
                 }
             }
         }
@@ -1954,16 +2138,33 @@ __device__ void attn_decode(const float* __restrict__ q, const f16_bits* __restr
         }
         // V rows in batches of VB independent loads so their latency overlaps.
         constexpr int VB = PER >= 16 ? 4 : 8;
-        const int n_pos = min(WARP_SIZE, ctx - p0);
+        const int n_pos = min(WARP_SIZE, hi - p0);
         for (int j0 = 0; j0 < n_pos; j0 += VB) {
-            f16_bits vh[VB][PER];
+            float vh[VB][PER];
 #pragma unroll
             for (int jj = 0; jj < VB; jj++) {
                 const int pj = p0 + min(j0 + jj, n_pos - 1);
-                const f16_bits* vr =
-                    vc + ((long)table[pj / block_size] * block_size + pj % block_size) * kv_w + kvh * HD + lane;
+                const long vb = ((long)table[pj / block_size] * block_size + pj % block_size) * kv_w + kvh * HD;
+                if (Q8) {
+                    const i8* vr = (const i8*)vc + vb + lane * PER;
+                    i8 raw[PER];
+                    if (PER == 16)
+                        *(uint4*)raw = *(const uint4*)vr;
+                    else if (PER == 8)
+                        *(uint2*)raw = *(const uint2*)vr;
+                    else if (PER == 4)
+                        *(u32*)raw = *(const u32*)vr;
+                    else
 #pragma unroll
-                for (int i = 0; i < PER; i++) vh[jj][i] = vr[i * WARP_SIZE];
+                        for (int i = 0; i < PER; i++) raw[i] = vr[i];
+                    const float dv = f16_to_f32(vsc[(vb + lane * PER) / 32]);
+#pragma unroll
+                    for (int i = 0; i < PER; i++) vh[jj][i] = raw[i] * dv;
+                } else {
+#pragma unroll
+                    for (int i = 0; i < PER; i++)
+                        vh[jj][i] = f16_to_f32(((const f16_bits*)vc)[vb + lane + i * WARP_SIZE]);
+                }
             }
 #pragma unroll
             for (int jj = 0; jj < VB; jj++) {
@@ -1973,7 +2174,7 @@ __device__ void attn_decode(const float* __restrict__ q, const f16_bits* __restr
                     float w = __shfl_sync(0xffffffff, pr[g], (j0 + jj) & (WARP_SIZE - 1));
                     if (!in) w = 0.f;
 #pragma unroll
-                    for (int i = 0; i < PER; i++) acc[g][i] += w * f16_to_f32(vh[jj][i]);
+                    for (int i = 0; i < PER; i++) acc[g][i] += w * vh[jj][i];
                 }
             }
         }
@@ -1986,9 +2187,10 @@ __device__ void attn_decode(const float* __restrict__ q, const f16_bits* __restr
             sml[(warp * G + g) * 2 + 1] = l[g];
         }
 #pragma unroll
-        for (int i = 0; i < PER; i++) sacc[(warp * G + g) * HD + lane + i * WARP_SIZE] = acc[g][i];
+        for (int i = 0; i < PER; i++) sacc[(warp * G + g) * HD + (Q8 ? lane * PER + i : lane + i * WARP_SIZE)] = acc[g][i];
     }
     __syncthreads();
+    float* mine = part + (((long)t * n_kv_heads + kvh) * splits + split) * (G * (HD + 2));
     for (int i = threadIdx.x; i < G * HD; i += blockDim.x) {
         int g = i / HD, dd = i % HD;
         float gm = NEG_INF;
@@ -2000,6 +2202,14 @@ __device__ void attn_decode(const float* __restrict__ q, const f16_bits* __restr
             gl += sml[(w * G + g) * 2 + 1] * f;
             v += sacc[(w * G + g) * HD + dd] * f;
         }
+        if (splits > 1) {
+            mine[i] = v;
+            if (dd == 0) {
+                mine[G * HD + g] = gm;
+                mine[G * HD + G + g] = gl;
+            }
+            continue;
+        }
         const long oi = ((long)t * n_heads + kvh * G) * HD + i;
         out[oi] = v / gl;
         // Warps cover 32-aligned runs of i, and G*HD is a multiple of 32.
@@ -2007,13 +2217,44 @@ __device__ void attn_decode(const float* __restrict__ q, const f16_bits* __restr
     }
 }
 
+// Merge attn_decode's split states, in split order. Grid: (tokens, kv heads).
+extern "C" __global__ void attn_decode_combine(const float* __restrict__ part, float* __restrict__ out, int splits,
+                                               int group, int head_dim, int n_heads, int n_kv_heads, QOut qo) {
+    const int t = blockIdx.x, kvh = blockIdx.y, gh = group * head_dim;
+    const float* base = part + ((long)t * n_kv_heads + kvh) * splits * (gh + 2 * group);
+    for (int i = threadIdx.x; i < gh; i += blockDim.x) {
+        const int g = i / head_dim;
+        float gm = NEG_INF;
+        for (int s = 0; s < splits; s++) gm = fmaxf(gm, base[s * (gh + 2 * group) + gh + g]);
+        float gl = 0.f, v = 0.f;
+        for (int s = 0; s < splits; s++) {
+            const float* ps = base + s * (gh + 2 * group);
+            const float ms = ps[gh + g];
+            const float f = ms == NEG_INF ? 0.f : __expf(ms - gm);
+            gl += ps[gh + group + g] * f;
+            v += ps[i] * f;
+        }
+        const long oi = ((long)t * n_heads + kvh * group) * head_dim + i;
+        out[oi] = v / gl;
+        if (qo.on) quant_unit(v / gl, oi / 32, qo);
+    }
+}
+
 #define INSTANTIATE_AD(G, HD)                                                                                \
     extern "C" __global__ void attn_decode_g##G##_d##HD(                                                      \
-        const float* q, const f16_bits* kc, const f16_bits* vc, float* out, const u32* token_seq,            \
+        const float* q, const void* kc, const void* vc, float* out, const u32* token_seq,                    \
         const u32* positions, const u32* block_tables, int max_blocks, int n_heads, int n_kv_heads,          \
-        int block_size, float scale, int window, QOut qo) {                                                   \
-        attn_decode<G, HD>(q, kc, vc, out, token_seq, positions, block_tables, max_blocks, n_heads,           \
-                           n_kv_heads, block_size, scale, window, qo);                                        \
+        int block_size, float scale, int window, QOut qo, float* part) {                                      \
+        attn_decode<G, HD, false>(q, kc, vc, out, token_seq, positions, block_tables, max_blocks, n_heads,    \
+                                  n_kv_heads, block_size, scale, window, qo, nullptr, nullptr, part);         \
+    }                                                                                                         \
+    extern "C" __global__ void attn_decode_q8_g##G##_d##HD(                                                   \
+        const float* q, const void* kc, const void* vc, float* out, const u32* token_seq,                    \
+        const u32* positions, const u32* block_tables, int max_blocks, int n_heads, int n_kv_heads,          \
+        int block_size, float scale, int window, QOut qo, const f16_bits* ksc, const f16_bits* vsc,           \
+        float* part) {                                                                                        \
+        attn_decode<G, HD, true>(q, kc, vc, out, token_seq, positions, block_tables, max_blocks, n_heads,     \
+                                 n_kv_heads, block_size, scale, window, qo, ksc, vsc, part);                  \
     }
 INSTANTIATE_AD(1, 64)
 INSTANTIATE_AD(1, 128)

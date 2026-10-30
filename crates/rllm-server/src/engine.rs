@@ -12,8 +12,14 @@
 //! the cache is evicted first, then the newest generation is paused
 //! (preempted) and resumed later by recomputing its tokens.
 //!
-//! The KV pool lives as long as the engine. CUDA decode graphs capture its
-//! device addresses, so it must not be reallocated.
+//! With a draft model (speculative decoding), a small model with the same
+//! vocabulary proposes a few tokens per decoding sequence, and one forward
+//! pass of the main model checks them all: every accepted token saves a
+//! main-model step. Verification keeps the output distributed exactly as
+//! without a draft (identical text when greedy).
+//!
+//! The KV pools live as long as the engine. CUDA decode graphs capture their
+//! device addresses, so they must not be reallocated.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -22,10 +28,10 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use rllm_core::Backend;
+use rllm_core::{Backend, KvType};
 use rllm_gguf::Gguf;
 use rllm_kv::{PrefixCache, SeqKv};
-use rllm_model::{AnyModel, KvPool, Model, Sampler, SamplerConfig, StepItem, Want};
+use rllm_model::{AnyModel, Dist, KvPool, Model, Sampler, SamplerConfig, StepItem, Want};
 use rllm_tokenizer::Tokenizer;
 use tokio::sync::{mpsc as tmpsc, oneshot};
 
@@ -104,6 +110,8 @@ pub struct EngineInfo {
     pub backend: String,
     pub summary: String,
     pub vocab: usize,
+    /// The draft model, when speculative decoding is on.
+    pub draft: Option<String>,
 }
 
 #[derive(Clone)]
@@ -150,9 +158,25 @@ pub struct EngineConfig {
     pub kv_tokens: usize,
     /// Keep finished sequences for prefix reuse.
     pub prefix_cache: bool,
+    /// KV cache storage (both models).
+    pub kv_type: KvType,
+    /// Draft model for speculative decoding (same vocabulary as the model).
+    pub draft: Option<Arc<Gguf>>,
+    /// Most tokens the draft proposes per sequence and step.
+    pub draft_tokens: usize,
 }
 
 const BLOCK_SIZE: usize = 16;
+
+/// Most tokens in a step that verifies drafts. Up to 8 tokens a step stays
+/// on the matvec kernels and in a CUDA graph; beyond that the main model's
+/// pass costs much more, so drafts are shortened to fit (and switched off
+/// once 5 sequences decode together).
+const SPEC_STEP_TOKENS: usize = 8;
+/// After this many verifications in a row that accept no draft token, a
+/// sequence decodes without drafts for SPEC_PAUSE_STEPS steps.
+const SPEC_MAX_MISSES: u32 = 3;
+const SPEC_PAUSE_STEPS: u32 = 8;
 
 /// Start the engine thread. `make_backend` runs on that thread (CUDA
 /// contexts are tied to it). Returns once the model is loaded.
@@ -177,29 +201,72 @@ where
             let setup = (|| -> Result<_> {
                 let backend = make_backend()?;
                 let model = AnyModel::load(&backend, &gguf)?;
-                Ok((backend, model))
+                let draft = match &cfg.draft {
+                    Some(g) => {
+                        let d = AnyModel::load(&backend, g).context("loading the draft model")?;
+                        check_draft_vocab(&tok, &model, g, &d)?;
+                        Some(d)
+                    }
+                    None => None,
+                };
+                Ok((backend, model, draft))
             })();
-            let (backend, model) = match setup {
+            let (backend, model, draft_model) = match setup {
                 Ok(v) => v,
                 Err(e) => {
                     let _ = ready_tx.send(Err(format!("{e:#}")));
                     return;
                 }
             };
-            let pool = match KvPool::new(&backend, &model, cfg.kv_tokens.max(cfg.ctx), BLOCK_SIZE) {
+            let kv_tokens = cfg.kv_tokens.max(cfg.ctx);
+            let pools = (|| -> Result<_> {
+                let pool = KvPool::new(&backend, &model, kv_tokens, BLOCK_SIZE, cfg.kv_type)?;
+                let draft = match &draft_model {
+                    Some(d) => Some(KvPool::new(&backend, d, kv_tokens, BLOCK_SIZE, cfg.kv_type).context("draft model KV cache")?),
+                    None => None,
+                };
+                Ok((pool, draft))
+            })();
+            let (pool, draft) = match pools {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = ready_tx.send(Err(format!("{e:#}")));
                     return;
                 }
             };
-            let info = EngineInfo { backend: backend.name(), summary: model.summary(), vocab: model.vocab_size() };
+            let info = EngineInfo {
+                backend: backend.name(),
+                summary: model.summary(),
+                vocab: model.vocab_size(),
+                draft: draft_model.as_ref().map(|d| d.summary()),
+            };
             let _ = ready_tx.send(Ok(info));
-            Scheduler::new(pool, &tok, &vocab, &cfg, &metrics).run(jobs_rx);
+            Scheduler::new(pool, draft, &tok, &vocab, &cfg, &metrics).run(jobs_rx);
         })
         .context("spawn engine thread")?;
     let info = ready_rx.recv().context("engine thread exited")?.map_err(|e| anyhow::anyhow!(e))?;
     Ok((EngineHandle { jobs: jobs_tx }, info))
+}
+
+/// The draft model must tokenize like the main model: same logits width and
+/// the same token strings.
+fn check_draft_vocab<B: Backend>(tok: &Tokenizer, model: &AnyModel<B>, draft_gguf: &Gguf, draft: &AnyModel<B>) -> Result<()> {
+    anyhow::ensure!(
+        model.vocab_size() == draft.vocab_size(),
+        "draft model vocabulary ({}) differs from the model's ({})",
+        draft.vocab_size(),
+        model.vocab_size()
+    );
+    let dt = Tokenizer::from_gguf(draft_gguf).context("draft model tokenizer")?;
+    let n = tok.vocab_size().min(dt.vocab_size());
+    if let Some(id) = (0..n as u32).find(|&i| tok.token_text(i) != dt.token_text(i)) {
+        anyhow::bail!(
+            "draft model tokenizer differs from the model's (token {id}: {:?} vs {:?})",
+            dt.token_text(id),
+            tok.token_text(id)
+        );
+    }
+    Ok(())
 }
 
 /// On hybrid CPUs (Intel P- and E-cores), keep the engine thread on the
@@ -258,6 +325,17 @@ struct Seq {
     json: Option<JsonState>,
     /// Admission order; the newest running sequence is preempted first.
     admitted: u64,
+    /// The draft model's cache: `draft_kv.len` tokens of `tokens`.
+    draft_kv: SeqKv,
+    /// Draws the draft's proposals (its own random stream).
+    draft_sampler: Sampler,
+    /// Draft tokens to propose next: one more than were last accepted, so
+    /// it follows how predictable the text currently is.
+    spec_k: usize,
+    /// Steps without drafts left, after drafts kept failing outright.
+    spec_pause: u32,
+    /// Verifications in a row that accepted nothing.
+    spec_misses: u32,
 }
 
 impl Seq {
@@ -276,8 +354,18 @@ enum Next {
     Done(Finish),
 }
 
+/// Draft tokens proposed for one sequence, with the distribution each was
+/// drawn from.
+#[derive(Default)]
+struct Proposal {
+    tokens: Vec<u32>,
+    dists: Vec<Dist>,
+}
+
 struct Scheduler<'a, 'm, B: Backend> {
     pool: KvPool<'m, B, AnyModel<B>>,
+    /// The draft model's pool (speculative decoding).
+    draft: Option<KvPool<'m, B, AnyModel<B>>>,
     cache: PrefixCache,
     tok: &'a Tokenizer,
     vocab: &'a Vocab,
@@ -297,6 +385,8 @@ struct StepTiming {
     steps: u32,
     forward: std::time::Duration,
     sample: std::time::Duration,
+    /// Draft model (speculative decoding), forward passes and sampling.
+    draft: std::time::Duration,
     total: std::time::Duration,
 }
 
@@ -309,11 +399,12 @@ impl StepTiming {
         if self.steps == 256 {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3 / 256.0;
             eprintln!(
-                "[rllm] engine step: {:.3} ms (forward {:.3}, sampling {:.3}, other {:.3})",
+                "[rllm] engine step: {:.3} ms (draft {:.3}, forward {:.3}, sampling {:.3}, other {:.3})",
                 ms(self.total),
+                ms(self.draft),
                 ms(self.forward),
                 ms(self.sample),
-                ms(self.total - self.forward - self.sample)
+                ms(self.total - self.draft - self.forward - self.sample)
             );
             *self = Self { enabled: true, ..Self::default() };
         }
@@ -321,10 +412,18 @@ impl StepTiming {
 }
 
 impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
-    fn new(pool: KvPool<'m, B, AnyModel<B>>, tok: &'a Tokenizer, vocab: &'a Vocab, cfg: &'a EngineConfig, metrics: &'a Metrics) -> Self {
+    fn new(
+        pool: KvPool<'m, B, AnyModel<B>>,
+        draft: Option<KvPool<'m, B, AnyModel<B>>>,
+        tok: &'a Tokenizer,
+        vocab: &'a Vocab,
+        cfg: &'a EngineConfig,
+        metrics: &'a Metrics,
+    ) -> Self {
         Metrics::set(&metrics.kv_blocks_total, pool.alloc.n_blocks());
         Self {
             pool,
+            draft,
             cache: PrefixCache::default(),
             tok,
             vocab,
@@ -366,9 +465,10 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                 // A failed forward pass leaves the batch in an unknown state:
                 // fail its requests, keep serving.
                 let msg = format!("{e:#}");
-                for mut s in self.running.drain(..) {
+                for mut s in std::mem::take(&mut self.running) {
                     let _ = s.events.send(GenEvent::Error(msg.clone()));
                     s.kv.free(&mut self.pool.alloc);
+                    self.free_draft(&mut s);
                 }
             }
             Metrics::add(&self.metrics.busy_us, t0.elapsed().as_micros() as usize);
@@ -388,12 +488,10 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                     let _ = events.send(GenEvent::Done { finish: Finish::Length, prompt_tokens: prompt.len(), cached_tokens: 0 });
                     return;
                 }
-                let sampler = Sampler::new(SamplerConfig {
-                    temperature: params.temperature,
-                    top_k: params.top_k,
-                    top_p: params.top_p,
-                    seed: params.seed,
-                });
+                let sampler_cfg =
+                    SamplerConfig { temperature: params.temperature, top_k: params.top_k, top_p: params.top_p, seed: params.seed };
+                let sampler = Sampler::new(sampler_cfg.clone());
+                let draft_sampler = Sampler::new(SamplerConfig { seed: params.seed ^ 0xD1B5_4A32_D192_ED03, ..sampler_cfg });
                 let json = params.json.clone();
                 self.waiting.push_back(Seq {
                     prompt_len: prompt.len(),
@@ -406,6 +504,11 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                     counts: HashMap::new(),
                     json,
                     admitted: 0,
+                    draft_kv: SeqKv::default(),
+                    draft_sampler,
+                    spec_k: self.cfg.draft_tokens,
+                    spec_pause: 0,
+                    spec_misses: 0,
                     params,
                     events,
                     cancel,
@@ -444,7 +547,14 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         self.retire(&mut s);
     }
 
+    fn free_draft(&mut self, s: &mut Seq) {
+        if let Some(d) = &mut self.draft {
+            s.draft_kv.free(&mut d.alloc);
+        }
+    }
+
     fn retire(&mut self, s: &mut Seq) {
+        self.free_draft(s);
         let kv = std::mem::take(&mut s.kv);
         if self.cfg.prefix_cache {
             self.cache.insert(&mut self.pool.alloc, &s.tokens[..kv.len], kv);
@@ -490,22 +600,38 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         Metrics::set(&m.prefix_cache_blocks, self.cache.n_blocks());
     }
 
+    /// Draft tokens to propose for a sequence this step (0: none). Only
+    /// for decoding sequences without a JSON constraint, within the
+    /// remaining budget, and so that a step of `decoding` sequences stays
+    /// within SPEC_STEP_TOKENS.
+    fn spec_len(&self, s: &Seq, decoding: usize) -> usize {
+        if self.draft.is_none() || s.todo().len() != 1 || s.json.is_some() || s.spec_pause > 0 {
+            return 0;
+        }
+        let fit = (SPEC_STEP_TOKENS / decoding.max(1)).saturating_sub(1);
+        s.spec_k.min(fit).min((s.budget - s.generated).saturating_sub(1))
+    }
+
     /// Plan, run and sample one batched forward pass.
     fn step(&mut self) -> Result<()> {
         let t_start = Instant::now();
-        // Decoding sequences first (one token each), then prompt chunks
-        // in admission order within the prefill budget.
+        // Decoding sequences first (one token each, plus drafts), then
+        // prompt chunks in admission order within the prefill budget.
         self.running.sort_by_key(|s| (s.todo().len() > 1, s.admitted));
         let mut takes: Vec<usize>;
+        let mut spec: Vec<usize>;
         loop {
+            let decoding = self.running.iter().filter(|s| s.todo().len() == 1).count();
+            spec = self.running.iter().map(|s| self.spec_len(s, decoding)).collect();
             let mut budget = self.cfg.prefill_chunk.max(1);
             takes = self
                 .running
                 .iter()
-                .map(|s| {
+                .zip(&spec)
+                .map(|(s, &k)| {
                     let n = s.todo().len();
                     if n == 1 {
-                        1
+                        1 + k
                     } else {
                         let t = n.min(budget);
                         budget -= t;
@@ -525,9 +651,47 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             Metrics::add(&self.metrics.preemptions, 1);
             anyhow::ensure!(!self.running.is_empty(), "KV cache too small for one sequence");
         }
+        for s in &mut self.running {
+            s.spec_pause = s.spec_pause.saturating_sub(1);
+        }
+
+        // Draft proposals. If the draft can't run (its pool is full), this
+        // step goes without: drafts only ever save work.
+        let mut proposals: Vec<Proposal> = (0..self.running.len()).map(|_| Proposal::default()).collect();
+        if spec.iter().any(|&k| k > 0) {
+            let t = Instant::now();
+            match self.propose(&spec) {
+                Ok(p) => proposals = p,
+                Err(_) => {
+                    for i in 0..self.running.len() {
+                        let mut s = std::mem::take(&mut self.running[i].draft_kv);
+                        if let Some(d) = &mut self.draft {
+                            s.free(&mut d.alloc);
+                        }
+                    }
+                }
+            }
+            for (i, p) in proposals.iter().enumerate() {
+                if spec[i] > 0 {
+                    takes[i] = 1 + p.tokens.len();
+                    Metrics::add(&self.metrics.draft_tokens, p.tokens.len());
+                }
+            }
+            self.timing.draft += t.elapsed();
+        }
+
         let active: Vec<usize> = (0..self.running.len()).filter(|&i| takes[i] > 0).collect();
+        // Logits rows per active sequence, and where its KV stood before.
         let mut rows_of = Vec::with_capacity(active.len());
+        let mut start_of = vec![0usize; self.running.len()];
         let out = {
+            // Verified tokens: the pending one, then the drafts.
+            let spec_tokens: Vec<Vec<u32>> = self
+                .running
+                .iter()
+                .zip(&proposals)
+                .map(|(s, p)| if p.tokens.is_empty() { Vec::new() } else { [s.todo(), &p.tokens].concat() })
+                .collect();
             let mut items: Vec<StepItem> = Vec::with_capacity(active.len());
             let mut n_tok = 0;
             for (i, s) in self.running.iter_mut().enumerate() {
@@ -535,12 +699,18 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                     continue;
                 }
                 let start = s.kv.len;
-                let all = start + takes[i] == s.tokens.len();
-                rows_of.push(all);
+                start_of[i] = start;
                 n_tok += takes[i];
                 // `tokens` and `kv` are disjoint fields.
                 let Seq { tokens, kv, .. } = s;
-                items.push(StepItem { seq: kv, tokens: &tokens[start..start + takes[i]], want: if all { Want::Last } else { Want::None } });
+                if !spec_tokens[i].is_empty() {
+                    rows_of.push(takes[i]);
+                    items.push(StepItem { seq: kv, tokens: &spec_tokens[i], want: Want::All });
+                } else {
+                    let all = start + takes[i] == tokens.len();
+                    rows_of.push(all as usize);
+                    items.push(StepItem { seq: kv, tokens: &tokens[start..start + takes[i]], want: if all { Want::Last } else { Want::None } });
+                }
             }
             Metrics::add(&self.metrics.steps, 1);
             Metrics::add(&self.metrics.step_tokens, n_tok);
@@ -555,34 +725,69 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         let mut out = out;
         // Logits rows are processed in place (no copies: a fresh 1 MB
         // buffer per token costs more in page faults than the argmax).
-        let mut rows = out.chunks_exact_mut(vocab_n);
-        let mut jobs: Vec<(usize, &mut [f32])> = Vec::new();
-        for (&i, &want) in active.iter().zip(&rows_of) {
-            if want {
-                jobs.push((i, rows.next().context("missing logits row")?));
+        let mut rest: &mut [f32] = &mut out;
+        let mut jobs: Vec<(usize, &mut [f32], Proposal)> = Vec::new();
+        for (&i, &n) in active.iter().zip(&rows_of) {
+            if n > 0 {
+                anyhow::ensure!(rest.len() >= n * vocab_n, "missing logits rows");
+                let (rows, tail) = rest.split_at_mut(n * vocab_n);
+                rest = tail;
+                jobs.push((i, rows, std::mem::take(&mut proposals[i])));
             }
         }
         let (tok, vocab) = (self.tok, self.vocab);
-        let results: Vec<(usize, Next)> = if jobs.len() <= 1 {
-            jobs.into_iter().map(|(i, l)| (i, sample_next(&mut self.running[i], l, tok, vocab))).collect()
+        let run = move |s: &mut Seq, rows: &mut [f32], p: Proposal| -> (Next, usize) {
+            if p.tokens.is_empty() { (sample_next(s, rows, tok, vocab), 0) } else { verify_drafts(s, rows, vocab_n, &p, tok) }
+        };
+        let results: Vec<(usize, Next, usize)> = if jobs.len() <= 1 {
+            jobs.into_iter()
+                .map(|(i, l, p)| {
+                    let (n, kept) = run(&mut self.running[i], l, p);
+                    (i, n, kept)
+                })
+                .collect()
         } else {
             // Sampling a large vocabulary takes a while: one thread per sequence.
             let mut refs: Vec<Option<&mut Seq>> = self.running.iter_mut().map(Some).collect();
             std::thread::scope(|sc| {
                 let handles: Vec<_> = jobs
                     .into_iter()
-                    .map(|(i, l)| {
+                    .map(|(i, l, p)| {
                         let s = refs[i].take().unwrap();
-                        sc.spawn(move || (i, sample_next(s, l, tok, vocab)))
+                        sc.spawn(move || {
+                            let (n, kept) = run(s, l, p);
+                            (i, n, kept)
+                        })
                     })
                     .collect();
                 handles.into_iter().map(|h| h.join().expect("sampler thread panicked")).collect()
             })
         };
-        let mut done: Vec<(usize, Finish)> = results.into_iter().filter_map(|(i, n)| match n {
-            Next::Continue => None,
-            Next::Done(f) => Some((i, f)),
-        }).collect();
+        let mut done: Vec<(usize, Finish)> = Vec::new();
+        for (i, next, kept) in results {
+            if spec[i] > 0 && takes[i] > 1 {
+                // Keep the KV of the pending token and the accepted drafts;
+                // the draft cache keeps what it shares with them.
+                Metrics::add(&self.metrics.draft_accepted, kept);
+                let keep = start_of[i] + 1 + kept;
+                let s = &mut self.running[i];
+                s.spec_k = (kept + 1).min(self.cfg.draft_tokens);
+                s.spec_misses = if kept == 0 { s.spec_misses + 1 } else { 0 };
+                if s.spec_misses >= SPEC_MAX_MISSES {
+                    // The draft keeps guessing wrong here: decode plainly
+                    // for a while (drafts that all fail only cost time).
+                    s.spec_pause = SPEC_PAUSE_STEPS;
+                    s.spec_misses = 0;
+                }
+                s.kv.truncate(&mut self.pool.alloc, keep);
+                if let Some(d) = &mut self.draft {
+                    s.draft_kv.truncate(&mut d.alloc, keep);
+                }
+            }
+            if let Next::Done(f) = next {
+                done.push((i, f));
+            }
+        }
         self.timing.sample += t_sample.elapsed();
         self.timing.total += t_start.elapsed();
         self.timing.report();
@@ -593,6 +798,85 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             self.finish(s, f);
         }
         Ok(())
+    }
+
+    /// Run the draft model for the sequences with `spec[i] > 0`: catch its
+    /// cache up with their tokens, then propose up to `spec[i]` tokens each
+    /// (one batched draft step per token). Fails only if the draft pool is
+    /// out of blocks.
+    fn propose(&mut self, spec: &[usize]) -> Result<Vec<Proposal>> {
+        let draft = self.draft.as_mut().context("no draft model")?;
+        let vocab_n = draft.model().vocab_size();
+        let mut props: Vec<Proposal> = (0..self.running.len()).map(|_| Proposal::default()).collect();
+        let idx: Vec<usize> = (0..self.running.len()).filter(|&i| spec[i] > 0).collect();
+        // Logits after each sequence's latest token, as rows of `logits`.
+        let mut logits: Vec<f32> = vec![0.0; self.running.len() * vocab_n];
+        // Catch up: everything not yet in the draft cache (the last token,
+        // or the whole prompt the first time), in prefill-sized chunks.
+        loop {
+            let mut items = Vec::new();
+            let mut owners = Vec::new();
+            let mut refs: Vec<Option<&mut Seq>> = self.running.iter_mut().map(Some).collect();
+            for &i in &idx {
+                let s = refs[i].take().unwrap();
+                let todo = s.tokens.len() - s.draft_kv.len;
+                if todo == 0 {
+                    continue;
+                }
+                let take = todo.min(self.cfg.prefill_chunk.max(1));
+                let start = s.draft_kv.len;
+                let last = take == todo;
+                let Seq { tokens, draft_kv, .. } = s;
+                items.push(StepItem { seq: draft_kv, tokens: &tokens[start..start + take], want: if last { Want::Last } else { Want::None } });
+                if last {
+                    owners.push(i);
+                }
+            }
+            if items.is_empty() {
+                break;
+            }
+            let out = draft.step(&mut items, false)?;
+            for (row, &i) in out.chunks_exact(vocab_n).zip(&owners) {
+                logits[i * vocab_n..(i + 1) * vocab_n].copy_from_slice(row);
+            }
+        }
+        // Propose: draw a token from each row, then feed it to get the next.
+        let max_k = idx.iter().map(|&i| spec[i]).max().unwrap_or(0);
+        for round in 0..max_k {
+            let mut feed: Vec<(usize, u32)> = Vec::new();
+            for &i in &idx {
+                let s = &mut self.running[i];
+                let p = &mut props[i];
+                if p.tokens.len() != round || round >= spec[i] {
+                    continue; // stopped early, or has enough
+                }
+                let row = &mut logits[i * vocab_n..(i + 1) * vocab_n];
+                draft_logits(s, &p.tokens, row);
+                let q = s.draft_sampler.dist(row);
+                let t = s.draft_sampler.draw(&q);
+                p.tokens.push(t);
+                p.dists.push(q);
+                // Nothing to propose after the end of the output.
+                if round + 1 < spec[i] && !self.tok.is_stop(t) {
+                    feed.push((i, t));
+                }
+            }
+            if feed.is_empty() {
+                break;
+            }
+            let toks: Vec<[u32; 1]> = feed.iter().map(|&(_, t)| [t]).collect();
+            let mut items = Vec::with_capacity(feed.len());
+            let mut refs: Vec<Option<&mut Seq>> = self.running.iter_mut().map(Some).collect();
+            for (k, &(i, _)) in feed.iter().enumerate() {
+                let s = refs[i].take().unwrap();
+                items.push(StepItem { seq: &mut s.draft_kv, tokens: &toks[k], want: Want::Last });
+            }
+            let out = draft.step(&mut items, false)?;
+            for (row, &(i, _)) in out.chunks_exact(vocab_n).zip(&feed) {
+                logits[i * vocab_n..(i + 1) * vocab_n].copy_from_slice(row);
+            }
+        }
+        Ok(props)
     }
 
     /// Embedding jobs run between steps, one input at a time, in their own
@@ -651,6 +935,44 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
 /// Process one sequence's logits: logprobs, logit bias, penalties, the JSON
 /// constraint, sampling; then send the token and decide whether to go on.
 fn sample_next(s: &mut Seq, logits: &mut [f32], tok: &Tokenizer, vocab: &Vocab) -> Next {
+    let lp = process_logits(s, logits);
+    let id = match &mut s.json {
+        Some(state) => match pick_json(logits, state, vocab, &s.params, &mut s.sampler) {
+            Some(id) => id,
+            None => return Next::Done(Finish::Stop),
+        },
+        None => s.sampler.sample(logits),
+    };
+    emit(s, id, lp, logits, tok)
+}
+
+/// Check a sequence's draft tokens against the main model's logits rows
+/// (one per verified position: the pending token, then each draft) and
+/// emit the accepted ones plus one more from the main model: a replacement
+/// for the first rejected draft, or the token after the last one.
+/// Returns what happens next and how many drafts went into the sequence.
+fn verify_drafts(s: &mut Seq, rows: &mut [f32], vocab_n: usize, p: &Proposal, tok: &Tokenizer) -> (Next, usize) {
+    let mut kept = 0;
+    for (j, row) in rows.chunks_exact_mut(vocab_n).enumerate() {
+        let lp = process_logits(s, row);
+        let (id, accepted) = match p.tokens.get(j) {
+            Some(&d) => {
+                let target = s.sampler.dist(row);
+                s.sampler.verify(&target, &p.dists[j], d)
+            }
+            None => (s.sampler.sample(row), false),
+        };
+        match emit(s, id, lp, row, tok) {
+            Next::Continue if accepted => kept += 1,
+            next => return (next, kept),
+        }
+    }
+    (Next::Continue, kept)
+}
+
+/// Logprobs of the raw logits (if requested), then the request's logit
+/// bias and frequency/presence penalties, in place.
+fn process_logits(s: &Seq, logits: &mut [f32]) -> Option<LogSoftmax> {
     let params = &s.params;
     let mut lp = params.logprobs.map(|k| LogSoftmax::new(logits, k));
     // Request-level logit processing (before sampling, after logprobs).
@@ -672,13 +994,33 @@ fn sample_next(s: &mut Seq, logits: &mut [f32], tok: &Tokenizer, vocab: &Vocab) 
             }
         }
     }
-    let id = match &mut s.json {
-        Some(state) => match pick_json(logits, state, vocab, params, &mut s.sampler) {
-            Some(id) => id,
-            None => return Next::Done(Finish::Stop),
-        },
-        None => s.sampler.sample(logits),
-    };
+    lp
+}
+
+/// The draft model's view of the request's logit processing: bias and
+/// penalties, counting the tokens drafted so far as generated.
+fn draft_logits(s: &Seq, drafted: &[u32], logits: &mut [f32]) {
+    let params = &s.params;
+    for &(id, b) in &params.logit_bias {
+        if let Some(l) = logits.get_mut(id as usize) {
+            *l += b;
+        }
+    }
+    if params.frequency_penalty != 0.0 || params.presence_penalty != 0.0 {
+        let mut counts = s.counts.clone();
+        for &t in drafted {
+            *counts.entry(t).or_default() += 1;
+        }
+        for (&id, &c) in &counts {
+            if let Some(l) = logits.get_mut(id as usize) {
+                *l -= c as f32 * params.frequency_penalty + params.presence_penalty;
+            }
+        }
+    }
+}
+
+/// Send a chosen token and decide whether the sequence goes on.
+fn emit(s: &mut Seq, id: u32, lp: Option<LogSoftmax>, logits: &[f32], tok: &Tokenizer) -> Next {
     if tok.is_stop(id) {
         return Next::Done(Finish::Stop);
     }

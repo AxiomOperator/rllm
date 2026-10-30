@@ -98,6 +98,19 @@ impl SeqKv {
         Ok(slots)
     }
 
+    /// Keep only the first `len` tokens (rejected speculative tokens), and
+    /// release blocks no longer needed. Their slots are simply overwritten
+    /// by later tokens.
+    pub fn truncate(&mut self, alloc: &mut BlockAllocator, len: usize) {
+        if len >= self.len {
+            return;
+        }
+        for b in self.block_table.drain(len.div_ceil(alloc.block_size())..) {
+            alloc.release(b);
+        }
+        self.len = len;
+    }
+
     /// Return all blocks to the allocator.
     pub fn free(&mut self, alloc: &mut BlockAllocator) {
         for b in self.block_table.drain(..) {
@@ -250,6 +263,19 @@ mod tests {
         assert_eq!(a.n_free(), 3);
         // t's next block comes from s's freed blocks.
         assert_eq!(t.append(&mut a, 2).unwrap(), vec![5, 2]);
+    }
+
+    #[test]
+    fn truncate_releases_whole_blocks() {
+        let mut a = BlockAllocator::new(4, 4);
+        let mut s = SeqKv::default();
+        s.append(&mut a, 10).unwrap();
+        s.truncate(&mut a, 5);
+        assert_eq!((s.len, s.block_table.len(), a.n_free()), (5, 2, 2));
+        // The next token goes right after the kept ones.
+        assert_eq!(s.append(&mut a, 1).unwrap(), vec![s.block_table[1] * 4 + 1]);
+        s.truncate(&mut a, 8);
+        assert_eq!(s.len, 6);
     }
 
     #[test]

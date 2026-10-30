@@ -11,6 +11,8 @@ rllm serve models/Qwen3-0.6B-Q8_0.gguf --port 8080
 rllm serve model.gguf --host 0.0.0.0 --port 8080 --ctx 8192 --parallel 8 \
     --api-key "$KEY" --model-name my-model --strict-model -d cuda:0 \
     --store-file store.json
+# A draft model for speculative decoding, and an 8-bit KV cache:
+rllm serve models/Qwen3-8B-Q4_K_M.gguf --draft models/Qwen3-0.6B-Q8_0.gguf --kv-type q8
 ```
 
 ```python
@@ -27,6 +29,9 @@ r = client.chat.completions.create(model="my-model", messages=[{"role": "user", 
 | `--parallel` | 4 | Most requests decoded together in one batch. More wait in a queue. |
 | `--kv-tokens` | `ctx × parallel` | Size of the KV cache shared by all requests, in tokens. Allocated once at startup. |
 | `--no-prefix-cache` | off | Don't keep finished requests' KV for reuse. |
+| `--kv-type` | `f16` | KV cache storage: `f16`, or `q8` (8-bit, about half the memory; see [KV cache type](#kv-cache-type)). |
+| `--draft` | none | Draft model for speculative decoding: a small GGUF with the same tokenizer (see [Speculative decoding](#speculative-decoding)). |
+| `--draft-tokens` | 5 | Most tokens the draft proposes per step. |
 | `--api-key` | `$RLLM_API_KEY`, else none | Require `Authorization: Bearer <key>`. |
 | `--model-name` | file name without `.gguf` | Model id reported by `/v1/models` and in responses. |
 | `--strict-model` | off | Answer requests naming another model with 404 `model_not_found`, as OpenAI does. Off by default: any model name is served by the loaded model, so clients that hard-code e.g. `gpt-4o` still work. |
@@ -35,7 +40,7 @@ r = client.chat.completions.create(model="my-model", messages=[{"role": "user", 
 | `-q`, `--quiet` | off | Don't log a line per finished generation. |
 
 Environment: `RLLM_API_KEY` (as `--api-key`), `RLLM_ENGINE_TIMING=1` (print
-where engine step time goes every 256 steps), `RLLM_NO_PIN=1` (see
+where engine step time goes every 256 steps, draft model included), `RLLM_NO_PIN=1` (see
 [Performance](#performance)).
 
 ## Endpoints
@@ -155,7 +160,8 @@ retrieval-embedding model.
 - **One model, one engine thread, continuous batching.** The engine owns a paged KV cache of `--kv-tokens` tokens, shared by all requests.
   - Each forward pass takes one token from every decoding request, plus up to `--prefill-chunk` prompt tokens from requests still reading their prompt.
   - New requests join the batch as soon as a slot (`--parallel`) and KV blocks are free. Finished ones leave without waiting for the rest.
-  - Batched decode steps of up to 8 requests replay CUDA graphs. Steps that mix in prompt chunks run directly.
+  - Steps of up to 8 tokens (decoding requests, or drafts being verified) replay CUDA graphs. Steps that mix in prompt chunks run directly.
+  - Decode attention splits long contexts over several thread blocks per head and merges them in a fixed order (2× faster on Qwen3-0.6B at 8k context on the laptop GPU).
   - HTTP handling, tokenization, chat templating, stop sequences and output parsing run on the async runtime.
 - **Prefix cache.** When a request finishes, its KV blocks stay cached. A later request whose prompt starts with the same tokens reuses those blocks instead of recomputing them. That covers the next turn of a chat, a repeated system prompt, `n` choices or `previous_response_id`.
   - Only whole 16-token blocks are shared, so the last few tokens before the difference are recomputed.
@@ -164,7 +170,7 @@ retrieval-embedding model.
 - **Sampling.** Each request's logits are processed on the host: logprobs, `logit_bias`, penalties, the JSON constraint, then sampling. With several requests in a step, this runs on one thread per request.
 - **Numerics.** A request batched with others runs through the multi-row int8 kernels (the ones prefill uses), and a lone request through the single-row decode kernels.
   - Logprobs agree to about 0.01–0.02 on average, but greedy text can drift apart after a few dozen tokens.
-  - Results are reproducible for the same mix of concurrent requests.
+  - Results are reproducible for the same mix of concurrent requests: every GPU reduction sums in a fixed order, so the same tokens give bit-identical logits on every run. (Prefill matmuls split along k used to `atomicAdd` their parts in whatever order they finished.)
 - **Cancellation.** A client that disconnects (a closed stream, a dropped connection) cancels its generation at the next step and frees its slot. Stop sequences cancel the rest of the generation too.
 - **`n` and `best_of`.** The choices run concurrently, so they share batches. They use seeds `seed`, `seed + 1`, …. Streaming with `n > 1` still sends the choices one after another.
 - **Storage.** Stored chat completions and responses live in memory.
@@ -172,11 +178,66 @@ retrieval-embedding model.
   - A background response still running at shutdown loads as `failed`.
 - **Logging.** One line per finished generation: prompt tokens (cached), generated tokens, time to first token, decode rate, total time and finish reason.
 
+## Speculative decoding
+
+With `--draft`, a small model with the same tokenizer (for example
+Qwen3-0.6B for Qwen3-8B) proposes a few tokens for each decoding request,
+and one forward pass of the main model checks them all. Every accepted token
+is a main-model step saved.
+- **Exact.** Verification follows the speculative sampling rule (accept a drafted token with probability min(1, p/q), otherwise draw from the leftover distribution), so output is distributed exactly as without a draft. Greedy output is token for token the same on Qwen3: a verification step computes the same logits as one-token steps. On Gemma 4 models, whose one-token steps use their own fused kernels, it matches as closely as batched requests do.
+- **Request features.** Logit bias, frequency and presence penalties, logprobs, stop sequences and `n` all apply as usual (the draft sees the bias and penalties too). Requests with a JSON constraint (`json_object`, `json_schema`, forced tool calls) decode without drafts.
+- **Adaptive.** Each request proposes one token more than it last had accepted, up to `--draft-tokens`, so drafts stay short where the text is hard to predict. After three verifications in a row that accept nothing, the request decodes without drafts for 8 steps.
+- **Batching.** Drafts are shortened so a step stays within 8 tokens (one request: up to 7 drafts; two: 3 each; three or four: 1 each). With 5 or more requests decoding, the batch alone keeps the GPU busy and speculation pauses.
+- **Draft cache.** The draft model has its own KV pool (the same size as the main one). Each request's draft cache catches up lazily (its whole prompt at the first decode step) and is cut back to the accepted tokens after each verification. It has no prefix cache.
+- **Pairs need the same vocabulary.** The server checks the logits width and every token string at startup.
+
+| Qwen3-8B Q4_K_M, RTX 6000 Ada | rllm | rllm + Qwen3-0.6B draft | llama-server | llama-server + draft |
+|---|---:|---:|---:|---:|
+| Single request, 6 mixed prompts (mean decode) | 141 tok/s | 213 tok/s (1.51×) | 146 tok/s | 126 tok/s |
+| Single request, list continuation | 140 tok/s | 246 tok/s (1.76×) | 143 tok/s | 134 tok/s |
+| 4 clients, total output | 475 tok/s | 515 tok/s | 401 tok/s | 189 tok/s |
+| 8 clients, total output | 762 tok/s | 745 tok/s | 528 tok/s | 355 tok/s |
+
+The six prompts are code, an explanation, a list, a translation, a story and
+JSON (200 tokens out at most, greedy). Code and JSON gain most (1.8–1.9× on
+the laptop GPU), the story least (1.15×); 58% of drafted tokens were
+accepted. llama-server ran `-md` with `--spec-type draft-simple` and its
+default `--spec-draft-n-max 3` (8 was slower still); in this build its
+speculative mode lowered throughput.
+
+## KV cache type
+
+`--kv-type q8` stores keys and values as 8-bit integers with one f16 scale
+per 32 values (GGUF's q8_0 layout): about half the memory of f16, so twice
+the context or concurrent requests in the same `--kv-tokens` budget.
+- **Keys are rotated.** Each head's key vector is multiplied by an orthonormal Walsh–Hadamard matrix before quantizing, and queries get the same rotation, so q·k is unchanged. The rotation spreads a few large channels across the whole group of 32. Without it, Qwen3-0.6B's perplexity rose 1.4%. llama.cpp rotates the same way. Values aren't rotated (quantizing them costs about 0.02%).
+- **Quality.** Perplexity changes are within noise on the larger models (wikitext-2, 20 chunks; Qwen3-0.6B on the laptop GPU, the others on the Ada):
+
+| Perplexity, f16 → q8 | ctx 512 | ctx 2048 |
+|---|---:|---:|
+| Qwen3-0.6B Q8_0 | 23.676 → 23.721 (+0.19%) | 17.271 → 17.277 (+0.03%) |
+| Qwen3-8B Q4_K_M | 11.003 → 10.997 | 8.344 → 8.340 |
+| Nemotron E4B Q8_K_XL | 150.76 → 150.48 | 96.82 → 96.81 |
+
+  llama.cpp's q8_0 cache on the same Qwen3-0.6B chunks: +0.21%.
+- **Speed.** Decode reads half the bytes, which pays off at long contexts; prefill expands the blocks it reads to f16 first (the tensor-core kernels need f16), which costs a few percent:
+
+| Qwen3-8B Q4_K_M, RTX 6000 Ada | f16 | q8 | llama.cpp f16 | llama.cpp q8_0 |
+|---|---:|---:|---:|---:|
+| Decode, empty context | 143.1 tok/s | 141.0 tok/s | 153.3 tok/s | 146.9 tok/s |
+| Decode at 8k context | 110.4 tok/s | 121.8 tok/s | 125.5 tok/s | 124.9 tok/s |
+| Decode at 32k context | 71.4 tok/s | 88.0 tok/s | 82.3 tok/s | 79.5 tok/s |
+| Prefill (512) at 32k context | 2593 tok/s | 2477 tok/s | 3261 tok/s | 3180 tok/s |
+
+  On Nemotron (mostly sliding-window layers) q8 decodes 7% faster at 32k context.
+- **How.** One f16 scale per 32 values; decode-sized steps (up to 8 tokens) read the int8 cache directly in the decode attention kernel; larger prefill steps expand the blocks they attend to into an f16 staging buffer and run the f16 tensor-core kernels on a remapped block table. `rllm run`, `bench` and `perplexity` take `--kv-type` too.
+
 ## Metrics
 
 `GET /metrics` serves Prometheus text, every series labelled with the model:
 - **Engine gauges:** `rllm_requests_running`, `rllm_requests_waiting`, `rllm_kv_blocks_total`, `rllm_kv_blocks_free`, `rllm_prefix_cache_entries`, `rllm_prefix_cache_blocks`.
 - **Engine counters:** `rllm_requests_finished_total`, `rllm_prompt_tokens_total`, `rllm_prompt_tokens_cached_total`, `rllm_generation_tokens_total`, `rllm_embedding_tokens_total`, `rllm_preemptions_total`, `rllm_engine_steps_total`, `rllm_engine_step_tokens_total`, `rllm_engine_busy_seconds_total`.
+- **Speculative decoding:** `rllm_draft_tokens_total` (proposed) and `rllm_draft_tokens_accepted_total`.
 - **HTTP:** `rllm_http_requests_total` and `rllm_http_request_seconds_total`, by method, route pattern (`/v1/responses/{id}`) and status.
 
 ## Performance
@@ -239,6 +300,12 @@ A second suite (17 checks, both models) covers the newer features:
 - **Schema enforcement:** keys, integer types, enums and `maxItems` under `json_schema`; `required` and named tool calls matching their tools' schemas.
 - **Ops endpoints:** `/tokenize`, `/detokenize`, `/apply-template`, `/metrics`.
 
+Both suites also passed (47/47, 17/17) on Qwen3-8B with a Qwen3-0.6B draft
+model (laptop GPU). With the draft, greedy output on six mixed prompts was
+identical to the run without one, sampling at temperature 0.8 worked
+(1.37× faster), and the preemption test below passed again (2 preemptions,
+outputs identical to the requests run alone).
+
 Separately:
 - **Preemption:** a 1024-token pool with 4 concurrent 380-token completions preempted twice. Every output was identical to the same request run alone.
 - **Persistence:** stored completions survived a restart with `--store-file`.
@@ -247,5 +314,16 @@ Separately:
 Unit tests cover:
 - **The JSON validator:** schemas, `$ref` recursion, `anyOf`, the Gemma dialect, tool-call alternatives.
 - **The prefix cache:** block sharing, eviction, superseded entries.
-- **The sampler:** argmax and top-k against naive versions, `exp` accuracy, sampled frequencies against softmax for temperature, top-k and top-p.
+- **The sampler:** argmax and top-k against naive versions, `exp` accuracy, sampled frequencies against softmax for temperature, top-k and top-p, and speculative verification reproducing the target distribution (greedy, temperature, top-k, top-p).
+- **The KV cache:** truncation after rejected drafts.
+
+GPU tests (`crates/rllm-model/tests/gpu.rs`) need a model file:
+`RLLM_TEST_MODEL=models/Qwen3-0.6B-Q8_0.gguf cargo test --release -p rllm-model --test gpu`
+(add `RLLM_MMQ=1` to send a small model's prefill through the int8 kernels).
+They check that the same tokens give bit-identical logits on every run,
+that a verification step matches one-token steps, and that a q8 cache tracks
+f16 on real text (97–99% same top token, mean KL ≤ 4e-3). They passed on
+Qwen3-0.6B, Qwen3-8B and Nemotron on both GPUs. The CUDA parity tests
+(`crates/rllm-cuda/tests/parity.rs`) run every attention path on a q8 cache
+against the CPU backend, which emulates q8's rounding.
 - **The output parser:** reasoning and tool-call markers split at every possible point, Gemma argument syntax, stop sequences spanning chunks.

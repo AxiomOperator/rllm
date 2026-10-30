@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use rllm_core::Backend;
+use rllm_core::{Backend, KvType};
 use rllm_cpu::CpuBackend;
 use rllm_cuda::CudaBackend;
 use rllm_gguf::Gguf;
@@ -66,6 +66,16 @@ enum Cmd {
         /// Don't keep finished requests' KV for reuse by later prompts with the same prefix.
         #[arg(long)]
         no_prefix_cache: bool,
+        /// KV cache storage: f16, or q8 (8-bit, about half the memory).
+        #[arg(long, default_value = "f16")]
+        kv_type: KvType,
+        /// Speculative decoding: a small model with the same tokenizer that
+        /// proposes tokens for this one to check (e.g. Qwen3-0.6B for Qwen3-8B).
+        #[arg(long)]
+        draft: Option<PathBuf>,
+        /// Most tokens the draft model proposes per step.
+        #[arg(long, default_value_t = 5)]
+        draft_tokens: usize,
         /// Save stored chat completions and responses to this JSON file (loaded at start).
         #[arg(long)]
         store_file: Option<PathBuf>,
@@ -86,6 +96,9 @@ enum Cmd {
         /// Stop after this many chunks (default: all).
         #[arg(long)]
         chunks: Option<usize>,
+        /// KV cache storage: f16 or q8.
+        #[arg(long, default_value = "f16")]
+        kv_type: KvType,
     },
     /// Throughput benchmark, same method as llama.cpp's llama-bench:
     /// pp = one N-token prompt in a single batch, tg = N tokens decoded one at
@@ -103,6 +116,12 @@ enum Cmd {
         /// Measured repetitions (after one warmup).
         #[arg(short, long, default_value_t = 3)]
         reps: usize,
+        /// Context already in the KV cache before each test (llama-bench's -d).
+        #[arg(long, default_value_t = 0)]
+        depth: usize,
+        /// KV cache storage: f16 or q8.
+        #[arg(long, default_value = "f16")]
+        kv_type: KvType,
     },
     /// Compare against a llama.cpp reference dump (tools/llama-ref): same token
     /// ids in, logits compared at every position.
@@ -132,6 +151,9 @@ enum Cmd {
         /// Max prompt tokens per forward pass (small values exercise the decode kernels).
         #[arg(long, default_value_t = 512)]
         prefill_chunk: usize,
+        /// KV cache storage on both backends (the CPU emulates q8's rounding).
+        #[arg(long, default_value = "f16")]
+        kv_type: KvType,
     },
 }
 
@@ -174,6 +196,9 @@ struct RunArgs {
     /// Print token ids alongside text.
     #[arg(long)]
     show_ids: bool,
+    /// KV cache storage: f16 or q8.
+    #[arg(long, default_value = "f16")]
+    kv_type: KvType,
 }
 
 fn main() -> Result<()> {
@@ -197,6 +222,9 @@ fn main() -> Result<()> {
             parallel,
             kv_tokens,
             no_prefix_cache,
+            kv_type,
+            draft,
+            draft_tokens,
             store_file,
             quiet,
         } => {
@@ -212,6 +240,9 @@ fn main() -> Result<()> {
                 parallel,
                 kv_tokens,
                 prefix_cache: !no_prefix_cache,
+                kv_type,
+                draft,
+                draft_tokens,
                 store_file,
                 log: !quiet,
             };
@@ -223,20 +254,20 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Perplexity { model, file, device, ctx, chunks } => match device.as_str() {
-            "cpu" => perplexity(&CpuBackend::new(), &model, &file, ctx, chunks),
-            d => perplexity(&CudaBackend::new(parse_cuda(d)?)?, &model, &file, ctx, chunks),
+        Cmd::Perplexity { model, file, device, ctx, chunks, kv_type } => match device.as_str() {
+            "cpu" => perplexity(&CpuBackend::new(), &model, &file, ctx, chunks, kv_type),
+            d => perplexity(&CudaBackend::new(parse_cuda(d)?)?, &model, &file, ctx, chunks, kv_type),
         },
-        Cmd::Bench { model, device, n_prompt, n_gen, reps } => match device.as_str() {
-            "cpu" => bench(&CpuBackend::new(), &model, n_prompt, n_gen, reps),
-            d => bench(&CudaBackend::new(parse_cuda(d)?)?, &model, n_prompt, n_gen, reps),
+        Cmd::Bench { model, device, n_prompt, n_gen, reps, depth, kv_type } => match device.as_str() {
+            "cpu" => bench(&CpuBackend::new(), &model, n_prompt, n_gen, reps, depth, kv_type),
+            d => bench(&CudaBackend::new(parse_cuda(d)?)?, &model, n_prompt, n_gen, reps, depth, kv_type),
         },
         Cmd::CompareRef { model, reference, prompt_file, device, prefill_chunk } => match device.as_str() {
             "cpu" => compare_ref(&CpuBackend::new(), &model, &reference, prompt_file.as_deref(), prefill_chunk),
             d => compare_ref(&CudaBackend::new(parse_cuda(d)?)?, &model, &reference, prompt_file.as_deref(), prefill_chunk),
         },
-        Cmd::Compare { model, prompt, steps, gpu, block_size, prefill_chunk } => {
-            compare(&model, &prompt, steps, gpu, block_size, prefill_chunk)
+        Cmd::Compare { model, prompt, steps, gpu, block_size, prefill_chunk, kv_type } => {
+            compare(&model, &prompt, steps, gpu, block_size, prefill_chunk, kv_type)
         }
     }
 }
@@ -305,7 +336,7 @@ fn run<B: Backend>(backend: &B, a: RunArgs) -> Result<()> {
         t0.elapsed().as_secs_f64()
     );
 
-    let mut generator = Generator::new(backend, &model, a.ctx, a.block_size)?;
+    let mut generator = Generator::with_kv(backend, &model, a.ctx, a.block_size, a.kv_type)?;
     let mut sampler = Sampler::new(SamplerConfig { temperature: a.temperature, top_k: a.top_k, top_p: a.top_p, seed: a.seed });
     let mut stream = tok.stream(false);
     let mut out = std::io::stdout().lock();
@@ -345,7 +376,7 @@ fn run<B: Backend>(backend: &B, a: RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn compare(path: &PathBuf, prompt: &str, steps: usize, gpu: usize, block_size: usize, prefill_chunk: usize) -> Result<()> {
+fn compare(path: &PathBuf, prompt: &str, steps: usize, gpu: usize, block_size: usize, prefill_chunk: usize, kv: KvType) -> Result<()> {
     let g = Gguf::open(path)?;
     let tok = Tokenizer::from_gguf(&g)?;
     let cpu = CpuBackend::new();
@@ -354,8 +385,8 @@ fn compare(path: &PathBuf, prompt: &str, steps: usize, gpu: usize, block_size: u
     let (m_cpu, m_gpu) = (AnyModel::load(&cpu, &g)?, AnyModel::load(&cuda, &g)?);
     let ids = tok.encode(prompt)?;
     let ctx = ids.len() + steps + 1;
-    let mut a = Generator::new(&cpu, &m_cpu, ctx, block_size)?;
-    let mut b = Generator::new(&cuda, &m_gpu, ctx, block_size)?;
+    let mut a = Generator::with_kv(&cpu, &m_cpu, ctx, block_size, kv)?;
+    let mut b = Generator::with_kv(&cuda, &m_gpu, ctx, block_size, kv)?;
 
     let mut la = a.feed(&ids, prefill_chunk)?;
     let mut lb = b.feed(&ids, prefill_chunk)?;
@@ -496,7 +527,14 @@ fn compare_ref<B: Backend>(
     Ok(())
 }
 
-fn perplexity<B: Backend>(backend: &B, model_path: &PathBuf, file: &PathBuf, n_ctx: usize, max_chunks: Option<usize>) -> Result<()> {
+fn perplexity<B: Backend>(
+    backend: &B,
+    model_path: &PathBuf,
+    file: &PathBuf,
+    n_ctx: usize,
+    max_chunks: Option<usize>,
+    kv_type: KvType,
+) -> Result<()> {
     let g = Gguf::open(model_path)?;
     let tok = Tokenizer::from_gguf(&g)?;
     let model = AnyModel::load(backend, &g)?;
@@ -518,7 +556,7 @@ fn perplexity<B: Backend>(backend: &B, model_path: &PathBuf, file: &PathBuf, n_c
         {
             chunk[0] = b;
         }
-        let mut generator = Generator::new(backend, &model, n_ctx, 16)?;
+        let mut generator = Generator::with_kv(backend, &model, n_ctx, 16, kv_type)?;
         let logits = generator.feed_rows(&chunk, &rows)?;
         // Per-row negative log-likelihood of the next token; rows split
         // across threads (a full-vocab log-softmax per row is the slow part).
@@ -562,7 +600,15 @@ fn perplexity<B: Backend>(backend: &B, model_path: &PathBuf, file: &PathBuf, n_c
     Ok(())
 }
 
-fn bench<B: Backend>(backend: &B, model_path: &PathBuf, n_prompt: usize, n_gen: usize, reps: usize) -> Result<()> {
+fn bench<B: Backend>(
+    backend: &B,
+    model_path: &PathBuf,
+    n_prompt: usize,
+    n_gen: usize,
+    reps: usize,
+    depth: usize,
+    kv_type: KvType,
+) -> Result<()> {
     let g = Gguf::open(model_path)?;
     let model = AnyModel::load(backend, &g)?;
     let name = g.get_str("general.name").unwrap_or("model").to_string();
@@ -577,7 +623,8 @@ fn bench<B: Backend>(backend: &B, model_path: &PathBuf, n_prompt: usize, n_gen: 
         state ^= state << 17;
         (state % vocab) as u32
     };
-    let ctx = n_prompt.max(n_gen) + 1;
+    let ctx = depth + n_prompt.max(n_gen) + 1;
+    let context: Vec<u32> = (0..depth).map(|_| next_tok()).collect();
 
     let mut measure = |label: String, n: usize, batched: bool| -> Result<()> {
         if n == 0 {
@@ -585,9 +632,14 @@ fn bench<B: Backend>(backend: &B, model_path: &PathBuf, n_prompt: usize, n_gen: 
         }
         let tokens: Vec<u32> = (0..n).map(|_| next_tok()).collect();
         let mut rates = Vec::with_capacity(reps);
-        // First iteration is warmup.
+        // One cache for all iterations (CUDA graphs recorded in the warmup
+        // are tied to it); the first iteration is warmup.
+        let mut generator = Generator::with_kv(backend, &model, ctx, 16, kv_type)?;
         for i in 0..=reps {
-            let mut generator = Generator::new(backend, &model, ctx, 16)?;
+            generator.reset();
+            if depth > 0 {
+                generator.feed(&context, 512)?;
+            }
             backend.synchronize()?;
             let t0 = Instant::now();
             if batched {
@@ -609,7 +661,12 @@ fn bench<B: Backend>(backend: &B, model_path: &PathBuf, n_prompt: usize, n_gen: 
     };
     println!("| model | backend | test | t/s |");
     println!("|---|---|---|---:|");
-    measure(format!("pp{n_prompt}"), n_prompt, true)?;
-    measure(format!("tg{n_gen}"), n_gen, false)?;
+    let at = match (depth, kv_type) {
+        (0, KvType::F16) => String::new(),
+        (0, kv) => format!(" (KV {kv})"),
+        (d, kv) => format!(" @ d{d} (KV {kv})"),
+    };
+    measure(format!("pp{n_prompt}{at}"), n_prompt, true)?;
+    measure(format!("tg{n_gen}{at}"), n_gen, false)?;
     Ok(())
 }

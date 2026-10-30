@@ -71,6 +71,12 @@ pub struct ServeConfig {
     pub kv_tokens: Option<usize>,
     /// Reuse the KV of earlier requests that share a prompt prefix.
     pub prefix_cache: bool,
+    /// KV cache storage.
+    pub kv_type: rllm_core::KvType,
+    /// Draft model for speculative decoding.
+    pub draft: Option<PathBuf>,
+    /// Most tokens the draft proposes per step.
+    pub draft_tokens: usize,
     /// Save stored chat completions and responses here, and load them at start.
     pub store_file: Option<PathBuf>,
     /// Log one line per finished generation.
@@ -92,8 +98,20 @@ where
     let parallel = cfg.parallel.max(1);
     let kv_tokens = cfg.kv_tokens.unwrap_or(cfg.ctx * parallel).max(cfg.ctx);
     let metrics = Arc::new(Metrics::default());
-    let engine_cfg =
-        engine::EngineConfig { ctx: cfg.ctx, prefill_chunk: cfg.prefill_chunk, parallel, kv_tokens, prefix_cache: cfg.prefix_cache };
+    let draft = match &cfg.draft {
+        Some(p) => Some(Arc::new(Gguf::open(p).with_context(|| format!("open {}", p.display()))?)),
+        None => None,
+    };
+    let engine_cfg = engine::EngineConfig {
+        ctx: cfg.ctx,
+        prefill_chunk: cfg.prefill_chunk,
+        parallel,
+        kv_tokens,
+        prefix_cache: cfg.prefix_cache,
+        kv_type: cfg.kv_type,
+        draft,
+        draft_tokens: cfg.draft_tokens.max(1),
+    };
     let store = match &cfg.store_file {
         Some(p) => Store::load(p)?,
         None => Store::default(),
@@ -109,11 +127,16 @@ where
         format!("fp_{:010x}", h.finish() & 0xff_ffff_ffff)
     };
     eprintln!(
-        "[rllm] serving {model_id} ({}) on {}: context {} tokens, {parallel} parallel, KV pool {kv_tokens} tokens, prefix cache {}; loaded in {:.1} s",
+        "[rllm] serving {model_id} ({}) on {}: context {} tokens, {parallel} parallel, KV pool {kv_tokens} tokens ({}), prefix cache {}{}; loaded in {:.1} s",
         info.summary,
         info.backend,
         cfg.ctx,
+        cfg.kv_type,
         if cfg.prefix_cache { "on" } else { "off" },
+        match &info.draft {
+            Some(d) => format!(", draft model ({d}, up to {} tokens)", cfg.draft_tokens.max(1)),
+            None => String::new(),
+        },
         t0.elapsed().as_secs_f64()
     );
     let state = Arc::new(AppState {

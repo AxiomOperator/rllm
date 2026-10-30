@@ -16,7 +16,7 @@
 //! - Final logits are soft-capped: `cap * tanh(logits / cap)`.
 
 use anyhow::{Context, Result, bail};
-use rllm_core::{Activation, AttnMeta, Backend, HostTensor, KvLayout};
+use rllm_core::{Activation, AttnMeta, Backend, HostTensor, KvLayout, KvType};
 use rllm_gguf::{Gguf, Value};
 
 use crate::loader::{host_tensor, load_weight};
@@ -404,9 +404,9 @@ impl<B: Backend> Gemma4<B> {
 impl<B: Backend> Model<B> for Gemma4<B> {
     type Cache = Cache<B>;
 
-    fn alloc_cache(&self, b: &B, n_blocks: usize, block_size: usize) -> Result<Cache<B>> {
+    fn alloc_cache(&self, b: &B, n_blocks: usize, block_size: usize, kv: KvType) -> Result<Cache<B>> {
         let c = &self.cfg;
-        let layout = |n_layers, head_dim| KvLayout { n_layers, n_blocks, block_size, n_kv_heads: c.n_kv_heads, head_dim };
+        let layout = |n_layers, head_dim| KvLayout { n_layers, n_blocks, block_size, n_kv_heads: c.n_kv_heads, head_dim, dtype: kv };
         Ok(Cache {
             swa: b.alloc_kv(layout(self.n_swa_kv.max(1), c.head_dim_swa)).context("allocating sliding-window KV cache")?,
             global: b.alloc_kv(layout(self.n_global_kv.max(1), c.head_dim_global)).context("allocating global KV cache")?,

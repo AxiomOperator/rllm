@@ -9,7 +9,7 @@ fn main() {
     let b = CudaBackend::new(0).expect("cuda");
     for (n_heads, n_kv, hd, n) in [(16usize, 8usize, 128usize, 512usize), (8, 2, 256, 512), (8, 2, 512, 512), (16, 8, 128, 2048)] {
         let bs = 16;
-        let layout = KvLayout { n_layers: 1, n_blocks: n.div_ceil(bs), block_size: bs, n_kv_heads: n_kv, head_dim: hd };
+        let layout = KvLayout { n_layers: 1, n_blocks: n.div_ceil(bs), block_size: bs, n_kv_heads: n_kv, head_dim: hd, dtype: rllm_core::KvType::F16 };
         let mut kv = b.alloc_kv(layout).unwrap();
         let q = b.alloc(n * n_heads * hd).unwrap();
         let k = b.alloc(n * n_kv * hd).unwrap();

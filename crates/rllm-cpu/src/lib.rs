@@ -6,7 +6,7 @@
 
 use rayon::prelude::*;
 use rllm_core::quant::dequantize_row;
-use rllm_core::{AttnMeta, Backend, DType, Error, HostBytes, HostTensor, KvLayout, Result};
+use rllm_core::{AttnMeta, Backend, DType, Error, HostBytes, HostTensor, KvLayout, KvType, Result};
 
 pub struct CpuBackend;
 
@@ -340,6 +340,19 @@ impl Backend for CpuBackend {
             }
             kc[s * w..(s + 1) * w].copy_from_slice(&k[i * w..(i + 1) * w]);
             vc[s * w..(s + 1) * w].copy_from_slice(&v[i * w..(i + 1) * w]);
+            if kv.layout.dtype == KvType::Q8 {
+                // Same rounding as a q8 cache (values stay f32 here).
+                // Keys are quantized rotated and rotated back (H is its own
+                // inverse): what attention sees through a rotated q8 cache.
+                let hd = kv.layout.head_dim;
+                let rot = 1 << hd.trailing_zeros();
+                for chunk in kc[s * w..(s + 1) * w].chunks_exact_mut(rot) {
+                    fwht(chunk);
+                    chunk.chunks_exact_mut(32).for_each(q8_round);
+                    fwht(chunk);
+                }
+                vc[s * w..(s + 1) * w].chunks_exact_mut(32).for_each(q8_round);
+            }
         }
         Ok(())
     }
@@ -380,5 +393,33 @@ impl Backend for CpuBackend {
             }
         });
         Ok(())
+    }
+}
+
+/// Orthonormal fast Walsh-Hadamard transform (length a power of two).
+fn fwht(x: &mut [f32]) {
+    let n = x.len();
+    let mut h = 1;
+    while h < n {
+        for i in (0..n).step_by(2 * h) {
+            for j in i..i + h {
+                let (a, b) = (x[j], x[j + h]);
+                x[j] = a + b;
+                x[j + h] = a - b;
+            }
+        }
+        h *= 2;
+    }
+    let sc = 1.0 / (n as f32).sqrt();
+    x.iter_mut().for_each(|v| *v *= sc);
+}
+
+/// Round a group of 32 values as a q8 KV cache stores them: int8 times an
+/// f16 scale of max|x| / 127.
+fn q8_round(g: &mut [f32]) {
+    let d = g.iter().fold(0f32, |a, x| a.max(x.abs())) / 127.0;
+    let dh = half::f16::from_f32(d).to_f32();
+    for x in g {
+        *x = if d > 0.0 { (*x / d).round_ties_even() * dh } else { 0.0 };
     }
 }

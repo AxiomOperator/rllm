@@ -324,11 +324,13 @@ Nemotron over 25 steps, and one on Q8_0, at a position where the CPU
 reference's top two tokens are 0.029 logits apart.
 
 - **Nemotron is about 1.1–1.2× llama.cpp's floor on both GPUs; BF16 is at it
-  in absolute terms (KL below 1e-4).** rllm's CUDA output varies slightly from
-  run to run: split-K matmuls sum partial results with `atomicAdd`, whose
-  order isn't fixed. On the 35-position chat prompt that moved the KL between
-  3.5e-3 and 6.8e-3 across recent builds, so single readings understate the
-  spread.
+  in absolute terms (KL below 1e-4).** When these were measured, rllm's CUDA
+  output varied slightly from run to run: split-K matmuls summed partial
+  results with `atomicAdd`, whose order isn't fixed. On the 35-position chat
+  prompt that moved the KL between 3.5e-3 and 6.8e-3 across recent builds.
+  Since then the sums run in a fixed order and the same tokens give
+  bit-identical logits on every run (see
+  [Deterministic reductions](#deterministic-reductions-q8-kv-cache-and-speculative-decoding)).
 - **Q8_0 sits above the floor,** as in every comparison since the start, and
   Q4_K_M is above the (smaller) Ada floor. The disagreements are at
   low-confidence positions in the prompt; generated text matches.
@@ -436,6 +438,54 @@ Notes:
   - Sampling now works in place and is vectorized, and the engine thread pins itself to the P-cores. A step now takes 7.69 ms.
   - Temperature sampling over the 262k vocabulary went from 0.86 to 0.08 ms per token (laptop CPU).
 
+## Deterministic reductions, q8 KV cache and speculative decoding
+
+Three later additions, measured on the RTX 6000 Ada (details and laptop
+numbers in `docs/server.md`).
+
+**Deterministic reductions.** Prefill matmuls split along k (MMQ) with three
+or more splits now write their partial tiles to a buffer that a small kernel
+sums in split order; two splits still `atomicAdd` into a zeroed output,
+which is order-independent (x + y = y + x). Same tokens, same logits, every
+run: checked bit for bit on Qwen3-0.6B (forced through MMQ), Qwen3-8B and
+Nemotron on both GPUs (`crates/rllm-model/tests/gpu.rs`). The cost is in
+prefill only: pp512 0–1.8% slower on the Ada (Nemotron within noise,
+Qwen3-8B 6560 vs 6678 tok/s), 1.5–3% on the laptop. (Summing in the last
+block to finish each tile, llama.cpp's stream-k style, measured 13% slower
+here: it cost registers and occupancy.)
+
+**q8 KV cache** (`--kv-type q8`): int8 with a scale per 32 values, keys
+rotated by a Walsh–Hadamard matrix as llama.cpp does. Perplexity is within
+noise of f16 on Qwen3-8B and Nemotron (+0.19% on Qwen3-0.6B at ctx 512,
+llama.cpp's q8_0 +0.21% on the same chunks). Decode attention also got a
+split-context (flash-decoding) path for long contexts, which helps f16 as
+well.
+
+| Qwen3-8B Q4_K_M | rllm f16 | rllm q8 | llama.cpp f16 | llama.cpp q8_0 |
+|---|---:|---:|---:|---:|
+| tg64, empty context | 143.1 | 141.0 | 153.3 | 146.9 |
+| tg64 @ 8k context | 110.4 | 121.8 | 125.5 | 124.9 |
+| tg64 @ 32k context | 71.4 | **88.0** | 82.3 | 79.5 |
+| pp512 @ 32k context | 2593 | 2477 | 3261 | 3180 |
+
+(`rllm bench --depth N --kv-type q8` and `llama-bench -d N -ctk q8_0 -ctv
+q8_0 -fa 1`.) Nemotron: q8 decodes 7% faster at 32k context and 1.7%
+slower with an empty context.
+
+**Speculative decoding** (`rllm serve --draft`): Qwen3-8B Q4_K_M with
+Qwen3-0.6B Q8_0 as the draft, same harness as the serving section.
+
+| Qwen3-8B Q4_K_M | rllm | rllm + draft | llama-server | llama-server + draft |
+|---|---:|---:|---:|---:|
+| Single request, 6 mixed prompts, tok/s | 141 | **213** | 146 | 126 |
+| Single request, list continuation, tok/s | 140 | **246** | 143 | 134 |
+| 4 clients: total output, tok/s | 475 | **515** | 401 | 189 |
+| 8 clients: total output, tok/s | 762 | 745 | 528 | 355 |
+
+Greedy output with the draft is token for token the same as without it
+(six prompts compared). llama-server used `--spec-type draft-simple` with its
+default 3 draft tokens; 8 was slower still.
+
 ## Known gaps
 
 - **Prefill activation quantization on small GPUs:** on the RTX 6000 Ada no
@@ -450,9 +500,22 @@ Notes:
   to 13% and the GPU was power-capped (both rllm builds then measured the same
   ~12 tok/s), so the last decode change (float-weight fused FFN) was
   benchmarked on the Ada only; the laptop table is from the run before it.
-- **Run-to-run variation on CUDA:** split-K accumulates with `atomicAdd`, so
-  logits differ slightly between runs (see "Correctness on GPU"). A
-  deterministic reduction (like llama.cpp's stream-k fixup) would remove it.
+- **Qwen3-8B Q4_K_M vs llama.cpp (Ada):** llama.cpp prefills 1.4× faster
+  (pp512 9380 vs 6640 tok/s) and decodes 7% faster with an empty context; at
+  32k context its f16 decode is 15% faster than rllm's f16 (rllm's q8 beats
+  both). The earlier tables cover Qwen3-0.6B and Nemotron, where rllm leads
+  or matches.
+- **q8 KV prefill:** steps longer than 8 tokens expand the blocks they read
+  into f16 before the tensor-core kernels run: 1–4% slower prefill at depth.
+- **Speculative decoding on Gemma 4:** its one-token steps use fused kernels
+  the multi-token verification step doesn't, so greedy output with a draft
+  matches as closely as batched requests do rather than bit for bit (Qwen3
+  matches exactly). The draft model has no prefix cache: each request's
+  draft cache reads its whole prompt at the first decode step. `rllm run`
+  has no `--draft`; the server does.
+- **Several backends in one process:** two `CudaBackend`s recording CUDA
+  graphs at once (only possible in tests) disturb each other's decode
+  steps, so the GPU tests take a lock. The binaries create one backend.
 - **Q4_K on CPU:** emulating llama.cpp's activation rounding doesn't narrow the
   gap. llama.cpp uses repacked Q4_K kernels on AVX2, whose rounding isn't
   mirrored. The gap is still within llama.cpp's own noise floor.

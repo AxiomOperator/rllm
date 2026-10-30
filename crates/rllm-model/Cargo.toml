@@ -10,3 +10,7 @@ rllm-core.workspace = true
 rllm-gguf.workspace = true
 rllm-kv.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+rllm-cuda.workspace = true
+rllm-tokenizer.workspace = true

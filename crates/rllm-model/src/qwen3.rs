@@ -5,7 +5,7 @@
 //! RMSNorm → SwiGLU MLP → residual.
 
 use anyhow::{Context, Result, bail};
-use rllm_core::{Activation, AttnMeta, Backend, KvLayout};
+use rllm_core::{Activation, AttnMeta, Backend, KvLayout, KvType};
 use rllm_gguf::Gguf;
 
 use crate::loader::load_weight;
@@ -61,13 +61,14 @@ impl Qwen3Config {
         self.n_kv_heads * self.head_dim
     }
 
-    pub fn kv_layout(&self, n_blocks: usize, block_size: usize) -> KvLayout {
+    pub fn kv_layout(&self, n_blocks: usize, block_size: usize, dtype: KvType) -> KvLayout {
         KvLayout {
             n_layers: self.n_layers,
             n_blocks,
             block_size,
             n_kv_heads: self.n_kv_heads,
             head_dim: self.head_dim,
+            dtype,
         }
     }
 }
@@ -204,8 +205,8 @@ impl<B: Backend> Qwen3<B> {
 impl<B: Backend> Model<B> for Qwen3<B> {
     type Cache = B::KvCache;
 
-    fn alloc_cache(&self, b: &B, n_blocks: usize, block_size: usize) -> Result<B::KvCache> {
-        Ok(b.alloc_kv(self.cfg.kv_layout(n_blocks, block_size))?)
+    fn alloc_cache(&self, b: &B, n_blocks: usize, block_size: usize, kv: KvType) -> Result<B::KvCache> {
+        Ok(b.alloc_kv(self.cfg.kv_layout(n_blocks, block_size, kv))?)
     }
 
     fn forward(&self, b: &B, cache: &mut B::KvCache, batch: &Batch, block_size: usize) -> Result<Vec<f32>> {

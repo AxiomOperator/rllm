@@ -25,6 +25,10 @@ pub struct Metrics {
     pub generated_tokens: AtomicU64,
     pub embedded_tokens: AtomicU64,
     pub preemptions: AtomicU64,
+    /// Speculative decoding: tokens the draft proposed, and how many the
+    /// model accepted.
+    pub draft_tokens: AtomicU64,
+    pub draft_accepted: AtomicU64,
     pub steps: AtomicU64,
     pub step_tokens: AtomicU64,
     /// Time spent in forward passes and sampling, microseconds.
@@ -66,6 +70,8 @@ impl Metrics {
         one("generation_tokens_total", "counter", "Generated tokens.", get(&self.generated_tokens) as f64);
         one("embedding_tokens_total", "counter", "Tokens embedded.", get(&self.embedded_tokens) as f64);
         one("preemptions_total", "counter", "Generations paused to free KV blocks.", get(&self.preemptions) as f64);
+        one("draft_tokens_total", "counter", "Tokens proposed by the draft model.", get(&self.draft_tokens) as f64);
+        one("draft_tokens_accepted_total", "counter", "Draft tokens the model accepted.", get(&self.draft_accepted) as f64);
         one("engine_steps_total", "counter", "Forward passes.", get(&self.steps) as f64);
         one("engine_step_tokens_total", "counter", "Tokens processed by forward passes.", get(&self.step_tokens) as f64);
         one("engine_busy_seconds_total", "counter", "Time spent in forward passes and sampling.", get(&self.busy_us) as f64 / 1e6);

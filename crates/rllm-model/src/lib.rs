@@ -5,13 +5,13 @@ pub mod qwen3;
 pub mod sampler;
 
 use anyhow::{Result, bail};
-use rllm_core::Backend;
+use rllm_core::{Backend, KvType};
 use rllm_gguf::Gguf;
 
 pub use gemma4::{Gemma4, Gemma4Config};
 pub use generate::{Generator, KvPool, StepItem, Want};
 pub use qwen3::{Qwen3, Qwen3Config};
-pub use sampler::{Sampler, SamplerConfig, log_sum_exp, top_candidates};
+pub use sampler::{Dist, Sampler, SamplerConfig, log_sum_exp, top_candidates};
 
 /// One forward step over a flattened batch of tokens (see [`rllm_core::AttnMeta`]).
 pub struct Batch<'a> {
@@ -26,13 +26,17 @@ pub struct Batch<'a> {
     /// Return those rows' final (normalized) hidden states, `[rows, hidden]`,
     /// instead of logits (for embeddings).
     pub hidden: bool,
+    /// Identifies the KV cache the step uses (see [`Batch::graph_key`]).
+    pub cache_id: u64,
 }
 
 impl Batch<'_> {
     /// Graph key for `Backend::begin_step`: decode-sized steps with the same
     /// shapes share one. Block tables are keyed by their padded width (the
     /// CUDA backend pads to a power of two), so the key stays stable while
-    /// the context grows. Prefill (large steps) runs eagerly.
+    /// the context grows. Prefill (large steps) runs eagerly. A recorded
+    /// step holds the KV cache's device addresses, so the cache is part of
+    /// the key: a new cache never replays steps recorded for an old one.
     pub fn graph_key(&self, model_id: usize) -> Option<u64> {
         use std::hash::{Hash, Hasher};
         if self.tokens.len() > 8 {
@@ -40,7 +44,7 @@ impl Batch<'_> {
         }
         let width = self.block_tables.iter().map(Vec::len).max().unwrap_or(0).max(1).next_power_of_two();
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (model_id, self.tokens.len(), self.block_tables.len(), width, self.logit_rows.len(), self.hidden).hash(&mut h);
+        (model_id, self.cache_id, self.tokens.len(), self.block_tables.len(), width, self.logit_rows.len(), self.hidden).hash(&mut h);
         Some(h.finish())
     }
 }
@@ -50,7 +54,7 @@ pub trait Model<B: Backend> {
     /// The model's KV cache (some architectures need more than one pool).
     type Cache;
 
-    fn alloc_cache(&self, b: &B, n_blocks: usize, block_size: usize) -> Result<Self::Cache>;
+    fn alloc_cache(&self, b: &B, n_blocks: usize, block_size: usize, kv: KvType) -> Result<Self::Cache>;
 
     /// Run one step. Returns logits `[batch.logit_rows.len(), vocab]` on the host
     /// (or hidden states `[rows, hidden_size]` if `batch.hidden`).
@@ -86,10 +90,10 @@ impl<B: Backend> AnyModel<B> {
 impl<B: Backend> Model<B> for AnyModel<B> {
     type Cache = AnyCache<B>;
 
-    fn alloc_cache(&self, b: &B, n_blocks: usize, block_size: usize) -> Result<AnyCache<B>> {
+    fn alloc_cache(&self, b: &B, n_blocks: usize, block_size: usize, kv: KvType) -> Result<AnyCache<B>> {
         Ok(match self {
-            Self::Qwen3(m) => AnyCache::Qwen3(m.alloc_cache(b, n_blocks, block_size)?),
-            Self::Gemma4(m) => AnyCache::Gemma4(m.alloc_cache(b, n_blocks, block_size)?),
+            Self::Qwen3(m) => AnyCache::Qwen3(m.alloc_cache(b, n_blocks, block_size, kv)?),
+            Self::Gemma4(m) => AnyCache::Gemma4(m.alloc_cache(b, n_blocks, block_size, kv)?),
         })
     }
 

@@ -70,6 +70,9 @@ def chat(session, base, model, messages, args):
     try:
         with session.post(f'{base}/v1/chat/completions', json=payload, timeout=(10, args.timeout), stream=args.stream) as response:
             response.raise_for_status()
+            # SSE is UTF-8, but without a charset in the Content-Type requests
+            # decodes text/* as Latin-1, garbling emoji into terminal control codes.
+            response.encoding = 'utf-8'
             if args.stream:
                 for raw_line in response.iter_lines(decode_unicode=True):
                     if not raw_line or not raw_line.startswith('data:'):

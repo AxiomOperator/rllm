@@ -42,7 +42,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::extract::{MatchedPath, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -284,6 +284,11 @@ async fn headers(State(state): State<Arc<AppState>>, req: Request, next: Next) -
     h.insert("openai-version", HeaderValue::from_static("2020-10-01"));
     if let Some(id) = client_id {
         h.insert("x-client-request-id", id);
+    }
+    // axum's Sse omits the charset; clients such as Python requests then
+    // decode the stream as Latin-1 and garble non-ASCII text.
+    if h.get(header::CONTENT_TYPE).is_some_and(|v| v == "text/event-stream") {
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream; charset=utf-8"));
     }
     state.metrics.record_http(&method, &route, res.status().as_u16(), t0.elapsed().as_secs_f64());
     if res.status() == StatusCode::METHOD_NOT_ALLOWED {

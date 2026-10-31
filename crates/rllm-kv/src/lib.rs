@@ -50,6 +50,11 @@ impl BlockAllocator {
         (n <= self.free.len()).then(|| (0..n).map(|_| self.alloc().expect("checked above")).collect())
     }
 
+    /// References held to `block` (0: free).
+    pub fn refcount(&self, block: u32) -> u32 {
+        self.refcount[block as usize]
+    }
+
     /// Add a reference to an allocated block (prefix sharing).
     pub fn share(&mut self, block: u32) {
         let rc = &mut self.refcount[block as usize];
@@ -238,22 +243,17 @@ impl PrefixCache {
     pub fn lookup(&mut self, store: &mut impl BlockStore, tokens: &[u32]) -> (usize, Vec<u32>) {
         let bs = store.device().block_size();
         let limit = tokens.len().saturating_sub(1) / bs;
-        // Best match on the device and on the host: (entry, blocks).
-        let mut best: [Option<(usize, usize)>; 2] = [None, None];
-        for (i, e) in self.entries.iter().enumerate() {
-            let common = e.tokens.iter().zip(tokens).take_while(|(a, b)| a == b).count();
-            let n = (common / bs).min(limit).min(e.blocks.len());
-            let b = &mut best[e.on_host as usize];
-            if n > 0 && b.is_none_or(|(_, m)| n > m) {
-                *b = Some((i, n));
-            }
-        }
+        let mut best = self.best_matches(tokens, bs, limit);
         let on_device = best[0].map_or(0, |b| b.1);
         if let Some((i, n)) = best[1]
             && n > on_device
-            && let Some(hit) = self.restore(store, i, n)
         {
-            return hit;
+            if let Some(hit) = self.restore(store, i, n) {
+                return hit;
+            }
+            // A failed restore reorders and may evict entries: the device
+            // match found above can point at another entry now.
+            best = self.best_matches(tokens, bs, limit);
         }
         let Some((i, n)) = best[0] else {
             return (0, Vec::new());
@@ -264,6 +264,20 @@ impl PrefixCache {
             store.device().share(b);
         }
         (n * bs, blocks)
+    }
+
+    /// Best match on the device and on the host: (entry index, blocks).
+    fn best_matches(&self, tokens: &[u32], bs: usize, limit: usize) -> [Option<(usize, usize)>; 2] {
+        let mut best: [Option<(usize, usize)>; 2] = [None, None];
+        for (i, e) in self.entries.iter().enumerate() {
+            let common = e.tokens.iter().zip(tokens).take_while(|(a, b)| a == b).count();
+            let n = (common / bs).min(limit).min(e.blocks.len());
+            let b = &mut best[e.on_host as usize];
+            if n > 0 && b.is_none_or(|(_, m)| n > m) {
+                *b = Some((i, n));
+            }
+        }
+        best
     }
 
     /// Copy the first `n` blocks of host entry `i` back to the device as a
@@ -360,7 +374,13 @@ impl PrefixCache {
     /// Free the least recently used device entry's blocks, moving it to the
     /// host tier if there is one. False if no device entry is left.
     pub fn evict(&mut self, store: &mut impl BlockStore) -> bool {
-        let lru = self.entries.iter().enumerate().filter(|(_, e)| !e.on_host).min_by_key(|(_, e)| e.used).map(|(i, _)| i);
+        self.evict_where(store, |_, _| true)
+    }
+
+    /// Evict the least recently used device entry that `pick` accepts.
+    fn evict_where(&mut self, store: &mut impl BlockStore, pick: impl Fn(&Entry, &BlockAllocator) -> bool) -> bool {
+        let dev = store.device();
+        let lru = self.entries.iter().enumerate().filter(|(_, e)| !e.on_host && pick(e, dev)).min_by_key(|(_, e)| e.used).map(|(i, _)| i);
         let Some(i) = lru else {
             return false;
         };
@@ -406,8 +426,17 @@ impl PrefixCache {
 
     /// Evict until `need` device blocks are free (or nothing is left to evict).
     pub fn make_room(&mut self, store: &mut impl BlockStore, need: usize) -> bool {
+        // Blocks only the cache holds: evicting is pointless (and costs a
+        // copy to the host tier) when even all of them are too few.
+        let sole = |e: &Entry, dev: &BlockAllocator| e.blocks.iter().filter(|&&b| dev.refcount(b) == 1).count();
+        let dev = store.device();
+        let freeable: usize = self.entries.iter().filter(|e| !e.on_host).map(|e| sole(e, dev)).sum();
+        if dev.n_free() + freeable < need {
+            return false;
+        }
         while store.device().n_free() < need {
-            if !self.evict(store) {
+            // Skip entries whose blocks running sequences still hold.
+            if !self.evict_where(store, |e, dev| sole(e, dev) > 0) {
                 return false;
             }
         }
@@ -522,11 +551,12 @@ mod tests {
         host: BlockAllocator,
         dev_data: Vec<u32>,
         host_data: Vec<u32>,
+        fail_restore: bool,
     }
 
     impl TwoTier {
         fn new(dev: usize, host: usize, bs: usize) -> Self {
-            Self { dev: BlockAllocator::new(dev, bs), host: BlockAllocator::new(host, bs), dev_data: vec![0; dev], host_data: vec![0; host] }
+            Self { dev: BlockAllocator::new(dev, bs), host: BlockAllocator::new(host, bs), dev_data: vec![0; dev], host_data: vec![0; host], fail_restore: false }
         }
 
         /// A sequence holding `tokens`; each block's payload is its first token.
@@ -555,6 +585,9 @@ mod tests {
             Ok(())
         }
         fn to_device(&mut self, host: &[u32], dev: &[u32]) -> Result<()> {
+            if self.fail_restore {
+                return Err(Error::Copy("injected".into()));
+            }
             for (&h, &d) in host.iter().zip(dev) {
                 self.dev_data[d as usize] = self.host_data[h as usize];
             }
@@ -636,5 +669,51 @@ mod tests {
         assert_eq!(n, 4);
         assert_eq!(pc.stats().restored, 0);
         blocks.into_iter().for_each(|b| st.dev.release(b));
+    }
+
+    #[test]
+    fn failed_restore_falls_back_to_the_device_match() {
+        let mut st = TwoTier::new(8, 8, 2);
+        let mut pc = PrefixCache::default();
+        // Keep host block ids apart from device ones.
+        let pad = st.host.alloc_n(4).unwrap();
+        let a: Vec<u32> = (0..6).collect();
+        let s = st.seq(&a);
+        pc.insert(&mut st, &a, s);
+        assert!(pc.make_room(&mut st, 8));
+        pad.into_iter().for_each(|b| st.host.release(b));
+        // Entries: [a (host), x, d]; the failed restore reorders them.
+        let mut d_blocks = Vec::new();
+        for t in [vec![50, 51, 52, 53], vec![0, 1, 9, 9]] {
+            let s = st.seq(&t);
+            d_blocks = s.block_table.clone();
+            pc.insert(&mut st, &t, s);
+        }
+        st.fail_restore = true;
+        let (n, blocks) = pc.lookup(&mut st, &[0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(n, 2);
+        assert_eq!(blocks, d_blocks[..1]);
+        assert_eq!((pc.len(), pc.host_len()), (2, 1));
+        blocks.into_iter().for_each(|b| st.dev.release(b));
+        pc.clear(&mut st);
+        assert_eq!((st.dev.n_free(), st.host.n_free()), (8, 8));
+    }
+
+    #[test]
+    fn make_room_keeps_entries_that_free_nothing() {
+        let mut st = TwoTier::new(6, 8, 2);
+        let mut pc = PrefixCache::default();
+        let a: Vec<u32> = (0..4).collect();
+        let s = st.seq(&a);
+        pc.insert(&mut st, &a, s);
+        // A running sequence holds `a`'s blocks.
+        let (n, held) = pc.lookup(&mut st, &[0, 1, 2, 3, 4]);
+        assert_eq!(n, 4);
+        // Evicting `a` would free nothing: no eviction, no copy to the host.
+        assert!(!pc.make_room(&mut st, 5));
+        assert_eq!((pc.len(), pc.host_len(), pc.stats().offloaded), (1, 0, 0));
+        held.into_iter().for_each(|b| st.dev.release(b));
+        assert!(pc.make_room(&mut st, 6));
+        assert_eq!((pc.len(), pc.host_len()), (0, 1));
     }
 }

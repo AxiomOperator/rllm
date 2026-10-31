@@ -32,6 +32,12 @@ impl Sampler {
         if self.cfg.temperature <= 0.0 {
             return argmax(logits);
         }
+        let clean = without_nans(logits);
+        let logits = &*clean;
+        if !max_of(logits).is_finite() {
+            // Nothing to weigh (every logit -inf), or +inf logits: they win.
+            return argmax(logits);
+        }
         // No truncation: sample the full distribution (no sort).
         if self.cfg.top_k == 0 && self.cfg.top_p >= 1.0 {
             let (inv_t, max) = (1.0 / self.cfg.temperature, max_of(logits));
@@ -123,6 +129,11 @@ impl Sampler {
     /// The distribution [`Self::sample`] draws from for these logits.
     pub fn dist(&mut self, logits: &[f32]) -> Dist {
         if self.cfg.temperature <= 0.0 {
+            return Dist::Point(argmax(logits));
+        }
+        let clean = without_nans(logits);
+        let logits = &*clean;
+        if !max_of(logits).is_finite() {
             return Dist::Point(argmax(logits));
         }
         if self.cfg.top_k == 0 && self.cfg.top_p >= 1.0 {
@@ -237,6 +248,16 @@ impl DistLookup<'_> {
 }
 
 const LANES: usize = 16;
+
+/// NaN logits (a broken model or weights) as -inf, so they are never drawn
+/// and don't poison the sums. Borrowed when there are none.
+fn without_nans(x: &[f32]) -> std::borrow::Cow<'_, [f32]> {
+    if x.iter().any(|v| v.is_nan()) {
+        x.iter().map(|&v| if v.is_nan() { f32::NEG_INFINITY } else { v }).collect()
+    } else {
+        std::borrow::Cow::Borrowed(x)
+    }
+}
 
 fn max_of(x: &[f32]) -> f32 {
     let mut lanes = [f32::NEG_INFINITY; LANES];
@@ -439,6 +460,19 @@ mod speed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nan_logits_never_win_or_panic() {
+        let x = [f32::NAN, 0.0, f32::NAN, 1.0];
+        for (k, p) in [(0, 1.0), (2, 1.0), (0, 0.9), (2, 0.5)] {
+            let mut s = Sampler::new(SamplerConfig { temperature: 1.0, top_k: k, top_p: p, seed: 3 });
+            for _ in 0..50 {
+                assert!(matches!(s.sample(&x), 1 | 3));
+            }
+            assert_eq!(s.sample(&[f32::NAN; 8]), 0);
+            s.dist(&[f32::NAN; 8]);
+        }
+    }
 
     fn random_logits(n: usize, seed: u64, scale: f32) -> Vec<f32> {
         let mut r = SplitMix64(seed);

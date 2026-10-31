@@ -14,6 +14,10 @@ use rllm_core::DType;
 
 const MAGIC: u32 = 0x4655_4747; // "GGUF" little-endian
 const DEFAULT_ALIGNMENT: u64 = 32;
+/// GGML tensors have at most 4 dims; anything far beyond is corrupt.
+const MAX_DIMS: u32 = 8;
+/// Arrays of arrays: real files nest one level.
+const MAX_NESTING: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -39,6 +43,8 @@ pub enum Error {
     KeyType(String),
     #[error("missing tensor {0}")]
     MissingTensor(String),
+    #[error("malformed GGUF: {0}")]
+    Malformed(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -172,11 +178,13 @@ impl Gguf {
         let n_tensors = r.u64("tensor count")?;
         let n_kv = r.u64("kv count")?;
 
-        let mut metadata = Vec::with_capacity(n_kv as usize);
+        // Corrupt counts must not size allocations: every entry takes at
+        // least a dozen bytes of the file.
+        let mut metadata = Vec::with_capacity((n_kv as usize).min(mmap.len() / 12));
         for _ in 0..n_kv {
             let key = r.string()?;
             let ty = r.u32("value type")?;
-            let value = r.value(ty)?;
+            let value = r.value(ty, 0)?;
             metadata.push((key, value));
         }
         let meta_index: HashMap<String, usize> =
@@ -186,11 +194,17 @@ impl Gguf {
             .get("general.alignment")
             .and_then(|&i| metadata[i].1.as_u64())
             .unwrap_or(DEFAULT_ALIGNMENT);
+        if !alignment.is_power_of_two() {
+            return Err(Error::Malformed(format!("alignment {alignment}")));
+        }
 
-        let mut raw = Vec::with_capacity(n_tensors as usize);
+        let mut raw = Vec::with_capacity((n_tensors as usize).min(mmap.len() / 24));
         for _ in 0..n_tensors {
             let name = r.string()?;
             let n_dims = r.u32("n_dims")?;
+            if n_dims > MAX_DIMS {
+                return Err(Error::Malformed(format!("tensor {name} has {n_dims} dims")));
+            }
             let dims = (0..n_dims).map(|_| r.u64("dim")).collect::<Result<Vec<_>>>()?;
             let ty = r.u32("tensor type")?;
             let offset = r.u64("tensor offset")?;
@@ -203,12 +217,20 @@ impl Gguf {
             let Some(dtype) = DType::from_ggml(ty) else {
                 return Err(Error::TensorType(name, ty));
             };
-            let numel: u64 = dims.iter().product();
+            // Checked: a tensor's elements can't outnumber the file's bits.
+            let numel = dims.iter().try_fold(1u64, |a, &d| a.checked_mul(d)).filter(|&n| n <= mmap.len() as u64 * 8);
+            let Some(numel) = numel else {
+                return Err(Error::TensorBounds(name));
+            };
+            if numel % dtype.block_size() as u64 != 0 {
+                return Err(Error::Malformed(format!("tensor {name}: {numel} elements is not a whole number of {dtype} blocks")));
+            }
             let size = dtype.row_bytes(numel as usize);
-            let offset = (data_start + offset) as usize;
-            if offset + size > mmap.len() {
+            let end = data_start.checked_add(offset).and_then(|o| o.checked_add(size as u64));
+            if end.is_none_or(|e| e > mmap.len() as u64) {
                 return Err(Error::TensorBounds(name));
             }
+            let offset = (data_start + offset) as usize;
             tensors.push(TensorInfo { name, dims, dtype, offset, size });
         }
         let tensor_index = tensors.iter().enumerate().map(|(i, t)| (t.name.clone(), i)).collect();
@@ -290,7 +312,7 @@ impl Reader<'_> {
         String::from_utf8(bytes.to_vec()).map_err(|_| Error::Utf8)
     }
 
-    fn value(&mut self, ty: u32) -> Result<Value> {
+    fn value(&mut self, ty: u32, depth: usize) -> Result<Value> {
         Ok(match ty {
             0 => Value::U8(self.array::<1>("u8")?[0]),
             1 => Value::I8(self.array::<1>("i8")?[0] as i8),
@@ -303,12 +325,15 @@ impl Reader<'_> {
             8 => Value::String(self.string()?),
             9 => {
                 let item_ty = self.u32("array type")?;
+                if item_ty == 9 && depth >= MAX_NESTING {
+                    return Err(Error::Malformed("arrays nested too deeply".into()));
+                }
                 let len = self.u64("array length")? as usize;
                 // Cap the preallocation so a corrupt length can't OOM us before
                 // the EOF check fires.
                 let mut items = Vec::with_capacity(len.min(1 << 20));
                 for _ in 0..len {
-                    items.push(self.value(item_ty)?);
+                    items.push(self.value(item_ty, depth + 1)?);
                 }
                 Value::Array(items)
             }
@@ -317,5 +342,79 @@ impl Reader<'_> {
             12 => Value::F64(f64::from_le_bytes(self.array("f64")?)),
             t => return Err(Error::ValueType(t)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A header with `n_tensors` and the given metadata/tensor bytes.
+    fn file(n_tensors: u64, n_kv: u64, body: &[u8]) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend(MAGIC.to_le_bytes());
+        f.extend(3u32.to_le_bytes());
+        f.extend(n_tensors.to_le_bytes());
+        f.extend(n_kv.to_le_bytes());
+        f.extend(body);
+        f
+    }
+
+    fn string(s: &str) -> Vec<u8> {
+        let mut b = (s.len() as u64).to_le_bytes().to_vec();
+        b.extend(s.as_bytes());
+        b
+    }
+
+    fn parse(bytes: &[u8]) -> Result<Gguf> {
+        let path = std::env::temp_dir().join(format!("rllm-gguf-test-{}-{:x}.gguf", std::process::id(), bytes.len() ^ bytes.iter().map(|&b| b as usize).sum::<usize>()));
+        std::fs::write(&path, bytes).unwrap();
+        let r = Gguf::open(&path);
+        std::fs::remove_file(&path).unwrap();
+        r
+    }
+
+    fn tensor(name: &str, dims: &[u64], ty: u32, offset: u64) -> Vec<u8> {
+        let mut b = string(name);
+        b.extend((dims.len() as u32).to_le_bytes());
+        dims.iter().for_each(|d| b.extend(d.to_le_bytes()));
+        b.extend(ty.to_le_bytes());
+        b.extend(offset.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn valid_file_parses() {
+        let mut body = tensor("w", &[4, 2], 0, 0);
+        body.resize(body.len() + 64, 0);
+        let g = parse(&file(1, 0, &body)).unwrap();
+        assert_eq!(g.tensors[0].size, 32);
+    }
+
+    #[test]
+    fn malformed_files_are_errors() {
+        // Huge counts: no giant reservation, just EOF.
+        assert!(matches!(parse(&file(u64::MAX / 2, u64::MAX / 2, &[])), Err(Error::Eof(_))));
+        // Alignment 0.
+        let mut body = string("general.alignment");
+        body.extend(4u32.to_le_bytes());
+        body.extend(0u32.to_le_bytes());
+        assert!(matches!(parse(&file(0, 1, &body)), Err(Error::Malformed(_))));
+        // Arrays nested a million deep.
+        let mut body = string("k");
+        body.extend(9u32.to_le_bytes());
+        for _ in 0..1_000_000 {
+            body.extend(9u32.to_le_bytes());
+            body.extend(1u64.to_le_bytes());
+        }
+        assert!(matches!(parse(&file(0, 1, &body)), Err(Error::Malformed(_))));
+        // Offsets and sizes that wrap around.
+        for t in [tensor("w", &[4], 0, u64::MAX - 8), tensor("w", &[1 << 32, 1 << 32, 16], 0, 0), tensor("w", &[3], 8, 0)] {
+            let mut body = t;
+            body.resize(body.len() + 64, 0);
+            assert!(matches!(parse(&file(1, 0, &body)), Err(Error::TensorBounds(_) | Error::Malformed(_))));
+        }
+        // Too many dims.
+        assert!(matches!(parse(&file(1, 0, &tensor("w", &[1; 9], 0, 0))), Err(Error::Malformed(_))));
     }
 }

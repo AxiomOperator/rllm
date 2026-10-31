@@ -86,8 +86,11 @@ impl Batch<'_> {
             return None;
         }
         let width = self.block_tables.iter().map(Vec::len).max().unwrap_or(0).max(1).next_power_of_two();
+        // How the tokens split into sequences: attention tiles runs of one
+        // sequence's tokens, and the tile count sets launch sizes.
+        let runs = (1..n).filter(|&i| self.token_seq[i] == self.token_seq[i - 1]).fold(0u64, |m, i| m | 1 << i);
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (model_id, self.cache_id, self.tokens.len(), self.block_tables.len(), width, self.logit_rows.len(), self.hidden).hash(&mut h);
+        (model_id, self.cache_id, self.tokens.len(), self.block_tables.len(), width, self.logit_rows.len(), self.hidden, runs).hash(&mut h);
         Some(h.finish())
     }
 }

@@ -897,7 +897,8 @@ extern "C" __global__ void __launch_bounds__(1024) sample_rows(const float* __re
         for (int i = threadIdx.x; i < vocab; i += blockDim.x)
             if (x[i] > bv) bv = x[i], best = i;
         best = block_argmax(bv, best, sv, si);
-        if (threadIdx.x == 0) out[blockIdx.x] = best;
+        // No candidate (all NaN or -inf): token 0, like the reference.
+        if (threadIdx.x == 0) out[blockIdx.x] = best < vocab ? best : 0;
         return;
     }
     const float inv_t = 1.f / temp;
@@ -949,7 +950,7 @@ extern "C" __global__ void __launch_bounds__(1024) sample_rows(const float* __re
         }
     }
     best = block_argmax(bv, best, sv, si);
-    if (threadIdx.x == 0) out[blockIdx.x] = best;
+    if (threadIdx.x == 0) out[blockIdx.x] = best < vocab ? best : 0;
 }
 
 // x = (x + rmsnorm(src) * w) * scale; if has_next: out = rmsnorm(x) * w2.

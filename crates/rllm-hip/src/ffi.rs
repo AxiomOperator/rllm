@@ -74,6 +74,7 @@ api!(Hip {
     fn hipHostGetDevicePointer(*mut *mut c_void, *mut c_void, c_uint) -> HipError;
     fn hipModuleLoadData(*mut Module, *const c_void) -> HipError;
     fn hipModuleGetFunction(*mut Function, Module, *const c_char) -> HipError;
+    fn hipModuleUnload(Module) -> HipError;
     fn hipModuleLaunchKernel(Function, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, Stream, *mut *mut c_void, *mut *mut c_void) -> HipError;
     fn hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(*mut c_int, Function, c_int, usize) -> HipError;
     fn hipFuncGetAttribute(*mut c_int, c_int, Function) -> HipError;

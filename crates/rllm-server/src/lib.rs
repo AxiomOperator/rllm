@@ -63,6 +63,9 @@ pub struct ServeConfig {
     pub model_name: Option<String>,
     pub host: String,
     pub port: u16,
+    /// Origins allowed to call the API from a browser (CORS); `*` for any.
+    /// Empty (the default): no CORS headers, so web pages can't read responses.
+    pub cors_origins: Vec<String>,
     pub api_key: Option<String>,
     pub ctx: usize,
     pub prefill_chunk: usize,
@@ -85,6 +88,8 @@ pub struct ServeConfig {
     pub host_cache_bytes: usize,
     /// Sample on the host from full logits rows (see `EngineConfig::host_sampling`).
     pub host_sampling: bool,
+    /// Most queued generations before new ones get 503 (0: no limit).
+    pub max_queue: usize,
     /// Save stored chat completions and responses here, and load them at start.
     pub store_file: Option<PathBuf>,
     /// Log one line per finished generation.
@@ -122,6 +127,7 @@ where
         prompt_lookup: cfg.prompt_lookup,
         host_cache_bytes: if cfg.prefix_cache { cfg.host_cache_bytes } else { 0 },
         host_sampling: cfg.host_sampling,
+        max_queue: cfg.max_queue,
     };
     let store = match &cfg.store_file {
         Some(p) => Store::load(p)?,
@@ -175,6 +181,7 @@ where
     rt.block_on(async move {
         let addr = format!("{}:{}", cfg.host, cfg.port);
         let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("bind {addr}"))?;
+        let loopback = listener.local_addr().is_ok_and(|a| a.ip().is_loopback());
         eprintln!("[rllm] listening on http://{addr}/v1");
         if state.store_file.is_some() {
             let s = state.clone();
@@ -186,7 +193,7 @@ where
                 }
             });
         }
-        axum::serve(listener, router(state.clone()))
+        axum::serve(listener, router(state.clone(), &cfg.cors_origins, loopback))
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
             })
@@ -208,7 +215,7 @@ fn save_store(state: &AppState, saved: u64) -> u64 {
         }
         (v, store.snapshot())
     };
-    match state::write_atomic(path, &bytes) {
+    match state::write_atomic(path, &bytes.to_bytes()) {
         Ok(()) => version,
         Err(e) => {
             eprintln!("[rllm] saving the store failed: {e:#}");
@@ -217,7 +224,7 @@ fn save_store(state: &AppState, saved: u64) -> u64 {
     }
 }
 
-fn router(state: Arc<AppState>) -> Router {
+fn router(state: Arc<AppState>, cors_origins: &[String], loopback: bool) -> Router {
     let v1 = Router::new()
         .route("/models", get(models::list))
         .route("/models/{model}", get(models::retrieve).delete(models::delete))
@@ -238,15 +245,64 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/detokenize", post(extras::detokenize))
         .route("/apply-template", post(extras::apply_template))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
-    Router::new()
+    let app = Router::new()
         .nest("/v1", v1)
         .merge(extras)
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(health))
         .fallback(invalid_url)
         .method_not_allowed_fallback(invalid_url)
         .layer(middleware::from_fn_with_state(state.clone(), headers))
-        .layer(CorsLayer::permissive())
-        .with_state(state)
+        .layer(middleware::from_fn(move |req, next| browser_guard(loopback, req, next)));
+    // CORS only for origins the operator lists: without it any web page the
+    // user visits could drive the GPU and read stored chats.
+    let app = if cors_origins.is_empty() {
+        app
+    } else if cors_origins.iter().any(|o| o == "*") {
+        app.layer(CorsLayer::permissive())
+    } else {
+        let origins: Vec<HeaderValue> = cors_origins.iter().filter_map(|o| HeaderValue::from_str(o).ok()).collect();
+        app.layer(
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any),
+        )
+    };
+    app.with_state(state)
+}
+
+/// The host part of a `Host` header: `localhost:8080` → `localhost`,
+/// `[::1]:8080` → `::1`.
+fn host_name(host: &str) -> &str {
+    match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None => host.rsplit_once(':').map_or(host, |(h, _)| h),
+    }
+}
+
+/// Requests a browser page could make without the API's consent:
+/// - bodies must be JSON (`Content-Type: application/json`): other types
+///   ("simple" requests such as `text/plain`) skip the CORS preflight, so a
+///   page could start generations even though it can't read the answers;
+/// - on a loopback address, the `Host` header must name the loopback too,
+///   which stops DNS-rebinding pages (`evil.example` resolving to 127.0.0.1).
+async fn browser_guard(loopback: bool, req: Request, next: Next) -> Response {
+    let has_body = matches!(*req.method(), Method::POST | Method::PUT | Method::PATCH);
+    if has_body {
+        let ct = req.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+        let json = ct.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json"));
+        if !json {
+            return ApiError::unsupported_media("Request bodies must be JSON: set 'Content-Type: application/json'.").into_response();
+        }
+    }
+    if loopback {
+        let host = req.headers().get(axum::http::header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+        let name = host_name(host);
+        if !(name.is_empty() || name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())) {
+            return ApiError::forbidden(format!("Host '{host}' is not this server: it listens on a loopback address.")).into_response();
+        }
+    }
+    next.run(req).await
 }
 
 /// OpenAI's answer for paths it doesn't serve.
@@ -311,4 +367,10 @@ async fn headers(State(state): State<Arc<AppState>>, req: Request, next: Next) -
         return res;
     }
     res
+}
+
+/// 200 "ok" while the engine thread runs; 503 once it has stopped (a panic
+/// would otherwise leave every request failing behind a healthy /health).
+async fn health(axum::extract::State(state): axum::extract::State<Arc<AppState>>) -> (axum::http::StatusCode, &'static str) {
+    if state.engine.is_alive() { (axum::http::StatusCode::OK, "ok") } else { (axum::http::StatusCode::SERVICE_UNAVAILABLE, "engine stopped") }
 }

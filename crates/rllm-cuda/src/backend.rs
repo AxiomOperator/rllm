@@ -765,32 +765,38 @@ impl CudaBackend {
     /// End of a graph step (the model's last op before reading results):
     /// finish a capture and launch the graph, or launch a replayed one.
     fn end_graph_step(&self) -> Result<()> {
-        {
-            let mut g = self.graph.lock().unwrap();
-            match g.mode {
-                StepMode::Measure(key) => {
-                    let used = g.arena_off;
-                    g.measured.insert(key, used);
-                }
-                StepMode::Capture(key) => {
-                    let n = g.written.len();
-                    g.index_writes.insert(key, n);
-                    let graph = gpu::end_capture(&self.stream)
-                        .map_err(err)?
-                        .ok_or_else(|| Error::Backend("empty graph capture".into()))?;
-                    graph.launch().map_err(err)?;
-                    g.graphs.insert(key, Graph(graph));
-                }
-                StepMode::Replay(key) => {
-                    if !g.launched {
-                        g.graphs[&key].0.launch().map_err(err)?;
-                    }
-                }
-                StepMode::Eager => {}
+        let mut g = self.graph.lock().unwrap();
+        // Eager from here, whatever happens below.
+        let mode = std::mem::replace(&mut g.mode, StepMode::Eager);
+        match mode {
+            StepMode::Measure(key) => {
+                let used = g.arena_off;
+                g.measured.insert(key, used);
             }
-            g.mode = StepMode::Eager;
+            StepMode::Capture(key) => {
+                let n = g.written.len();
+                g.index_writes.insert(key, n);
+                let graph = gpu::end_capture(&self.stream)
+                    .map_err(err)?
+                    .ok_or_else(|| Error::Backend("empty graph capture".into()))?;
+                graph.launch().map_err(err)?;
+                g.graphs.insert(key, Graph(graph));
+            }
+            StepMode::Replay(key) => {
+                if !g.launched {
+                    Self::launch_graph(&g, key)?;
+                }
+            }
+            StepMode::Eager => {}
         }
         Ok(())
+    }
+
+    /// Launch the recorded graph for `key`; an error, not a panic, if it was
+    /// dropped mid-step.
+    fn launch_graph(g: &GraphState, key: u64) -> Result<()> {
+        let graph = g.graphs.get(&key).ok_or_else(|| Error::Backend("graph invalidated during its replay step".into()))?;
+        graph.0.launch().map_err(err)
     }
 
     fn sync_index(&self, cache: &mut HashMap<&'static str, IndexBuf>, key: &'static str, data: &[u32]) -> Result<()> {
@@ -850,7 +856,7 @@ impl CudaBackend {
             // All of this step's index data is in place: start the graph now.
             let mut g = self.graph.lock().unwrap();
             if !g.launched && g.index_writes.get(&key) == Some(&g.written.len()) {
-                g.graphs[&key].0.launch().map_err(err)?;
+                Self::launch_graph(&g, key)?;
                 g.launched = true;
             }
         }
@@ -859,7 +865,12 @@ impl CudaBackend {
 
     fn ensure_len(&self, buf: &mut gpu::Slice<u16>, len: usize) -> Result<()> {
         if buf.len() < len {
+            if matches!(self.graph.lock().unwrap().mode, StepMode::Capture(_) | StepMode::Replay(_)) {
+                return Err(Error::Backend("GEMM scratch grew inside a graph step".into()));
+            }
             *buf = self.stream.alloc_zeros::<u16>(len).map_err(err)?;
+            // Recorded steps hold the old scratch's address.
+            self.invalidate_graphs();
         }
         Ok(())
     }
@@ -1384,6 +1395,11 @@ impl Backend for CudaBackend {
         // Models only pass a key for decode-sized steps.
         self.decode_step.store(graph_key.is_some(), std::sync::atomic::Ordering::Relaxed);
         let mut g = self.graph.lock().unwrap();
+        // A step that failed mid-capture left the stream capturing: end
+        // that capture and drop what it recorded.
+        if let StepMode::Capture(_) = std::mem::replace(&mut g.mode, StepMode::Eager) {
+            let _ = gpu::end_capture(&self.stream);
+        }
         g.written.clear();
         g.arena_off = 0;
         g.launched = false;
@@ -1394,7 +1410,7 @@ impl Backend for CudaBackend {
         if g.graphs.contains_key(&key) {
             g.mode = StepMode::Replay(key);
             if g.index_writes.get(&key) == Some(&0) {
-                g.graphs[&key].0.launch().map_err(err)?;
+                Self::launch_graph(&g, key)?;
                 g.launched = true;
             }
         } else if let Some(&need) = g.measured.get(&key) {
@@ -1460,13 +1476,21 @@ impl Backend for CudaBackend {
         // Eager from here: the adjustment lists vary from step to step.
         self.end_graph_step()?;
         let mut cache = self.index_cache.lock().unwrap();
-        let (mut at, mut delta) = (Vec::new(), Vec::new());
-        for &(r, s) in rows {
-            for &(id, d) in s.adjust.iter().filter(|(id, _)| (*id as usize) < vocab) {
-                at.push(r * vocab as u32 + id);
-                delta.push(d.to_bits());
+        // One entry per logit: the kernel writes each entry's sum without
+        // atomics, so repeated ids (a bias and a penalty) are merged here.
+        let mut adj: Vec<(u32, f32)> = rows
+            .iter()
+            .flat_map(|&(r, s)| s.adjust.iter().filter(|(id, _)| (*id as usize) < vocab).map(move |&(id, d)| (r * vocab as u32 + id, d)))
+            .collect();
+        adj.sort_unstable_by_key(|a| a.0);
+        adj.dedup_by(|b, a| {
+            let same = a.0 == b.0;
+            if same {
+                a.1 += b.1;
             }
-        }
+            same
+        });
+        let (at, delta): (Vec<u32>, Vec<u32>) = adj.into_iter().map(|(a, d)| (a, d.to_bits())).unzip();
         if !at.is_empty() {
             self.sync_index(&mut cache, "sample_adj_at", &at)?;
             self.sync_index(&mut cache, "sample_adj_d", &delta)?;
@@ -2370,11 +2394,13 @@ impl Backend for CudaBackend {
             }
         }
 
-        // Tensor-core path: 4 warps; head_dim split over `dw` warps (<= 128 dims each).
-        if is_prefill && self.tensor_cores && !FLAGS.no_tc_attn && hdim % 16 == 0 && hdim <= 4 * 128 {
+        // Tensor-core path: 4 warps; head_dim split evenly over `dw` warps,
+        // each a whole number of 16-dim MMA steps, <= 128 dims (320-dim heads
+        // take 4 x 80; 352, 416 and 480 have no such split up to 4 warps).
+        let tc_dw = (hdim.div_ceil(128).max(1)..=4).find(|&dw| hdim % dw == 0 && (hdim / dw) % 16 == 0);
+        if is_prefill && self.tensor_cores && !FLAGS.no_tc_attn && let Some(dw) = tc_dw {
             // 4 row groups (64 query rows) per block so each K/V tile is reused
             // widely; big heads split dims across `dw` warps (up to 16 warps).
-            let dw = hdim.div_ceil(128).max(1);
             let smem_for = |rg: usize| 32 * (hdim + 8) * 2 + hdim * 40 * 2 + if dw > 1 { rg * dw * 16 * 32 * 4 } else { 0 };
             let mut row_groups = (16 / dw).clamp(1, 4).max(group.div_ceil(16));
             while row_groups > group.div_ceil(16).max(1) && smem_for(row_groups) > self.max_smem {

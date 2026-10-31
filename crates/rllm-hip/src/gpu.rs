@@ -226,6 +226,15 @@ pub fn load_module(ctx: &Arc<Context>, code: Vec<u8>) -> Result<Arc<Module>, Err
     Ok(Arc::new(Module { raw: m }))
 }
 
+impl Drop for Module {
+    fn drop(&mut self) {
+        // Functions hold the module, so none is left to launch.
+        if let Ok(h) = hip() {
+            unsafe { (h.hipModuleUnload)(self.raw) };
+        }
+    }
+}
+
 impl Module {
     pub fn load_function(self: &Arc<Self>, name: &str) -> Result<Function, Error> {
         let c = CString::new(name).map_err(|e| Error(e.to_string()))?;
@@ -745,7 +754,13 @@ impl Blas {
         if st != 0 {
             return Err(format!("hipblasCreate: {st}"));
         }
-        let workspace = stream.alloc_zeros::<u8>(WORKSPACE).map_err(|e| e.0)?;
+        let workspace = match stream.alloc_zeros::<u8>(WORKSPACE) {
+            Ok(w) => w,
+            Err(e) => {
+                unsafe { (b.hipblasDestroy)(handle) };
+                return Err(e.0);
+            }
+        };
         unsafe {
             if (b.hipblasSetStream)(handle, stream.raw) != 0 {
                 (b.hipblasDestroy)(handle);

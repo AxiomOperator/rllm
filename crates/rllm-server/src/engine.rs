@@ -23,7 +23,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -119,11 +119,41 @@ pub struct EngineInfo {
 #[derive(Clone)]
 pub struct EngineHandle {
     jobs: mpsc::Sender<Job>,
+    /// Generations submitted but not yet taken by the engine thread; with
+    /// the engine's waiting queue (`metrics.waiting`), capped by `max_queue`.
+    queued: Arc<AtomicUsize>,
+    metrics: Arc<Metrics>,
+    max_queue: usize,
+    /// False once the engine thread has exited (including by a panic).
+    alive: Arc<AtomicBool>,
 }
 
 impl EngineHandle {
     pub fn submit(&self, job: Job) -> Result<()> {
+        if !self.is_alive() {
+            anyhow::bail!("engine stopped");
+        }
+        if let Job::Generate { .. } = job {
+            let n = self.queued.fetch_add(1, Ordering::Relaxed) + self.metrics.waiting.load(Ordering::Relaxed) as usize;
+            if self.max_queue > 0 && n >= self.max_queue {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+                anyhow::bail!("server busy: {n} requests already queued (--max-queue {})", self.max_queue);
+            }
+        }
         self.jobs.send(job).map_err(|_| anyhow::anyhow!("engine stopped"))
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+}
+
+/// Clears the engine's alive flag when its thread ends, however it ends.
+struct AliveGuard(Arc<AtomicBool>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
     }
 }
 
@@ -139,11 +169,19 @@ impl Vocab {
         let n = tok.vocab_size();
         let mut text = Vec::with_capacity(n);
         let mut special = Vec::with_capacity(n);
+        // SentencePiece decoders drop a leading space at the start of the
+        // text, so a token decoded alone loses it: decode each after an
+        // anchor token and keep what follows the anchor's text.
+        let anchor = tok.encode_with("a", false).ok().and_then(|ids| ids.last().copied());
+        let anchor_text = anchor.map(|a| tok.token_text(a)).unwrap_or_default();
         for id in 0..n as u32 {
             let raw = tok.token_text(id);
             let plain = tok.decode(&[id], true).unwrap_or_default();
             special.push(raw != plain || tok.is_stop(id));
-            text.push(raw);
+            let in_context = anchor
+                .and_then(|a| tok.decode(&[a, id], false).ok())
+                .and_then(|t| t.strip_prefix(anchor_text.as_str()).map(str::to_owned));
+            text.push(in_context.unwrap_or(raw));
         }
         Self { text, special }
     }
@@ -174,6 +212,9 @@ pub struct EngineConfig {
     /// Sample every token on the host from full logits rows, instead of on
     /// the device where possible (see `device_sample`).
     pub host_sampling: bool,
+    /// Most generations waiting for a batch slot before new ones get 503
+    /// (0: no limit).
+    pub max_queue: usize,
 }
 
 pub const BLOCK_SIZE: usize = 16;
@@ -222,9 +263,14 @@ where
 {
     let (jobs_tx, jobs_rx) = mpsc::channel::<Job>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<EngineInfo, String>>();
+    let alive = Arc::new(AtomicBool::new(true));
+    let queued = Arc::new(AtomicUsize::new(0));
+    let (alive_engine, queued_engine, metrics_handle) = (alive.clone(), queued.clone(), metrics.clone());
+    let max_queue = cfg.max_queue;
     std::thread::Builder::new()
         .name("rllm-engine".into())
         .spawn(move || {
+            let _alive = AliveGuard(alive_engine);
             pin_to_performance_cores();
             let setup = (|| -> Result<_> {
                 let backend = make_backend()?;
@@ -273,11 +319,11 @@ where
                 host_blocks: pool.host_blocks().map(|(n, _)| n),
             };
             let _ = ready_tx.send(Ok(info));
-            Scheduler::new(pool, draft, &tok, &vocab, &cfg, &metrics).run(jobs_rx);
+            Scheduler::new(pool, draft, &tok, &vocab, &cfg, &metrics, queued_engine).run(jobs_rx);
         })
         .context("spawn engine thread")?;
     let info = ready_rx.recv().context("engine thread exited")?.map_err(|e| anyhow::anyhow!(e))?;
-    Ok((EngineHandle { jobs: jobs_tx }, info))
+    Ok((EngineHandle { jobs: jobs_tx, queued, metrics: metrics_handle, max_queue, alive }, info))
 }
 
 /// The draft model must tokenize like the main model: same logits width and
@@ -418,6 +464,8 @@ impl Proposal {
 }
 
 struct Scheduler<'a, 'm, B: Backend> {
+    /// Shared with `EngineHandle`: jobs in the channel (decremented on accept).
+    queued: Arc<AtomicUsize>,
     pool: KvPool<'m, B, AnyModel<B>>,
     /// The draft model's pool (speculative decoding).
     draft: Option<KvPool<'m, B, AnyModel<B>>>,
@@ -474,9 +522,11 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         vocab: &'a Vocab,
         cfg: &'a EngineConfig,
         metrics: &'a Metrics,
+        queued: Arc<AtomicUsize>,
     ) -> Self {
         Metrics::set(&metrics.kv_blocks_total, pool.alloc.n_blocks());
         Self {
+            queued,
             pool,
             draft,
             cache: PrefixCache::default(),
@@ -533,6 +583,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
     fn accept(&mut self, job: Job) {
         match job {
             Job::Generate { prompt, params, events, cancel } => {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
                 if prompt.is_empty() || prompt.len() >= self.cfg.ctx {
                     let msg = format!("prompt ({} tokens) does not fit the context ({} tokens)", prompt.len(), self.cfg.ctx);
                     let _ = events.send(GenEvent::Error(msg));
@@ -684,9 +735,10 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         self.running.sort_by_key(|s| (s.todo().len() > 1, s.admitted));
         let mut takes: Vec<usize>;
         let mut spec: Vec<usize>;
+        let mut drafts = true;
         loop {
             let decoding = self.running.iter().filter(|s| s.todo().len() == 1).count();
-            spec = self.running.iter().map(|s| self.spec_len(s, decoding)).collect();
+            spec = self.running.iter().map(|s| if drafts { self.spec_len(s, decoding) } else { 0 }).collect();
             let mut budget = self.cfg.prefill_chunk.max(1);
             takes = self
                 .running
@@ -707,7 +759,12 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             if self.cache.make_room(&mut self.pool, need) {
                 break;
             }
-            // Out of blocks: pause the newest generation and recompute it later.
+            // Out of blocks: drafts only save work, so go without them first.
+            if spec.iter().any(|&k| k > 0) {
+                drafts = false;
+                continue;
+            }
+            // Then pause the newest generation and recompute it later.
             let newest = (0..self.running.len()).max_by_key(|&i| self.running[i].admitted).unwrap();
             let mut s = self.running.remove(newest);
             self.retire(&mut s);
@@ -1078,7 +1135,11 @@ fn sample_next(s: &mut Seq, logits: &mut [f32], tok: &Tokenizer, vocab: &Vocab) 
     let id = match &mut s.json {
         Some(state) => match pick_json(logits, state, vocab, &s.params, &mut s.sampler) {
             Some(id) => id,
-            None => return Next::Done(Finish::Stop),
+            None => {
+                // The output so far is not valid JSON: don't report success.
+                let _ = s.events.send(GenEvent::Error("the JSON constraint reached a dead end: no token continues the output as valid JSON".into()));
+                return Next::Done(Finish::Cancelled);
+            }
         },
         None => s.sampler.sample(logits),
     };
@@ -1186,7 +1247,8 @@ fn emit(s: &mut Seq, id: u32, lp: Option<LogSoftmax>, logits: &[f32], tok: &Toke
 fn pick_json(logits: &[f32], state: &mut JsonState, vocab: &Vocab, params: &GenParams, sampler: &mut Sampler) -> Option<u32> {
     let valid = |id: u32| -> Option<JsonState> {
         let i = id as usize;
-        if (vocab.special[i] && !state.allows_special(&vocab.text[i])) || vocab.text[i].is_empty() {
+        // The model's vocabulary can be padded past the tokenizer's.
+        if i >= vocab.text.len() || (vocab.special[i] && !state.allows_special(&vocab.text[i])) || vocab.text[i].is_empty() {
             return None;
         }
         let mut s = state.clone();

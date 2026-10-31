@@ -289,6 +289,16 @@ fn paged_attention_q8_cache() {
     }
 }
 
+/// Head sizes whose dims don't split evenly into 128-wide warp slices.
+#[test]
+fn paged_attention_odd_head_dims() {
+    for head_dim in [320, 352, 416, 480] {
+        for step in [Step::Mixed, Step::Long] {
+            attention_case(head_dim, 0, step, KvType::F16);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Step {
     /// One token per sequence.
@@ -623,7 +633,7 @@ fn sample_rows_matches_reference() {
                     top_p: p,
                     seed: 42 + r as u64,
                     counter,
-                    adjust: if r == 1 { vec![(7, 50.0), (9, -3.0)] } else { Vec::new() },
+                    adjust: if r == 1 { vec![(7, 40.0), (9, -3.0), (7, -40.0), (5, 25.0), (5, 25.0)] } else { Vec::new() },
                 })
                 .collect();
             // Every other row, in reverse: rows needn't be in order or complete.

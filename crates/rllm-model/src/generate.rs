@@ -87,6 +87,17 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
         let need: usize = items.iter().map(|i| i.seq.blocks_needed(self.block_size, i.tokens.len())).sum();
         anyhow::ensure!(need <= self.alloc.n_free(), "KV cache out of blocks (need {need}, have {})", self.alloc.n_free());
         let n: usize = items.iter().map(|i| i.tokens.len()).sum();
+        // Checked before any sequence grows, so a bad step changes nothing.
+        let n_rows = items
+            .iter()
+            .map(|i| match i.want {
+                Want::None => 0,
+                Want::Last => 1,
+                Want::All => i.tokens.len(),
+            })
+            .sum::<usize>()
+            .max(1);
+        anyhow::ensure!(sample.is_empty() || sample.len() == n_rows, "{} sample specs for {n_rows} rows", sample.len());
         let (mut tokens, mut token_seq, mut positions, mut slots, mut rows) =
             (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n), Vec::new());
         let mut tables = Vec::with_capacity(items.len());
@@ -120,7 +131,6 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
             cache_id: self.id,
             sample,
         };
-        anyhow::ensure!(sample.is_empty() || sample.len() == rows.len(), "{} sample specs for {} rows", sample.len(), rows.len());
         let out = self.model.forward(self.backend, &mut self.kv, &batch, self.block_size)?;
         if items.iter().all(|i| i.want == Want::None) {
             return Ok(StepOut::default());

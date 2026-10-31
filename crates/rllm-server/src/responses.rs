@@ -19,7 +19,7 @@ use crate::generation::{self, FinishKind, GenSpec, Out, Summary, TokenInfo};
 use crate::output::{OutputParser, Piece, ToolCall};
 use crate::params;
 use crate::prompt::{self, ChatPrompt, JsonFormat, ToolChoice};
-use crate::state::{AppState, StoredResponse, list_object, paginate};
+use crate::state::{AppState, History, StoredResponse, list_object, paginate};
 use crate::util;
 
 /// A validated create request.
@@ -28,8 +28,8 @@ struct Request {
     created: u64,
     model: String,
     prompt: ChatPrompt,
-    /// Conversation (template messages) this response continues from.
-    history: Vec<Value>,
+    /// Conversation (template messages) up to this response's output.
+    history: Arc<History>,
     input_items: Vec<Value>,
     params: crate::engine::GenParams,
     stream: bool,
@@ -140,23 +140,25 @@ fn tools(v: Option<&Value>) -> ApiResult<Vec<Value>> {
 }
 
 /// Build the prompt for a create or input_tokens body.
-fn build(state: &AppState, m: &Map<String, Value>) -> ApiResult<(ChatPrompt, Vec<Value>, Vec<Value>, Map<String, Value>)> {
+fn build(state: &AppState, m: &Map<String, Value>) -> ApiResult<(ChatPrompt, Arc<History>, Vec<Value>, Map<String, Value>)> {
     for (key, what) in [("conversation", "Conversations"), ("prompt", "Prompt templates"), ("context_management", "Context management")] {
         if m.get(key).is_some_and(|v| !v.is_null()) {
             return Err(ApiError::invalid(format!("{what} are not supported by this server."), Some(key)));
         }
     }
     let (new_messages, input_items) = input_messages(m.get("input"))?;
-    let mut history: Vec<Value> = Vec::new();
     let previous = params::opt_str(m, "previous_response_id")?;
-    if let Some(prev) = previous {
-        let store = state.store.lock().unwrap();
-        let r = store.responses.get(prev).ok_or_else(|| ApiError::not_found(format!("Previous response with id '{prev}' not found.")))?;
-        history = r.history.clone();
-    }
-    history.extend(new_messages);
+    let prev = match previous {
+        Some(prev) => {
+            let store = state.store.lock().unwrap();
+            let r = store.responses.get(prev).ok_or_else(|| ApiError::not_found(format!("Previous response with id '{prev}' not found.")))?;
+            Some(r.history.clone())
+        }
+        None => None,
+    };
+    let history = History::new(prev, new_messages);
     let instructions = params::opt_str(m, "instructions")?;
-    let mut messages = history.clone();
+    let mut messages = history.messages();
     if let Some(ins) = instructions {
         messages.insert(0, json!({ "role": "system", "content": ins }));
     }
@@ -166,20 +168,40 @@ fn build(state: &AppState, m: &Map<String, Value>) -> ApiResult<(ChatPrompt, Vec
     let json_format = JsonFormat::parse(text.get("format"), "text.format")?;
     let effort = m.get("reasoning").and_then(|r| r.get("effort")).and_then(Value::as_str);
     let truncation = params::opt_str(m, "truncation")?.unwrap_or("disabled");
-    // truncation "auto": drop the oldest turns until the prompt fits.
-    let prompt = loop {
-        match prompt::build(state, messages.clone(), &tool_defs, &choice, effort, json_format.as_ref()) {
-            Err(e) if truncation == "auto" && e.code.as_deref() == Some("context_length_exceeded") => {
-                let first = messages.iter().position(|m| m["role"] != "system");
-                match first {
-                    Some(i) if messages.len() - i > 1 => {
-                        messages.remove(i);
+    // Turns start at user messages: dropping whole turns keeps the roles
+    // alternating as templates require. `cuts[d]`: where the kept messages
+    // start with `d` turns dropped.
+    let first = messages.iter().position(|m| m["role"] != "system").unwrap_or(messages.len());
+    let cuts: Vec<usize> = std::iter::once(first).chain((first + 1..messages.len()).filter(|&i| messages[i]["role"] == "user")).collect();
+    let render = |drop: usize| {
+        let mut msgs = messages.clone();
+        msgs.drain(first..cuts[drop]);
+        prompt::build(state, msgs, &tool_defs, &choice, effort, json_format.as_ref())
+    };
+    let too_long = |e: &ApiError| e.code.as_deref() == Some("context_length_exceeded");
+    // truncation "auto": drop the fewest oldest turns that make the prompt
+    // fit, found by bisection (keeping at least the newest turn).
+    let prompt = match render(0) {
+        Err(e) if truncation == "auto" && too_long(&e) => {
+            let (mut lo, mut hi) = (0, cuts.len() - 1);
+            // render(lo) is too long; render(hi) fits.
+            let mut best = match render(hi) {
+                Err(e2) if too_long(&e2) => return Err(e),
+                r => r?,
+            };
+            while hi - lo > 1 {
+                let mid = (lo + hi) / 2;
+                match render(mid) {
+                    Err(e) if too_long(&e) => lo = mid,
+                    r => {
+                        best = r?;
+                        hi = mid;
                     }
-                    _ => return Err(e),
                 }
             }
-            other => break other?,
+            best
         }
+        other => other?,
     };
     let mut echo = Map::new();
     echo.insert("instructions".into(), instructions.map_or(Value::Null, |s| json!(s)));
@@ -494,24 +516,48 @@ async fn run(state: Arc<AppState>, req: Arc<Request>, cancel: Arc<AtomicBool>, m
     };
     if req.store {
         let mut store = state.store.lock().unwrap();
-        // A cancel that arrived first wins.
-        let cancelled = store.responses.get(&req.id).is_some_and(|r| r.response["status"] == "cancelled");
-        let mut history = req.history.clone();
-        history.push(b.assistant_message());
-        let final_resp = if cancelled {
-            let mut r = response.clone();
-            r["status"] = json!("cancelled");
-            r
-        } else {
-            response.clone()
-        };
-        store.responses.insert(req.id.clone(), StoredResponse { response: final_resp, input_items: req.input_items.clone(), history, cancel: None });
+        // Deleted (or evicted) while running: stays gone.
+        if let Some(stored) = store.responses.get_mut(&req.id) {
+            // A cancel that arrived first wins.
+            let cancelled = stored.response["status"] == "cancelled";
+            stored.response = response.clone();
+            if cancelled {
+                stored.response["status"] = json!("cancelled");
+            }
+            stored.history = History::new(Some(req.history.clone()), vec![b.assistant_message()]);
+            stored.cancel = None;
+        }
     }
     response
 }
 
+/// Marks a stored response failed if its request is dropped (the client
+/// disconnected) before it finishes.
+struct Unfinished {
+    state: Arc<AppState>,
+    id: Option<String>,
+}
+
+impl Drop for Unfinished {
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else { return };
+        let mut store = self.state.store.lock().unwrap();
+        if let Some(r) = store.responses.get_mut(&id)
+            && matches!(r.response["status"].as_str(), Some("queued" | "in_progress"))
+        {
+            r.response["status"] = json!("failed");
+            r.response["error"] = json!({ "code": "server_error", "message": "The client disconnected before the response finished." });
+            r.cancel = None;
+        }
+    }
+}
+
 pub async fn create(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResult<Response> {
-    let req = Arc::new(parse(&state, &body)?);
+    // Rendering and tokenizing (several times for truncation "auto") is CPU
+    // work: keep it off the async workers.
+    let s = state.clone();
+    let req = tokio::task::spawn_blocking(move || parse(&s, &body)).await.map_err(|e| ApiError::server(format!("{e}")))??;
+    let req = Arc::new(req);
     let cancel = Arc::new(AtomicBool::new(false));
     if req.store {
         let initial = response_object(&state, &req, if req.background { "queued" } else { "in_progress" }, Vec::new(), Value::Null, None);
@@ -534,7 +580,9 @@ pub async fn create(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResul
         });
         return Ok(Json(initial).into_response());
     }
+    let mut guard = Unfinished { state: state.clone(), id: req.store.then(|| req.id.clone()) };
     let response = run(state, req, cancel, |_| true).await;
+    guard.id = None;
     if response["status"] == "failed" {
         let message = response["error"]["message"].as_str().unwrap_or("The server had an error while processing your request.");
         return Err(ApiError::server(message));
@@ -581,7 +629,7 @@ pub async fn retrieve(State(state): State<Arc<AppState>>, Path(id): Path<String>
 pub async fn delete(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let mut store = state.store.lock().unwrap();
     let r = store.responses.remove(&id).ok_or_else(|| not_found(&id))?;
-    if let Some(c) = r.cancel {
+    if let Some(c) = &r.cancel {
         c.store(true, Ordering::Relaxed);
     }
     Ok(Json(json!({ "id": id, "object": "response.deleted", "deleted": true })))
@@ -617,6 +665,6 @@ pub async fn input_tokens(State(state): State<Arc<AppState>>, body: Bytes) -> Ap
     if m.contains_key("model") {
         state.resolve_model(m.get("model"))?;
     }
-    let (prompt, ..) = build(&state, &m)?;
+    let (prompt, ..) = tokio::task::spawn_blocking(move || build(&state, &m)).await.map_err(|e| ApiError::server(format!("{e}")))??;
     Ok(Json(json!({ "object": "response.input_tokens", "input_tokens": prompt.ids.len() })))
 }

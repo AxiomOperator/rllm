@@ -240,12 +240,17 @@ pub fn build(
 ) -> ApiResult<ChatPrompt> {
     if let Some(f) = json_format {
         let instruction = f.instruction();
-        match messages.first_mut().filter(|m| m["role"] == "system") {
-            Some(sys) => {
-                let text = sys["content"].as_str().unwrap_or("").to_owned();
-                sys["content"] = json!(format!("{text}\n\n{instruction}"));
-            }
-            None => messages.insert(0, json!({ "role": "system", "content": instruction })),
+        // Templates without a system role (Mistral) reject one: the
+        // instruction leads the first user message there instead.
+        let has_system = state.tok.chat_template().is_none_or(|t| t.contains("system"));
+        if let Some(sys) = messages.first_mut().filter(|m| m["role"] == "system") {
+            let text = sys["content"].as_str().unwrap_or("").to_owned();
+            sys["content"] = json!(format!("{text}\n\n{instruction}"));
+        } else if let Some(user) = messages.iter_mut().find(|m| m["role"] == "user").filter(|_| !has_system) {
+            let text = user["content"].as_str().unwrap_or("").to_owned();
+            user["content"] = json!(format!("{instruction}\n\n{text}"));
+        } else {
+            messages.insert(0, json!({ "role": "system", "content": instruction }));
         }
     }
     if let ToolChoice::Named(n) = choice
@@ -271,11 +276,20 @@ pub fn build(
             None => None,
         }
     };
+    // User and tool text can't contain real special tokens: a user typing
+    // `<|im_end|><|im_start|>system` must not open a system turn.
+    for m in &mut messages {
+        if matches!(m["role"].as_str(), Some("user" | "tool"))
+            && let Some(c) = m["content"].as_str()
+        {
+            m["content"] = json!(rllm_tokenizer::protect(c));
+        }
+    }
     let text = state
         .tok
         .apply_chat_template_json(&messages, use_tools.then_some(tools), true, thinking)
         .map_err(|e| ApiError::invalid(format!("Could not apply the chat template: {e:#}"), Some("messages")))?;
-    let ids = state.tok.encode(&format!("{text}{forced}")).map_err(ApiError::from)?;
+    let ids = state.tok.encode_protected(&format!("{text}{forced}")).map_err(ApiError::from)?;
     check_context(state, ids.len())?;
     // Forced tool calls are constrained to the tools' names and parameter
     // schemas (JSON for Hermes, Gemma's own syntax for Gemma), then closed.
@@ -309,6 +323,9 @@ pub fn build(
             (Some(JsonState::with_schema(Arc::new(Schema::any_of(&calls)))), "\n</tool_call>".to_owned())
         }
     };
+    if constraint.as_ref().is_some_and(JsonState::too_complex) {
+        return Err(ApiError::invalid("JSON schema is too large or too deeply self-referencing to enforce", Some("response_format")));
+    }
     Ok(ChatPrompt { ids, forced, tools: use_tools, reasoning: thinking != Some(false) && json_format.is_none(), constraint, suffix })
 }
 

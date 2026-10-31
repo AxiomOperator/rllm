@@ -56,13 +56,14 @@ pub fn sample_row(logits: &[f32], s: &RowSample) -> u32 {
         }
     }
     if s.temperature <= 0.0 {
-        let mut best = 0;
+        // NaNs never win; with no candidate at all, token 0.
+        let mut best = (f32::NEG_INFINITY, 0u32);
         for (i, &v) in x.iter().enumerate() {
-            if v > x[best] {
-                best = i;
+            if v > best.0 {
+                best = (v, i as u32);
             }
         }
-        return best as u32;
+        return best.1;
     }
     let inv_t = 1.0 / s.temperature;
     x.iter_mut().for_each(|v| *v *= inv_t);
@@ -122,6 +123,10 @@ mod tests {
         let mut s = row(0.0, 0, 1.0, 0);
         s.adjust = vec![(1, -100.0)];
         assert_eq!(sample_row(&logits, &s), 3);
+        let nan = [f32::NAN, 1.0, f32::NAN];
+        assert_eq!(sample_row(&nan, &row(0.0, 0, 1.0, 0)), 1);
+        assert_eq!(sample_row(&nan, &row(1.0, 2, 0.9, 0)), 1);
+        assert_eq!(sample_row(&[f32::NAN; 4], &row(1.0, 2, 0.9, 0)), 0);
     }
 
     /// Frequencies over many draws match softmax(x / T), restricted by top_k / top_p.

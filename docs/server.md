@@ -29,6 +29,7 @@ r = client.chat.completions.create(model="my-model", messages=[{"role": "user", 
 | `-d` | `gpu` | `gpu[:N]` (CUDA if present, else HIP), `cuda[:N]`, `hip[:N]` or `cpu`. |
 | `--ctx` | 8192 | Most tokens (prompt + output) one request may use. |
 | `--parallel` | 4 | Most requests decoded together in one batch. More wait in a queue. |
+| `--max-queue` | 256 | Most generations waiting for a slot; beyond that, new requests get 503 (0: no limit). |
 | `--kv-tokens` | `ctx × parallel` | Size of the KV cache shared by all requests, in tokens. Allocated once at startup. |
 | `--no-prefix-cache` | off | Don't keep finished requests' KV for reuse. |
 | `--kv-type` | `f16` | KV cache storage: `f16`, or `q8` (8-bit, about half the memory; see [KV cache type](#kv-cache-type)). |
@@ -38,6 +39,7 @@ r = client.chat.completions.create(model="my-model", messages=[{"role": "user", 
 | `--host-cache-gb` | 0 | Pinned system memory (GiB) for the prefix cache's host tier: evicted prefixes move there and come back on a hit (see [Host tier](#host-tier)). |
 | `--host-sampling` | off | Sample every token on the CPU from full logits rows instead of on the GPU (see [How requests run](#how-requests-run)). |
 | `--api-key` | `$RLLM_API_KEY`, else none | Require `Authorization: Bearer <key>`. |
+| `--cors-origin` | none | Allow browser pages from this origin to call the server (repeatable; `*` for any). Without it, responses carry no CORS headers. |
 | `--model-name` | file name without `.gguf` | Model id reported by `/v1/models` and in responses. |
 | `--strict-model` | off | Answer requests naming another model with 404 `model_not_found`, as OpenAI does. Off by default: any model name is served by the loaded model, so clients that hard-code e.g. `gpt-4o` still work. |
 | `--prefill-chunk` | 512 | Prompt tokens per forward pass (long prompts are split, so running requests keep decoding in between). |
@@ -111,13 +113,17 @@ implement, return OpenAI's `404 Invalid URL (METHOD /path)` error.
 
 Every response carries `x-request-id`, `openai-processing-ms` and
 `openai-version: 2020-10-01`; `X-Client-Request-Id` is validated and echoed.
-CORS is open, so browser clients can call the server directly.
+Browser protections:
+- **CORS is off by default:** a web page can't read responses unless its origin is allowed with `--cors-origin`.
+- **POST bodies must be JSON:** requests with another `Content-Type` get 415, so a page can't send one as a plain form.
+- **DNS rebinding:** on a loopback address (the default), requests whose `Host` isn't `localhost` or a loopback IP get 403.
 
 Errors use OpenAI's shape, `{"error": {"message", "type", "param", "code"}}`,
 with the same status codes: 400 `invalid_request_error` (naming the bad
 parameter in `param`), 401 for a missing or wrong key (`invalid_api_key`),
 404 for unknown models, objects and URLs, 400 `context_length_exceeded`,
-500 `server_error`, 503 if the engine stopped.
+500 `server_error`, 503 if the queue is full (`--max-queue`) or the engine
+stopped (`/health` then answers 503 too).
 
 ## Request parameters
 
@@ -152,7 +158,7 @@ Responses:
 - **Generation:** `instructions`, `max_output_tokens`, `temperature`, `top_p`, `top_logprobs` / `include: ["message.output_text.logprobs"]`.
 - **Tools:** `tools` (function tools), `tool_choice`, `parallel_tool_calls`, `max_tool_calls`.
 - **Output format:** `text.format` (`text`, `json_object`, `json_schema`, as above), and `reasoning.effort`.
-- **Conversation:** `previous_response_id` (the stored conversation, without the earlier `instructions`), and `truncation: "auto"`, which drops the oldest turns until the prompt fits.
+- **Conversation:** `previous_response_id` (the stored conversation, without the earlier `instructions`), and `truncation: "auto"`, which drops the fewest oldest turns (whole user-to-user turns, so roles keep alternating) that make the prompt fit.
 - **Storage and execution:** `store`, `background` (requires `store`), `metadata`, `stream`.
 - **Output items:**
   - `reasoning` items (`content: [{"type": "reasoning_text"}]`)
@@ -181,6 +187,11 @@ that runs on every candidate token. Supported keywords:
 - `anyOf` / `oneOf`, `allOf` (merged)
 - local `$ref`s (`#/$defs/…`, `#/definitions/…`), recursive ones included
 
+A schema too large or too self-referencing to compile within a fixed work
+budget (64 levels deep, 20,000 compile steps) is rejected with 400. If the
+model reaches a state where no token can continue valid JSON, the request
+ends with an error rather than a `stop` on invalid output.
+
 As in OpenAI's structured outputs, an object that lists `properties`
 without `additionalProperties` gets no other keys. Keys may come in any
 order, never twice, and the object can only close once every `required`
@@ -203,7 +214,7 @@ retrieval-embedding model.
 - **One model, one engine thread, continuous batching.** The engine owns a paged KV cache of `--kv-tokens` tokens, shared by all requests.
   - Each forward pass takes one token from every decoding request, plus up to `--prefill-chunk` prompt tokens from requests still reading their prompt.
   - New requests join the batch as soon as a slot (`--parallel`) and KV blocks are free. Finished ones leave without waiting for the rest.
-  - Steps of up to 8 tokens (decoding requests, or drafts being verified) replay CUDA graphs. Steps that mix in prompt chunks run directly.
+  - Steps of up to 8 tokens (decoding requests, or drafts being verified), and pure decode steps of up to 64 requests, replay CUDA/HIP graphs. Larger steps that mix in prompt chunks run directly.
   - Decode attention splits long contexts over several thread blocks per head and merges them in a fixed order (2× faster on Qwen3-0.6B at 8k context on the laptop GPU).
   - HTTP handling, tokenization, chat templating, stop sequences and output parsing run on the async runtime.
 - **Prefix cache.** When a request finishes, its KV blocks stay cached. A later request whose prompt starts with the same tokens reuses those blocks instead of recomputing them. That covers the next turn of a chat, a repeated system prompt, `n` choices or `previous_response_id`.
@@ -214,10 +225,13 @@ retrieval-embedding model.
 - **Numerics.** A request batched with others runs through the multi-row int8 kernels (the ones prefill uses), and a lone request through the single-row decode kernels.
   - Logprobs agree to about 0.01–0.02 on average, but greedy text can drift apart after a few dozen tokens.
   - Results are reproducible for the same mix of concurrent requests: every GPU reduction sums in a fixed order, so the same tokens give bit-identical logits on every run. (Prefill matmuls split along k used to `atomicAdd` their parts in whatever order they finished.)
-- **Cancellation.** A client that disconnects (a closed stream, a dropped connection) cancels its generation at the next step and frees its slot. Stop sequences cancel the rest of the generation too.
-- **`n` and `best_of`.** The choices run concurrently, so they share batches. They use seeds `seed`, `seed + 1`, …. Streaming with `n > 1` still sends the choices one after another.
-- **Storage.** Stored chat completions and responses live in memory.
-  - With `--store-file` they are written to that JSON file (atomically, at most every 2 s, and at shutdown) and loaded at start.
+- **Cancellation.** A client that disconnects (a closed stream, a dropped connection) cancels its generation at the next step and frees its slot, or its place in the queue if it hadn't started. Stop sequences cancel the rest of the generation too. A stored, non-background response whose client disconnects is saved as `failed`.
+- **Special tokens in user text.** Text from `user` and `tool` messages is tokenized as plain text: typing `<|im_end|>` or `[INST]` there can't open or close a turn.
+- **`n` and `best_of`.** The choices run concurrently, so they share batches. They use seeds `seed`, `seed + 1`, …. Streaming with `n > 1` still sends the choices one after another. A legacy completions request may run at most 128 sequences (prompts × `best_of`).
+- **Storage.** Stored chat completions and responses live in memory, up to 10,000 of each; the oldest go first.
+  - A chain of responses (`previous_response_id`) shares its earlier turns, in memory and on disk.
+  - With `--store-file` they are written to that JSON file (atomically, at most every 2 s, and at shutdown, serialized outside the store's lock) and loaded at start. Files from earlier versions still load.
+  - A response deleted while running stays deleted.
   - A background response still running at shutdown loads as `failed`.
 - **Logging.** One line per finished generation: prompt tokens (cached), generated tokens, time to first token, decode rate, total time and finish reason.
 

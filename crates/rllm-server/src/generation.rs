@@ -93,7 +93,19 @@ pub fn spawn(state: &Arc<AppState>, spec: GenSpec, cancel: Arc<AtomicBool>) -> m
         for p in parser.push(&forced) {
             alive &= send(Out::Piece(p));
         }
-        while let Some(ev) = erx.recv().await {
+        loop {
+            // A client that leaves while its request is still queued sends
+            // nothing to fail on: watch the output channel too.
+            let ev = tokio::select! {
+                ev = erx.recv() => match ev {
+                    Some(ev) => ev,
+                    None => break,
+                },
+                _ = out_tx.closed() => {
+                    cancel.store(true, Ordering::Relaxed);
+                    return;
+                }
+            };
             if !alive {
                 cancel.store(true, Ordering::Relaxed);
             }
@@ -132,8 +144,14 @@ pub fn spawn(state: &Arc<AppState>, spec: GenSpec, cancel: Arc<AtomicBool>) -> m
                 GenEvent::Done { finish, prompt_tokens, cached_tokens } => {
                     let mut pieces = Vec::new();
                     if !stopped {
-                        pieces.extend(parser.push(&stop.finish()));
-                        if finish == Finish::Stop {
+                        let held = dec.finish().unwrap_or_default();
+                        let mut passed = stop.push(&held);
+                        if !stop.stopped() {
+                            passed.push_str(&stop.finish());
+                        }
+                        pieces.extend(parser.push(&passed));
+                        stopped = stop.stopped();
+                        if finish == Finish::Stop && !stopped {
                             pieces.extend(parser.push(&suffix));
                         }
                     }

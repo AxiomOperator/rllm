@@ -373,12 +373,13 @@ impl Backend for CpuBackend {
                 // Keys are quantized rotated and rotated back (H is its own
                 // inverse): what attention sees through a rotated q8 cache.
                 let hd = kv.layout.head_dim;
+                // The rotation can be narrower than a 32-value q8 group
+                // (head dims 48, 80, 112: 16): rotate, round, rotate back.
                 let rot = 1 << hd.trailing_zeros();
-                for chunk in kc[s * w..(s + 1) * w].chunks_exact_mut(rot) {
-                    fwht(chunk);
-                    chunk.chunks_exact_mut(32).for_each(q8_round);
-                    fwht(chunk);
-                }
+                let slot = &mut kc[s * w..(s + 1) * w];
+                slot.chunks_exact_mut(rot).for_each(fwht);
+                slot.chunks_exact_mut(32).for_each(q8_round);
+                slot.chunks_exact_mut(rot).for_each(fwht);
                 vc[s * w..(s + 1) * w].chunks_exact_mut(32).for_each(q8_round);
             }
         }

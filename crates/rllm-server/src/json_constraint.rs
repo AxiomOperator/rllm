@@ -60,6 +60,9 @@ pub struct Schema {
     root: NodeId,
     /// Gemma 4 argument syntax instead of JSON.
     gemma: bool,
+    /// Compiling hit the work budget (see `Compiler::budget`): the schema is
+    /// rejected rather than enforced partially.
+    too_complex: bool,
 }
 
 impl Schema {
@@ -75,7 +78,7 @@ impl Schema {
 
     /// Any JSON object (`json_object` mode).
     pub fn any_object() -> Self {
-        Self { nodes: Self::builtin(), root: ANY_OBJECT, gemma: false }
+        Self { nodes: Self::builtin(), root: ANY_OBJECT, gemma: false, too_complex: false }
     }
 
     /// Any JSON object or array.
@@ -83,13 +86,18 @@ impl Schema {
         let mut nodes = Self::builtin();
         nodes.push(Node::AnyOf(vec![ANY_OBJECT, ANY_ARRAY]));
         let root = nodes.len() - 1;
-        Self { nodes, root, gemma: false }
+        Self { nodes, root, gemma: false, too_complex: false }
     }
 
     pub fn compile(schema: &Value) -> Self {
-        let mut c = Compiler { doc: schema, nodes: Self::builtin(), refs: HashMap::new(), depth: 0 };
+        let mut c = Compiler::new(schema);
         let root = c.compile(schema);
-        Self { nodes: c.nodes, root, gemma: false }
+        Self { too_complex: c.over_budget(), nodes: c.nodes, root, gemma: false }
+    }
+
+    /// True if the schema was too large to compile (see `Compiler::budget`).
+    pub fn too_complex(&self) -> bool {
+        self.too_complex
     }
 
     /// A schema in Gemma 4 argument syntax (a named tool call's arguments).
@@ -100,7 +108,7 @@ impl Schema {
     /// Any of these Gemma 4 tool calls: `name{arguments}` for each
     /// (name, parameter schema).
     pub fn gemma_calls(tools: &[(String, Value)]) -> Self {
-        let mut c = Compiler { doc: &Value::Null, nodes: Self::builtin(), refs: HashMap::new(), depth: 0 };
+        let mut c = Compiler::new(&Value::Null);
         let mut alts = Vec::new();
         for (name, params) in tools {
             c.doc = params;
@@ -109,12 +117,12 @@ impl Schema {
             alts.push(c.push(Node::Prefixed { text: name.clone(), then }));
         }
         let root = c.push(Node::AnyOf(alts));
-        Self { nodes: c.nodes, root, gemma: true }
+        Self { too_complex: c.over_budget(), nodes: c.nodes, root, gemma: true }
     }
 
     /// One of several schemas.
     pub fn any_of(schemas: &[Value]) -> Self {
-        let mut c = Compiler { doc: &Value::Null, nodes: Self::builtin(), refs: HashMap::new(), depth: 0 };
+        let mut c = Compiler::new(&Value::Null);
         let mut alts = Vec::new();
         for s in schemas {
             c.doc = s;
@@ -122,7 +130,7 @@ impl Schema {
             alts.push(c.compile(s));
         }
         let root = c.push(Node::AnyOf(alts));
-        Self { nodes: c.nodes, root, gemma: false }
+        Self { too_complex: c.over_budget(), nodes: c.nodes, root, gemma: false }
     }
 }
 
@@ -131,9 +139,24 @@ struct Compiler<'a> {
     nodes: Vec<Node>,
     refs: HashMap<String, NodeId>,
     depth: usize,
+    /// Schema values compiled so far, across the whole schema.
+    work: usize,
 }
 
-impl Compiler<'_> {
+impl<'a> Compiler<'a> {
+    /// Most schema values one request may compile. `$ref`s inlined by
+    /// `allOf` are compiled again at each use, so a small self-referencing
+    /// schema could otherwise grow exponentially (a 250-byte one took 3.5 GB).
+    const BUDGET: usize = 20_000;
+
+    fn new(doc: &'a Value) -> Self {
+        Compiler { doc, nodes: Schema::builtin(), refs: HashMap::new(), depth: 0, work: 0 }
+    }
+
+    fn over_budget(&self) -> bool {
+        self.work > Self::BUDGET
+    }
+
     fn push(&mut self, n: Node) -> NodeId {
         self.nodes.push(n);
         self.nodes.len() - 1
@@ -160,8 +183,9 @@ impl Compiler<'_> {
     }
 
     fn compile(&mut self, s: &Value) -> NodeId {
-        // Guard against pathological nesting.
-        if self.depth > 64 {
+        // Guard against pathological nesting and size.
+        self.work += 1;
+        if self.depth > 64 || self.over_budget() {
             return ANY;
         }
         self.depth += 1;
@@ -373,6 +397,13 @@ fn is_ws(c: char) -> bool {
 pub struct JsonState {
     schema: Arc<Schema>,
     alts: Vec<Stack>,
+}
+
+impl JsonState {
+    /// True if the schema was rejected as too large (see `Schema::too_complex`).
+    pub fn too_complex(&self) -> bool {
+        self.schema.too_complex()
+    }
 }
 
 impl Default for JsonState {
@@ -754,6 +785,30 @@ fn start_value(schema: &Schema, mut s: Stack, node: NodeId, c: char, out: &mut V
     };
     s.frames.push(frame);
     out.push(s);
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A self-referencing allOf doubles its work at each level: it must be
+    /// rejected quickly, not compiled exponentially.
+    #[test]
+    fn exploding_ref_schema_is_rejected() {
+        let schema = json!({
+            "$defs": { "a": { "properties": {
+                "l": { "allOf": [ { "$ref": "#/$defs/a" } ] },
+                "r": { "allOf": [ { "$ref": "#/$defs/a" } ] }
+            } } },
+            "$ref": "#/$defs/a"
+        });
+        let t = std::time::Instant::now();
+        let s = Schema::compile(&schema);
+        assert!(s.too_complex());
+        assert!(t.elapsed().as_secs() < 2, "{:?}", t.elapsed());
+        assert!(!Schema::compile(&json!({"type": "object", "properties": {"a": {"type": "string"}}})).too_complex());
+    }
 }
 
 #[cfg(test)]

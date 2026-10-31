@@ -93,6 +93,14 @@ enum Cmd {
         /// a JSON constraint), so only token ids leave the device.
         #[arg(long)]
         host_sampling: bool,
+        /// Allow browser pages from this origin to call the API (CORS); repeat
+        /// for several, or `*` for any. Off by default: a web page could
+        /// otherwise drive the server and read stored chats.
+        #[arg(long = "cors-origin")]
+        cors_origins: Vec<String>,
+        /// Most requests waiting for a batch slot; more get 503 (0: no limit).
+        #[arg(long, default_value_t = 256)]
+        max_queue: usize,
         /// Save stored chat completions and responses to this JSON file (loaded at start).
         #[arg(long)]
         store_file: Option<PathBuf>,
@@ -301,6 +309,8 @@ fn main() -> Result<()> {
             prompt_lookup,
             host_cache_gb,
             host_sampling,
+            max_queue,
+            cors_origins,
             store_file,
             quiet,
         } => {
@@ -309,6 +319,7 @@ fn main() -> Result<()> {
                 model_name,
                 host,
                 port,
+                cors_origins,
                 api_key,
                 ctx,
                 prefill_chunk,
@@ -322,6 +333,7 @@ fn main() -> Result<()> {
                 prompt_lookup,
                 host_cache_bytes: (host_cache_gb.max(0.0) * (1u64 << 30) as f64) as usize,
                 host_sampling,
+                max_queue,
                 store_file,
                 log: !quiet,
             };

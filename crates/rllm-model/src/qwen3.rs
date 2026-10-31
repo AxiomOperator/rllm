@@ -28,6 +28,8 @@ pub struct Qwen3Config {
     pub rope_theta: f32,
     pub rms_eps: f32,
     pub max_context: usize,
+    /// Sliding-window attention over every layer (Mistral v0.1); 0: none.
+    pub sliding_window: usize,
 }
 
 impl Qwen3Config {
@@ -45,6 +47,18 @@ impl Qwen3Config {
             None => hidden / n_heads,
         };
         let vocab = g.require_tensor("token_embd.weight")?.dims[1] as usize;
+        // Llama 3 scaling arrives as `rope_freqs.weight`; others would need
+        // positions or frequencies changed, which isn't implemented.
+        if let Some(t) = g.get(&k("rope.scaling.type")).and_then(|v| v.as_str())
+            && !matches!(t, "none" | "llama3")
+        {
+            bail!("RoPE scaling {t:?} is not supported");
+        }
+        if g.get(&k("rope.scaling.factor")).and_then(|v| v.as_f64()).is_some_and(|f| f != 1.0)
+            && g.tensor("rope_freqs.weight").is_none()
+        {
+            bail!("RoPE scaling (rope.scaling.factor) is not supported");
+        }
         Ok(Self {
             arch: arch.to_string(),
             n_layers: g.get_u64(&k("block_count"))? as usize,
@@ -57,6 +71,7 @@ impl Qwen3Config {
             rope_theta: g.get_f64(&k("rope.freq_base")).unwrap_or(if llama { 10_000.0 } else { 1_000_000.0 }) as f32,
             rms_eps: g.get_f64(&k("attention.layer_norm_rms_epsilon")).unwrap_or(if llama { 1e-5 } else { 1e-6 }) as f32,
             max_context: g.get_u64(&k("context_length")).unwrap_or(32768) as usize,
+            sliding_window: g.get(&k("attention.sliding_window")).and_then(|v| v.as_u64()).unwrap_or(0) as usize,
         })
     }
 
@@ -166,7 +181,7 @@ impl<B: Backend> Qwen3<B> {
             n_kv_heads: c.n_kv_heads,
             head_dim: c.head_dim,
             scale: 1.0 / (c.head_dim as f32).sqrt(),
-            window: 0,
+            window: c.sliding_window,
             token_seq: batch.token_seq,
             positions: batch.positions,
             block_tables: batch.block_tables,

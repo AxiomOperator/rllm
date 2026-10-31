@@ -31,6 +31,14 @@ impl ApiError {
         Self { code: Some(code.to_owned()), ..Self::invalid(message, param) }
     }
 
+    pub fn unsupported_media(message: impl Into<String>) -> Self {
+        Self { status: StatusCode::UNSUPPORTED_MEDIA_TYPE, ..Self::invalid(message, None) }
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self { status: StatusCode::FORBIDDEN, ..Self::invalid(message, None) }
+    }
+
     pub fn not_found(message: impl Into<String>) -> Self {
         Self { status: StatusCode::NOT_FOUND, ..Self::invalid(message, None) }
     }

@@ -91,7 +91,19 @@ fn parse(state: &AppState, body: &[u8]) -> ApiResult<Request> {
     gp.logprobs = logprobs.or((best_of > n).then_some(0));
     Ok(Request {
         model,
-        prompts: prompts(state, m.get("prompt"))?,
+        prompts: {
+            let prompts = prompts(state, m.get("prompt"))?;
+            // Each prompt runs best_of generations: bound the total, or one
+            // request could queue millions of them.
+            const MAX_SEQUENCES: usize = 128;
+            if prompts.len() * best_of > MAX_SEQUENCES {
+                return Err(ApiError::invalid(
+                    format!("{} prompts x best_of {best_of} is more than {MAX_SEQUENCES} generations per request.", prompts.len()),
+                    Some("prompt"),
+                ));
+            }
+            prompts
+        },
         params: gp,
         stops: params::stops(&m)?,
         n,

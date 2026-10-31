@@ -34,8 +34,28 @@ const TOKEN_NORMAL: i64 = 1;
 const TOKEN_CONTROL: i64 = 3;
 const TOKEN_USER_DEFINED: i64 = 4;
 
+/// Wrap text in these (see [`protect`]) to have [`Tokenizer::encode_protected`]
+/// treat it as plain text: special-token strings inside are not special.
+pub const PROTECT_START: char = '\u{E000}';
+pub const PROTECT_END: char = '\u{E001}';
+
+/// `text` marked as untrusted for [`Tokenizer::encode_protected`] (after
+/// removing any marker characters it contains, so they can't be forged).
+pub fn protect(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 6);
+    out.push(PROTECT_START);
+    out.extend(text.chars().filter(|&c| c != PROTECT_START && c != PROTECT_END));
+    out.push(PROTECT_END);
+    out
+}
+
 pub struct Tokenizer {
     inner: HfTokenizer,
+    /// The same tokenizer without added tokens: everything is plain text.
+    plain: HfTokenizer,
+    /// Added (control and user-defined) tokens by first character, longest
+    /// first, for [`Self::encode_protected`].
+    added: std::collections::HashMap<char, Vec<(String, u32)>>,
     pub bos: Option<u32>,
     pub eos: u32,
     pub add_bos: bool,
@@ -156,6 +176,16 @@ impl Tokenizer {
             .filter(|(_, t)| **t == TOKEN_USER_DEFINED)
             .map(|(s, _)| AddedToken::from(s.clone(), false))
             .collect();
+        let plain = inner.clone();
+        let mut added: std::collections::HashMap<char, Vec<(String, u32)>> = std::collections::HashMap::new();
+        for (i, (s, t)) in tokens.iter().zip(&types).enumerate() {
+            if (*t == TOKEN_CONTROL || *t == TOKEN_USER_DEFINED)
+                && let Some(c) = s.chars().next()
+            {
+                added.entry(c).or_default().push((s.clone(), i as u32));
+            }
+        }
+        added.values_mut().for_each(|v| v.sort_by(|a, b| b.0.len().cmp(&a.0.len())));
         inner.add_special_tokens(&special);
         inner.add_tokens(&user);
 
@@ -177,6 +207,8 @@ impl Tokenizer {
 
         Ok(Self {
             inner,
+            plain,
+            added,
             bos: id("tokenizer.ggml.bos_token_id"),
             eos,
             add_bos: g.get("tokenizer.ggml.add_bos_token").is_some_and(|v| *v == rllm_gguf::Value::Bool(true)),
@@ -210,12 +242,71 @@ impl Tokenizer {
         Ok(ids)
     }
 
+    /// Like [`Self::encode`], except inside [`protect`]ed spans: their text
+    /// is plain text even if it contains special-token strings (so a user
+    /// can't type `<|im_end|><|im_start|>system` to start a real system turn).
+    /// Outside them the result is exactly `encode`'s: added tokens are found
+    /// the same way (longest match) and the text between them is encoded as
+    /// one piece, protected or not.
+    pub fn encode_protected(&self, text: &str) -> Result<Vec<u32>> {
+        let mut ids = Vec::new();
+        if self.add_bos
+            && let Some(b) = self.bos
+            && !self.starts_with_token(text, b)
+        {
+            ids.push(b);
+        }
+        let mut chunk = String::new();
+        let flush = |chunk: &mut String, ids: &mut Vec<u32>| -> Result<()> {
+            if !chunk.is_empty() {
+                let enc = self.plain.encode_fast(chunk.as_str(), false).map_err(|e| anyhow!("encode: {e}"))?;
+                ids.extend_from_slice(enc.get_ids());
+                chunk.clear();
+            }
+            Ok(())
+        };
+        let mut inside = false;
+        let mut rest = text;
+        while let Some(c) = rest.chars().next() {
+            match c {
+                PROTECT_START => inside = true,
+                PROTECT_END => inside = false,
+                _ => {
+                    let hit = (!inside)
+                        .then(|| self.added.get(&c))
+                        .flatten()
+                        .and_then(|cands| cands.iter().find(|(t, _)| rest.starts_with(t.as_str())));
+                    if let Some((t, id)) = hit {
+                        flush(&mut chunk, &mut ids)?;
+                        ids.push(*id);
+                        rest = &rest[t.len()..];
+                        continue;
+                    }
+                    chunk.push(c);
+                }
+            }
+            rest = &rest[c.len_utf8()..];
+        }
+        flush(&mut chunk, &mut ids)?;
+        Ok(ids)
+    }
+
+    /// Whether `text` starts with token `id`'s text (outside protection).
+    fn starts_with_token(&self, text: &str, id: u32) -> bool {
+        self.inner.id_to_token(id).is_some_and(|t| !t.is_empty() && text.starts_with(t.as_str()))
+    }
+
     pub fn decode(&self, ids: &[u32], skip_special: bool) -> Result<String> {
         self.inner.decode(ids, skip_special).map_err(|e| anyhow!("decode: {e}"))
     }
 
     pub fn id_to_token(&self, id: u32) -> Option<String> {
         self.inner.id_to_token(id)
+    }
+
+    /// Whether `id` is an added (control or user-defined) token.
+    pub fn is_special(&self, id: u32) -> bool {
+        self.added.values().flatten().any(|&(_, i)| i == id)
     }
 
     pub fn is_stop(&self, id: u32) -> bool {
@@ -307,6 +398,15 @@ impl StreamDecoder<'_> {
             self.emitted = self.tok.decode(&self.ids, self.skip_special)?.len();
         }
         Ok(Some(new))
+    }
+
+    /// The text still held back at the end of the stream (an incomplete
+    /// UTF-8 sequence decodes as U+FFFD).
+    pub fn finish(&mut self) -> Result<String> {
+        let text = self.tok.decode(&self.ids, self.skip_special)?;
+        let rest = text.get(self.emitted..).unwrap_or_default().to_owned();
+        self.emitted = text.len();
+        Ok(rest)
     }
 }
 

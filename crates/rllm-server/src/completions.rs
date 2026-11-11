@@ -1,15 +1,14 @@
 //! `/v1/completions` (legacy): raw text in, raw text out.
 
-use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
+use tokio_stream::StreamMap;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::error::{ApiError, ApiResult};
@@ -18,7 +17,7 @@ use crate::output::{OutputParser, Piece};
 use crate::params;
 use crate::prompt;
 use crate::state::AppState;
-use crate::util;
+use crate::util::{self, Recv, SseSink};
 
 /// One prompt: its token ids and its text (for `echo`).
 struct Prompt {
@@ -57,6 +56,8 @@ fn prompts(state: &AppState, v: Option<&Value>) -> ApiResult<Vec<Prompt>> {
 }
 
 struct Request {
+    /// Queue places held before responding (set after parsing).
+    slots: Option<Arc<crate::engine::Slots>>,
     model: String,
     prompts: Vec<Prompt>,
     params: crate::engine::GenParams,
@@ -90,6 +91,7 @@ fn parse(state: &AppState, body: &[u8]) -> ApiResult<Request> {
     // best_of ranks candidates by logprob, so it needs them.
     gp.logprobs = logprobs.or((best_of > n).then_some(0));
     Ok(Request {
+        slots: None,
         model,
         prompts: {
             let prompts = prompts(state, m.get("prompt"))?;
@@ -118,7 +120,7 @@ fn parse(state: &AppState, body: &[u8]) -> ApiResult<Request> {
 fn spec(req: &Request, p: &Prompt, seed_offset: usize) -> GenSpec {
     let mut params = req.params.clone();
     params.seed = params.seed.wrapping_add(seed_offset as u64);
-    GenSpec { prompt: p.ids.clone(), params, stops: req.stops.clone(), parser: OutputParser::plain(), forced: String::new(), suffix: String::new(), skip_special: true }
+    GenSpec { prompt: p.ids.clone(), params, stops: req.stops.clone(), parser: OutputParser::plain(), forced: String::new(), suffix: String::new(), skip_special: true, slots: req.slots.clone() }
 }
 
 /// Legacy logprobs object; offsets count characters into `text` (which
@@ -133,7 +135,7 @@ fn logprobs_obj(tokens: &[TokenInfo], prefix_len: usize) -> Value {
     json!({
         "tokens": tokens.iter().map(|t| t.token.clone()).collect::<Vec<_>>(),
         "token_logprobs": tokens.iter().map(|t| t.logprob).collect::<Vec<_>>(),
-        "top_logprobs": tokens.iter().map(|t| t.top.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<_, _>>()).collect::<Vec<_>>(),
+        "top_logprobs": tokens.iter().map(|t| t.top.iter().map(|(k, _, v)| (k.clone(), json!(v))).collect::<serde_json::Map<_, _>>()).collect::<Vec<_>>(),
         "text_offset": offsets,
     })
 }
@@ -143,11 +145,15 @@ fn usage(prompt: usize, completion: usize) -> Value {
 }
 
 pub async fn create(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResult<Response> {
-    let req = parse(&state, &body)?;
+    // Tokenizing (up to the body limit) is CPU work: off the async workers.
+    let s = state.clone();
+    let mut req = util::blocking(move || parse(&s, &body)).await?;
+    // Before a streaming response sends its 200 head: a full queue is a 503.
+    req.slots = Some(state.reserve(req.prompts.len() * req.best_of)?);
     let id = util::alnum_id("cmpl-", 29);
     let created = util::now();
     if req.stream {
-        return Ok(stream(state, req, id, created).into_response());
+        return Ok(util::sse(move |sink| stream(state, req, id, created, sink)));
     }
     let mut choices = Vec::new();
     let (mut prompt_tokens, mut completion) = (0, 0);
@@ -187,67 +193,68 @@ pub async fn create(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResul
     .into_response())
 }
 
-fn stream(state: Arc<AppState>, req: Request, id: String, created: u64) -> Sse<UnboundedReceiverStream<Result<Event, Infallible>>> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
-    tokio::spawn(async move {
-        let chunk = |choices: Value, usage: Value| {
-            json!({ "id": id, "object": "text_completion", "created": created, "model": req.model, "system_fingerprint": state.fingerprint, "choices": choices, "usage": usage })
-        };
-        let send = |v: Value| tx.send(Ok(Event::default().data(v.to_string()))).is_ok();
-        let (mut prompt_tokens, mut completion) = (0, 0);
-        for (pi, p) in req.prompts.iter().enumerate() {
-            prompt_tokens += p.ids.len();
-            for j in 0..req.n {
-                let index = pi * req.n + j;
-                let mut offset = 0;
-                if req.echo {
-                    offset = p.text.chars().count();
-                    if !send(chunk(json!([{ "text": p.text, "index": index, "logprobs": null, "finish_reason": null }]), Value::Null)) {
-                        return;
-                    }
-                }
-                let mut rx = generation::spawn(&state, spec(&req, p, j), Arc::new(AtomicBool::new(false)));
-                let mut pending: Vec<TokenInfo> = Vec::new();
-                while let Some(ev) = rx.recv().await {
-                    let (text, finish) = match ev {
-                        Err(e) => {
-                            send(e.body());
-                            let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                            return;
-                        }
-                        Ok(Out::Token(t)) => {
-                            pending.push(t);
-                            continue;
-                        }
-                        Ok(Out::Piece(Piece::Content(t))) => (t, Value::Null),
-                        Ok(Out::Piece(_)) => continue,
-                        Ok(Out::Done(s)) => {
-                            completion += s.completion_tokens;
-                            (String::new(), json!(s.finish.as_str()))
-                        }
-                    };
-                    let lp = if req.logprobs.is_some() {
-                        let o = logprobs_obj(&pending, offset);
-                        offset += pending.iter().map(|t| t.token.chars().count()).sum::<usize>();
-                        pending.clear();
-                        o
-                    } else {
-                        Value::Null
-                    };
-                    let done = !finish.is_null();
-                    if !send(chunk(json!([{ "text": text, "index": index, "logprobs": lp, "finish_reason": finish }]), Value::Null)) {
-                        return;
-                    }
-                    if done {
-                        break;
-                    }
+/// Stream every prompt's `n` choices concurrently (the engine batches them,
+/// as it does without streaming); chunks of different choices interleave
+/// and carry their `index`.
+async fn stream(state: Arc<AppState>, req: Request, id: String, created: u64, sink: SseSink) {
+    let chunk = |choices: Value, usage: Value| {
+        json!({ "id": id, "object": "text_completion", "created": created, "model": req.model, "system_fingerprint": state.fingerprint, "choices": choices, "usage": usage })
+    };
+    let send = |v: Value| sink.data(&chunk(v, Value::Null));
+    let prompt_tokens: usize = req.prompts.iter().map(|p| p.ids.len()).sum();
+    let mut completion = 0;
+    // Per choice: text offset (characters) and logprobs not yet sent.
+    let mut offsets = vec![0usize; req.prompts.len() * req.n];
+    let mut pending: Vec<Vec<TokenInfo>> = (0..offsets.len()).map(|_| Vec::new()).collect();
+    let mut gens = StreamMap::new();
+    for (pi, p) in req.prompts.iter().enumerate() {
+        for j in 0..req.n {
+            let index = pi * req.n + j;
+            if req.echo {
+                offsets[index] = p.text.chars().count();
+                if !send(json!([{ "text": p.text, "index": index, "logprobs": null, "finish_reason": null }])) {
+                    return;
                 }
             }
+            let rx = generation::spawn(&state, spec(&req, p, j), Arc::new(AtomicBool::new(false)));
+            gens.insert(index, UnboundedReceiverStream::new(rx));
         }
-        if req.include_usage {
-            send(chunk(json!([]), usage(prompt_tokens, completion)));
+    }
+    loop {
+        let (index, ev) = match sink.next(&mut gens).await {
+            Recv::Item(x) => x,
+            Recv::Ended => break,
+            // Returning drops the receivers, which cancels the generations.
+            Recv::Gone => return,
+        };
+        let (text, finish) = match ev {
+            Err(e) => return sink.error_done(&e),
+            Ok(Out::Token(t)) => {
+                pending[index].push(t);
+                continue;
+            }
+            Ok(Out::Piece(Piece::Content(t))) => (t, Value::Null),
+            Ok(Out::Piece(_)) => continue,
+            Ok(Out::Done(s)) => {
+                completion += s.completion_tokens;
+                gens.remove(&index);
+                (String::new(), json!(s.finish.as_str()))
+            }
+        };
+        let lp = if req.logprobs.is_some() {
+            let p = std::mem::take(&mut pending[index]);
+            let o = logprobs_obj(&p, offsets[index]);
+            offsets[index] += p.iter().map(|t| t.token.chars().count()).sum::<usize>();
+            o
+        } else {
+            Value::Null
+        };
+        if !send(json!([{ "text": text, "index": index, "logprobs": lp, "finish_reason": finish }])) {
+            return;
         }
-        let _ = tx.send(Ok(Event::default().data("[DONE]")));
-    });
-    Sse::new(UnboundedReceiverStream::new(rx))
+    }
+    if req.include_usage {
+        sink.data(&chunk(json!([]), usage(prompt_tokens, completion)));
+    }
+    sink.done();
 }

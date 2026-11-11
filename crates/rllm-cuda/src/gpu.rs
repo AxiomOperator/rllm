@@ -3,6 +3,19 @@
 //! same names over HIP, hiprtc and hipBLAS, so the backend compiles against
 //! either. Types keep cudarc's method names; vendor calls the backend makes
 //! directly are the free functions below.
+//!
+//! Behavior the backend relies on, and where the HIP module differs:
+//! - `PinnedSlice` (cudarc's `PinnedHostSlice`) waits on its own event before
+//!   freeing, so dropping one after an async copy out of it is safe here. HIP's
+//!   frees right away; the backend therefore waits for copies out of pinned
+//!   staging buffers itself before dropping or rewriting them (`IndexBuf`,
+//!   `CudaHostKv`).
+//! - `Stream::memcpy_htod` from pageable host memory returns once the source
+//!   has been read (the driver stages it; HIP's wrapper synchronizes), on both
+//!   vendors; from pinned memory it is asynchronous and the source must
+//!   outlive the copy.
+//! - Event tracking is disabled context-wide (see [`new_context`]): device
+//!   buffers are ordered by the backend's single stream, not by cudarc events.
 
 use std::sync::Arc;
 
@@ -66,14 +79,38 @@ pub fn arch(ctx: &Context) -> Result<Arch, Error> {
     Ok(Arch { compile: format!("compute_{major}{minor}"), name: format!("sm_{major}{minor}"), tensor_cores: major >= 8, wmma: false })
 }
 
+/// Options passed to NVRTC besides the architecture.
+const COMPILE_OPTIONS: &[&str] = &["--std=c++17"];
+
 /// Compile the kernel source for `arch` (an [`Arch::compile`] string): PTX text.
 pub fn compile(src: &str, arch: &str) -> Result<Vec<u8>, String> {
     let opts = cudarc::nvrtc::CompileOptions {
         arch: Some(Box::leak(arch.to_string().into_boxed_str())),
-        options: vec!["--std=c++17".into()],
+        options: COMPILE_OPTIONS.iter().map(|o| o.to_string()).collect(),
         ..Default::default()
     };
-    cudarc::nvrtc::compile_ptx_with_opts(src, opts).map(|p| p.to_src().into_bytes()).map_err(|e| e.to_string())
+    let code = cudarc::nvrtc::compile_ptx_with_opts(src, opts).map(|p| p.to_src().into_bytes()).map_err(|e| e.to_string())?;
+    if !valid_code(&code) {
+        return Err("NVRTC returned no usable PTX".into());
+    }
+    Ok(code)
+}
+
+/// What else determines [`compile`]'s output besides source and arch: the
+/// compiler version and options (part of the kernel cache key).
+pub fn compiler_id() -> String {
+    preload();
+    let (mut major, mut minor) = (0, 0);
+    // SAFETY: plain out-pointers.
+    let st = unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor) };
+    let version = if st == cudarc::nvrtc::sys::nvrtcResult::NVRTC_SUCCESS { format!("{major}.{minor}") } else { "unknown".into() };
+    format!("nvrtc {version} {}", COMPILE_OPTIONS.join(" "))
+}
+
+/// Whether `code` is a plausible [`compile`] output (checked before loading
+/// a cached file): PTX text with version and target directives.
+pub fn valid_code(code: &[u8]) -> bool {
+    std::str::from_utf8(code).is_ok_and(|s| s.contains(".version") && s.contains(".target"))
 }
 
 /// File extension for cached [`compile`] output.
@@ -90,6 +127,9 @@ pub fn compiler_present() -> bool {
 pub const TEST_ARCHES: [&str; 2] = ["compute_89", "compute_86"];
 
 pub fn load_module(ctx: &Arc<Context>, code: Vec<u8>) -> Result<Arc<Module>, Error> {
+    if !valid_code(&code) {
+        return Err(cudarc::driver::DriverError(sys::CUresult::CUDA_ERROR_INVALID_PTX));
+    }
     ctx.load_module(cudarc::nvrtc::Ptx::from_src(String::from_utf8_lossy(&code)))
 }
 

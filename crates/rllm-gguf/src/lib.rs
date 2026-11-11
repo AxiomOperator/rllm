@@ -187,8 +187,12 @@ impl Gguf {
             let value = r.value(ty, 0)?;
             metadata.push((key, value));
         }
-        let meta_index: HashMap<String, usize> =
-            metadata.iter().enumerate().map(|(i, (k, _))| (k.clone(), i)).collect();
+        let mut meta_index: HashMap<String, usize> = HashMap::with_capacity(metadata.len());
+        for (i, (k, _)) in metadata.iter().enumerate() {
+            if meta_index.insert(k.clone(), i).is_some() {
+                return Err(Error::Malformed(format!("duplicate metadata key {k:?}")));
+            }
+        }
 
         let alignment = meta_index
             .get("general.alignment")
@@ -222,18 +226,37 @@ impl Gguf {
             let Some(numel) = numel else {
                 return Err(Error::TensorBounds(name));
             };
-            if numel % dtype.block_size() as u64 != 0 {
-                return Err(Error::Malformed(format!("tensor {name}: {numel} elements is not a whole number of {dtype} blocks")));
+            // Rows (the innermost axis) are stored as whole blocks.
+            let row = dims.first().copied().unwrap_or(1);
+            if row % dtype.block_size() as u64 != 0 {
+                return Err(Error::Malformed(format!("tensor {name}: rows of {row} elements are not whole {dtype} blocks")));
             }
-            let size = dtype.row_bytes(numel as usize);
-            let end = data_start.checked_add(offset).and_then(|o| o.checked_add(size as u64));
-            if end.is_none_or(|e| e > mmap.len() as u64) {
+            if offset % alignment != 0 {
+                return Err(Error::Malformed(format!("tensor {name}: offset {offset} is not a multiple of the alignment {alignment}")));
+            }
+            let size = (numel / dtype.block_size() as u64).checked_mul(dtype.block_bytes() as u64);
+            let end = size.and_then(|size| data_start.checked_add(offset)?.checked_add(size));
+            let (Some(size), Some(end)) = (size, end) else {
+                return Err(Error::TensorBounds(name));
+            };
+            if end > mmap.len() as u64 {
                 return Err(Error::TensorBounds(name));
             }
             let offset = (data_start + offset) as usize;
-            tensors.push(TensorInfo { name, dims, dtype, offset, size });
+            tensors.push(TensorInfo { name, dims, dtype, offset, size: size as usize });
         }
-        let tensor_index = tensors.iter().enumerate().map(|(i, t)| (t.name.clone(), i)).collect();
+        let mut tensor_index = HashMap::with_capacity(tensors.len());
+        for (i, t) in tensors.iter().enumerate() {
+            if tensor_index.insert(t.name.clone(), i).is_some() {
+                return Err(Error::Malformed(format!("duplicate tensor {:?}", t.name)));
+            }
+        }
+        // Tensors' data must not overlap (empty tensors take no space).
+        let mut by_offset: Vec<&TensorInfo> = tensors.iter().filter(|t| t.size > 0).collect();
+        by_offset.sort_by_key(|t| t.offset);
+        if let Some(w) = by_offset.windows(2).find(|w| w[0].offset + w[0].size > w[1].offset) {
+            return Err(Error::Malformed(format!("tensors {:?} and {:?} overlap", w[0].name, w[1].name)));
+        }
 
         Ok(Self { version, metadata, tensors, meta_index, tensor_index, mmap })
     }
@@ -279,6 +302,121 @@ impl Gguf {
     pub fn mmap(&self) -> &Arc<Mmap> {
         &self.mmap
     }
+}
+
+/// A few metadata values read cheaply with [`peek`].
+#[derive(Debug, Default)]
+pub struct Peek {
+    /// The values of the requested keys that the file has.
+    pub values: HashMap<String, Value>,
+    /// Length of every top-level array value (e.g. `tokenizer.ggml.tokens`).
+    pub array_lens: HashMap<String, u64>,
+}
+
+/// Wanted values larger than this aren't worth a peek.
+const MAX_PEEK_VALUE: u64 = 1 << 20;
+
+/// Read only the metadata keys in `wanted` (plus every array's length)
+/// without mapping the file or decoding the rest: other values, such as a
+/// tokenizer's vocabulary, are skipped over. For screening many files.
+pub fn peek(path: impl AsRef<Path>, wanted: &[&str]) -> Result<Peek> {
+    use std::io::{BufReader, Read};
+
+    struct Stream {
+        r: BufReader<File>,
+        pos: u64,
+        len: u64,
+    }
+    impl Stream {
+        fn bytes(&mut self, n: u64, what: &'static str) -> Result<Vec<u8>> {
+            self.skip(n, what)?;
+            let mut b = vec![0u8; n as usize];
+            self.r.seek_relative(-(n as i64))?;
+            self.r.read_exact(&mut b)?;
+            Ok(b)
+        }
+        fn skip(&mut self, n: u64, what: &'static str) -> Result<()> {
+            let end = self.pos.checked_add(n).filter(|&e| e <= self.len).ok_or(Error::Eof(what))?;
+            self.r.seek_relative((end - self.pos) as i64)?;
+            self.pos = end;
+            Ok(())
+        }
+        fn u32(&mut self, what: &'static str) -> Result<u32> {
+            Ok(u32::from_le_bytes(self.bytes(4, what)?.try_into().unwrap()))
+        }
+        fn u64(&mut self, what: &'static str) -> Result<u64> {
+            Ok(u64::from_le_bytes(self.bytes(8, what)?.try_into().unwrap()))
+        }
+        /// Skip one value of type `ty`; for an array, return its length.
+        fn skip_value(&mut self, ty: u32, depth: usize) -> Result<Option<u64>> {
+            let fixed = |ty| match ty {
+                0 | 1 | 7 => Some(1),
+                2 | 3 => Some(2),
+                4..=6 => Some(4),
+                10..=12 => Some(8),
+                _ => None,
+            };
+            match ty {
+                8 => {
+                    let n = self.u64("string length")?;
+                    self.skip(n, "string")?;
+                }
+                9 => {
+                    let item = self.u32("array type")?;
+                    if depth >= MAX_NESTING {
+                        return Err(Error::Malformed("arrays nested too deeply".into()));
+                    }
+                    let n = self.u64("array length")?;
+                    match fixed(item) {
+                        Some(size) => self.skip(n.checked_mul(size).ok_or(Error::Eof("array"))?, "array")?,
+                        None => {
+                            for _ in 0..n {
+                                self.skip_value(item, depth + 1)?;
+                            }
+                        }
+                    }
+                    return Ok(Some(n));
+                }
+                t => self.skip(fixed(t).ok_or(Error::ValueType(t))?, "value")?,
+            }
+            Ok(None)
+        }
+    }
+
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut s = Stream { r: BufReader::new(file), pos: 0, len };
+    if s.u32("magic")? != MAGIC {
+        return Err(Error::BadMagic);
+    }
+    let version = s.u32("version")?;
+    if !(2..=3).contains(&version) {
+        return Err(Error::Version(version));
+    }
+    let _n_tensors = s.u64("tensor count")?;
+    let n_kv = s.u64("kv count")?;
+    let mut out = Peek::default();
+    for _ in 0..n_kv {
+        let n = s.u64("string length")?;
+        if n > MAX_PEEK_VALUE {
+            return Err(Error::Malformed("metadata key too long".into()));
+        }
+        let key = String::from_utf8(s.bytes(n, "string")?).map_err(|_| Error::Utf8)?;
+        let ty = s.u32("value type")?;
+        let start = s.pos;
+        let array_len = s.skip_value(ty, 0)?;
+        if let Some(n) = array_len {
+            out.array_lens.insert(key.clone(), n);
+        }
+        if wanted.contains(&key.as_str()) && s.pos - start <= MAX_PEEK_VALUE {
+            let n = s.pos - start;
+            s.r.seek_relative(-(n as i64))?;
+            s.pos = start;
+            let buf = s.bytes(n, "value")?;
+            out.values.insert(key, Reader { buf: &buf, pos: 0 }.value(ty, 0)?);
+        }
+    }
+    Ok(out)
 }
 
 struct Reader<'a> {
@@ -366,12 +504,93 @@ mod tests {
         b
     }
 
-    fn parse(bytes: &[u8]) -> Result<Gguf> {
-        let path = std::env::temp_dir().join(format!("rllm-gguf-test-{}-{:x}.gguf", std::process::id(), bytes.len() ^ bytes.iter().map(|&b| b as usize).sum::<usize>()));
+    /// Run `f` on `bytes` written to a temporary file.
+    fn with_file<T>(bytes: &[u8], f: impl FnOnce(&Path) -> T) -> T {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("rllm-gguf-test-{}-{n}.gguf", std::process::id()));
         std::fs::write(&path, bytes).unwrap();
-        let r = Gguf::open(&path);
+        let r = f(&path);
         std::fs::remove_file(&path).unwrap();
         r
+    }
+
+    fn parse(bytes: &[u8]) -> Result<Gguf> {
+        with_file(bytes, |p| Gguf::open(p))
+    }
+
+    fn kv_u32(key: &str, v: u32) -> Vec<u8> {
+        let mut b = string(key);
+        b.extend(4u32.to_le_bytes());
+        b.extend(v.to_le_bytes());
+        b
+    }
+
+    /// A file with the given f32 tensors (`(name, elements, offset)`) and enough data.
+    fn with_tensors(ts: &[(&str, u64, u64)]) -> Result<Gguf> {
+        let mut body: Vec<u8> = ts.iter().flat_map(|&(n, e, o)| tensor(n, &[e], 0, o)).collect();
+        body.resize(body.len() + 512, 0);
+        parse(&file(ts.len() as u64, 0, &body))
+    }
+
+    #[test]
+    fn tensor_index_is_checked() {
+        // Back to back, and with a gap: fine.
+        assert!(with_tensors(&[("a", 8, 0), ("b", 8, 32), ("c", 8, 96)]).is_ok());
+        // The same name twice.
+        assert!(matches!(with_tensors(&[("a", 8, 0), ("a", 8, 32)]), Err(Error::Malformed(e)) if e.contains("duplicate")));
+        // Overlapping data, in either listing order.
+        assert!(matches!(with_tensors(&[("a", 16, 0), ("b", 8, 32)]), Err(Error::Malformed(e)) if e.contains("overlap")));
+        assert!(matches!(with_tensors(&[("b", 8, 32), ("a", 16, 0)]), Err(Error::Malformed(e)) if e.contains("overlap")));
+        assert!(matches!(with_tensors(&[("a", 8, 64), ("b", 8, 64)]), Err(Error::Malformed(e)) if e.contains("overlap")));
+        // Not a multiple of the (default 32-byte) alignment.
+        assert!(matches!(with_tensors(&[("a", 8, 4)]), Err(Error::Malformed(e)) if e.contains("alignment")));
+        // A custom alignment applies too.
+        let mut body = kv_u32("general.alignment", 64);
+        body.extend(tensor("a", &[8], 0, 32));
+        body.resize(body.len() + 512, 0);
+        assert!(matches!(parse(&file(1, 1, &body)), Err(Error::Malformed(e)) if e.contains("alignment")));
+        // Quantized rows must be whole blocks even if the total is (2 x 16 of Q8_0).
+        let mut body = tensor("q", &[16, 2], 8, 0);
+        body.resize(body.len() + 512, 0);
+        assert!(matches!(parse(&file(1, 0, &body)), Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn duplicate_metadata_keys_are_errors() {
+        let mut body = kv_u32("k", 1);
+        body.extend(kv_u32("k", 2));
+        assert!(matches!(parse(&file(0, 2, &body)), Err(Error::Malformed(e)) if e.contains("duplicate")));
+    }
+
+    #[test]
+    fn peek_reads_wanted_keys_and_array_lengths() {
+        let mut body = string("general.architecture");
+        body.extend(8u32.to_le_bytes());
+        body.extend(string("qwen3"));
+        body.extend(string("tokenizer.ggml.tokens"));
+        body.extend(9u32.to_le_bytes());
+        body.extend(8u32.to_le_bytes());
+        body.extend(3u64.to_le_bytes());
+        for t in ["a", "bc", "def"] {
+            body.extend(string(t));
+        }
+        body.extend(string("scores"));
+        body.extend(9u32.to_le_bytes());
+        body.extend(6u32.to_le_bytes());
+        body.extend(2u64.to_le_bytes());
+        body.extend([0u8; 8]);
+        body.extend(kv_u32("n", 7));
+        let bytes = file(0, 4, &body);
+        let p = with_file(&bytes, |p| peek(p, &["general.architecture", "n", "missing"])).unwrap();
+        assert_eq!(p.values.get("general.architecture"), Some(&Value::String("qwen3".into())));
+        assert_eq!(p.values.get("n"), Some(&Value::U32(7)));
+        assert_eq!(p.values.len(), 2);
+        assert_eq!(p.array_lens.get("tokenizer.ggml.tokens"), Some(&3));
+        assert_eq!(p.array_lens.get("scores"), Some(&2));
+        // Truncated: an error, not a panic or a huge allocation.
+        assert!(with_file(&bytes[..bytes.len() - 6], |p| peek(p, &["n"])).is_err());
+        assert!(with_file(&file(0, u64::MAX, &[]), |p| peek(p, &[])).is_err());
     }
 
     fn tensor(name: &str, dims: &[u64], ty: u32, offset: u64) -> Vec<u8> {

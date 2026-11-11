@@ -42,7 +42,10 @@ static NEXT_POOL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
     pub fn new(backend: &'m B, model: &'m M, max_tokens: usize, block_size: usize, kv: KvType) -> Result<Self> {
+        anyhow::ensure!(block_size > 0, "KV block size must be positive");
+        anyhow::ensure!(max_tokens > 0, "KV cache must hold at least one token");
         let n_blocks = max_tokens.div_ceil(block_size);
+        anyhow::ensure!(u32::try_from(n_blocks).is_ok(), "KV cache of {max_tokens} tokens is too large");
         let kv = model.alloc_cache(backend, n_blocks, block_size, kv)?;
         let id = NEXT_POOL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self { backend, model, kv, alloc: BlockAllocator::new(n_blocks, block_size), block_size, id, host: None })
@@ -216,6 +219,7 @@ impl<'m, B: Backend, M: Model<B>> Generator<'m, B, M> {
     /// (indices into `tokens`, ascending): `[rows.len(), vocab]`.
     pub fn feed_rows(&mut self, tokens: &[u32], rows: &[u32]) -> Result<Vec<f32>> {
         anyhow::ensure!(!tokens.is_empty(), "feed: no tokens");
+        anyhow::ensure!(!rows.is_empty(), "feed_rows: no rows");
         anyhow::ensure!(rows.iter().all(|&r| (r as usize) < tokens.len()), "feed_rows: row out of range");
         self.step_rows(tokens, rows)
     }

@@ -103,11 +103,15 @@ __device__ __forceinline__ float warp_max(float v) {
 //           Q4_K packs the scales tighter (4.5), at the cost of unpacking.
 //   FMT_Q5  as FMT_Q4, plus qh: 4 bytes per unit, bit e = bit 4 of element e
 //           (value = d * scale * q - dmin * min, q = 0..31). 5.625 bits.
-//   FMT_IQ4 qs: 4-bit codebook indices laid out like FMT_Q4; sc: f16 per
-//           unit (value = d * kvalues_iq4nl[q]). 4.5 bits, as in GGUF.
+//   FMT_IQ4 qs: 4-bit codebook indices laid out like FMT_Q4; sc: per 8
+//           units (a GGUF super-block), 16 bytes: an int8 scale (ls - 32) per
+//           unit, then f16 d (value = d * scale * kvalues_iq4nl[q], d * scale
+//           in f32 as ggml does). 4.5 bits, as in GGUF.
 //   FMT_Q6  qs: low 4 bits, laid out like FMT_Q4; qh: 8 bytes per unit,
 //           byte b = hi[b] | hi[b+8] << 2 | hi[b+16] << 4 | hi[b+24] << 6;
-//           sc: f16 per 16 elements (value = d * ((lo | hi << 4) - 32)).
+//           sc: per super-block (256 elements), 32 bytes: an int8 scale per
+//           16 elements, then f16 d (value = d * scale * ((lo | hi << 4) -
+//           32), d * scale in f32 as ggml does). 7 bits per weight.
 #define FMT_F32 0
 #define FMT_F16 1
 #define FMT_BF16 2
@@ -140,6 +144,19 @@ __device__ __forceinline__ int iq4_vals(u32 idx) {
     const u32 hi = perm8(0x26190D01u, 0x71594535u, idx & 0x07070707);
     const u32 sel = ((idx >> 3) & 0x01010101) * 0xFF;
     return (int)((lo & ~sel) | (hi & sel));
+}
+
+// FMT_Q6: the scale of 16-element group g of a row (f16 d times an int8
+// scale, in f32 like ggml; the product isn't always representable in f16).
+__device__ __forceinline__ float q6_scale(const u8* sc, int g) {
+    const u8* b = sc + (g >> 4) * 32;
+    return ld_f16a(b + 16) * (float)(signed char)b[g & 15];
+}
+
+// FMT_IQ4: the scale of unit u of a row.
+__device__ __forceinline__ float iq4_scale(const u8* sc, int u) {
+    const u8* b = sc + (u >> 3) * 16;
+    return ld_f16a(b + 8) * (float)(signed char)b[u & 7];
 }
 
 // FMT_Q4: unit u's scale d * scale and offset dmin * min.
@@ -183,13 +200,13 @@ __device__ __forceinline__ void dequant4(const u8* qs, const u8* qh, const u8* s
         int shift = (e >> 4) * 4;
         for (int i = 0; i < 4; i++) y[i] = d * (float)(((q[i] >> shift) & 0xF) | (((hb >> (e + i)) & 1) << 4)) - m;
     } else if (F == FMT_IQ4) {
-        float d = ld_f16(sc + u * 2);
+        float d = iq4_scale(sc, u);
         const u8* q = qs + u * 16 + (e & 15);
         int shift = (e >> 4) * 4;
         const signed char kv[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
         for (int i = 0; i < 4; i++) y[i] = d * (float)kv[(q[i] >> shift) & 0xF];
     } else if (F == FMT_Q6) {
-        float d = ld_f16(sc + ((u * 32 + e) >> 4) * 2);
+        float d = q6_scale(sc, (u * 32 + e) >> 4);
         const u8* lo = qs + u * 16 + (e & 15);
         const u8* hi = qh + u * 8 + (e & 7);
         int lshift = (e >> 4) * 4, hshift = 2 * (e >> 3);
@@ -263,7 +280,6 @@ extern "C" __global__ void repack_q6_k(const u8* __restrict__ raw, u8* qs, u8* q
     const u8* ql = b + half * 64 + (rr & 1) * 32;
     const u8* qhh = b + 128 + half * 32;
     const i8* scl = (const i8*)(b + 192 + half * 8);
-    float d = ld_f16(b + 208);
     int nshift = (rr >> 1) * 4;
     u8 q[32];
     for (int l = 0; l < 32; l++) q[l] = ((ql[l] >> nshift) & 0xF) | (((qhh[l] >> (2 * rr)) & 3) << 4);
@@ -273,8 +289,16 @@ extern "C" __global__ void repack_q6_k(const u8* __restrict__ raw, u8* qs, u8* q
     u8* hi = qh + orow * (k / 4) + u * 8;
     for (int i = 0; i < 8; i++)
         hi[i] = (q[i] >> 4) | ((q[i + 8] >> 4) << 2) | ((q[i + 16] >> 4) << 4) | ((q[i + 24] >> 4) << 6);
-    st_f16(sc + orow * (k / 16) * 2 + u * 4, d * scl[2 * rr]);
-    st_f16(sc + orow * (k / 16) * 2 + u * 4 + 2, d * scl[2 * rr + 1]);
+    // Group 2j / 2j + 1 of the super-block (j = half * 4 + rr): its int8
+    // scale; the first unit also copies d and clears the padding.
+    u8* g = sc + orow * (k / 16) * 2 + (u / 8) * 32;
+    g[2 * j] = (u8)scl[2 * rr];
+    g[2 * j + 1] = (u8)scl[2 * rr + 1];
+    if (j == 0) {
+        g[16] = b[208];
+        g[17] = b[209];
+        for (int i = 18; i < 32; i++) g[i] = 0;
+    }
 }
 
 extern "C" __global__ void repack_q5_k(const u8* __restrict__ raw, u8* qs, u8* qh, u8* sc, int row0, int n, int k) {
@@ -321,7 +345,13 @@ extern "C" __global__ void repack_iq4_xs(const u8* __restrict__ raw, u8* qs, u8*
     int scales_h = b[2] | (b[3] << 8);
     int ls = ((b[4 + j / 2] >> (4 * (j % 2))) & 0xF) | (((scales_h >> (2 * j)) & 3) << 4);
     long orow = row0 + r;
-    st_f16(sc + orow * units * 2 + u * 2, ld_f16(b) * (float)(ls - 32));
+    u8* g = sc + orow * units * 2 + (u / 8) * 16;
+    g[j] = (u8)(signed char)(ls - 32);
+    if (j == 0) {
+        g[8] = b[0];  // d as stored
+        g[9] = b[1];
+        for (int i = 10; i < 16; i++) g[i] = 0;
+    }
     const u8* q = b + 8 + j * 16;
     u8* o = qs + orow * (k / 2) + u * 16;
     for (int i = 0; i < 16; i++) o[i] = q[i];  // same nibble layout
@@ -379,6 +409,9 @@ __device__ __forceinline__ void quant_unit(float v, long unit, const QOut& o) {
 }
 
 // Quantize row `row` (width d, already written to `o` by this block).
+// Requires d % 32 == 0: units never straddle rows, so a partial last unit
+// would be left unwritten (and later units misnumbered). Callers only turn
+// `qo` on for such widths (every model width today is a multiple of 32).
 __device__ __forceinline__ void quant_row(const float* o, long row, int d, const QOut& qo) {
     __syncthreads();
     int warps = blockDim.x / WARP_SIZE, warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
@@ -421,7 +454,7 @@ __device__ __forceinline__ void mv_step(const u8* __restrict__ qr, const u8* __r
         const int u = i;
         int4 w = *(const int4*)(qr + u * 16);
         const int* wi = (const int*)&w;
-        const float d = ld_f16a(sr + u * 2);
+        const float d = iq4_scale(sr, u);
         int wl[4], wh[4];
 #pragma unroll
         for (int c = 0; c < 4; c++) {
@@ -492,7 +525,7 @@ __device__ __forceinline__ void mv_step(const u8* __restrict__ qr, const u8* __r
                 int hv = (((c & 1) ? hi.y : hi.x) >> (2 * (2 * half + (c >> 1)))) & 0x03030303;
                 w[c] = q6_to_s8x4(lv | (hv << 4));
             }
-            d = ld_f16a(sr + h * 2);
+            d = q6_scale(sr, h);
         }
 #pragma unroll
         for (int j = 0; j < MV_MAX_M; j++) {
@@ -755,7 +788,9 @@ extern "C" __global__ void f32_to_bf16(const float* __restrict__ x, unsigned sho
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         u32 b = __float_as_uint(x[i]);
-        out[i] = (unsigned short)((b + 0x7fff + ((b >> 16) & 1)) >> 16);
+        // NaN: a quiet NaN of the same sign (rounding could carry it to inf).
+        out[i] = (b & 0x7fffffff) > 0x7f800000 ? (unsigned short)((b >> 16) | 0x40)
+                                                : (unsigned short)((b + 0x7fff + ((b >> 16) & 1)) >> 16);
     }
 }
 
@@ -863,13 +898,14 @@ __device__ __forceinline__ int block_argmax(float v, int idx, float* sv, int* si
     return idx;
 }
 
-// Uniform in (0, 1) from (seed, counter, token): sample.rs's `uniform`.
+// Uniform strictly inside (0, 1) from (seed, counter, token): sample.rs's
+// `uniform`. 23 bits so the top value is 1 - 2^-24, not a rounded 1.0.
 __device__ __forceinline__ float sample_uniform(unsigned long long seed, unsigned long long ctr, u32 tok) {
     unsigned long long z = seed ^ (ctr * 0x9E3779B97F4A7C15ull) ^ ((unsigned long long)tok * 0xD1B54A32D192ED03ull);
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
     z ^= z >> 31;
-    return ((float)(z >> 40) + 0.5f) * (1.f / 16777216.f);
+    return ((float)(z >> 41) + 0.5f) * (1.f / 8388608.f);
 }
 
 // logits[at[i]] += delta[i] (logit bias, repetition penalties).
@@ -901,17 +937,25 @@ extern "C" __global__ void __launch_bounds__(1024) sample_rows(const float* __re
         if (threadIdx.x == 0) out[blockIdx.x] = best < vocab ? best : 0;
         return;
     }
-    const float inv_t = 1.f / temp;
+    // sample.rs's MIN_TEMPERATURE: x / T stays finite.
+    const float inv_t = 1.f / fmaxf(temp, 1e-4f);
+    // Bisection range: the finite values only (sample.rs's `threshold`); a
+    // -inf would make every midpoint -inf and turn the limits off.
     float lo = POS_INF, hi = NEG_INF;
     for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
         float v = x[i] * inv_t;
-        lo = fminf(lo, v);
-        hi = fmaxf(hi, v);
+        if (fabsf(v) < POS_INF) {  // finite (NaN compares false)
+            lo = fminf(lo, v);
+            hi = fmaxf(hi, v);
+        }
     }
     hi = block_max(hi, sv);
     lo = -block_max(-lo, sv);
     float thr = NEG_INF;
-    if (top_k > 0 && top_k < vocab) {
+    // No finite value: no limits (every non-NaN value competes).
+    const bool bisect = lo <= hi;
+    // Ties: every value at the threshold is kept (top_k may keep more than k).
+    if (bisect && top_k > 0 && top_k < vocab) {
         float a = lo, b = hi;
         for (int it = 0; it < SAMPLE_BISECT; it++) {
             const float mid = 0.5f * (a + b);
@@ -922,7 +966,7 @@ extern "C" __global__ void __launch_bounds__(1024) sample_rows(const float* __re
         thr = a;
         lo = a;
     }
-    if (top_p < 1.f) {
+    if (bisect && top_p < 1.f) {
         float tot = 0.f;
         for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
             float v = x[i] * inv_t;
@@ -1824,6 +1868,16 @@ struct WaCfg {
 };
 
 #if defined(__GFX11__)
+typedef _Float16 wa_half8 __attribute__((ext_vector_type(8)));
+
+// A 16-half fragment from shared memory as two 16-byte loads: the padded
+// row strides (KS, VS, PS) keep rows 16-byte aligned, not the 32 bytes a
+// wa_half16 load assumes.
+__device__ __forceinline__ wa_half16 wa_ld16(const _Float16* p) {
+    const wa_half8 a = *(const wa_half8*)p, b = *(const wa_half8*)(p + 8);
+    return __builtin_shufflevector(a, b, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+}
+
 template <int HD>
 __device__ void attn_wmma(const float* __restrict__ q, const f16_bits* __restrict__ kc,
                           const f16_bits* __restrict__ vc, float* __restrict__ out, const u32* __restrict__ tiles,
@@ -1912,7 +1966,7 @@ __device__ void attn_wmma(const float* __restrict__ q, const f16_bits* __restric
             const _Float16* kr = Ks + (j * 16 + col) * KS + d0;
 #pragma unroll
             for (int t = 0; t < NT; t++)
-                sj[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[t], *(const wa_half16*)(kr + t * 16), sj[j]);
+                sj[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[t], wa_ld16(kr + t * 16), sj[j]);
         }
         if (DW > 1) {
             // Add the row group's partial scores (same order in every wave).
@@ -1970,10 +2024,10 @@ __device__ void attn_wmma(const float* __restrict__ q, const f16_bits* __restric
         // O += P . V for this wave's dims: A = P rows (16 keys), B = V^T rows.
 #pragma unroll
         for (int j = 0; j < NJ; j++) {
-            wa_half16 a = *(const wa_half16*)(Pw + col * PS + j * 16);
+            wa_half16 a = wa_ld16(Pw + col * PS + j * 16);
 #pragma unroll
             for (int t = 0; t < NT; t++) {
-                wa_half16 b = *(const wa_half16*)(Vt + (d0 + t * 16 + col) * VS + j * 16);
+                wa_half16 b = wa_ld16(Vt + (d0 + t * 16 + col) * VS + j * 16);
                 o[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, o[t]);
             }
         }
@@ -2431,7 +2485,7 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
                                         iq4_vals(v.z & 0x0F0F0F0F), iq4_vals(v.w & 0x0F0F0F0F));
                 *(int4*)(dst + 16) = make_int4(iq4_vals((v.x >> 4) & 0x0F0F0F0F), iq4_vals((v.y >> 4) & 0x0F0F0F0F),
                                                iq4_vals((v.z >> 4) & 0x0F0F0F0F), iq4_vals((v.w >> 4) & 0x0F0F0F0F));
-                Ad[2 * ul][r] = ld_f16a(sr + u * 2);
+                Ad[2 * ul][r] = iq4_scale(sr, u);
             } else {  // FMT_Q6
                 int4 lov = *(const int4*)(qr + u * 16);
                 int2 hiv = *(const int2*)((second ? qh2 : qh) + (long)gr * qh_row + u * 8);
@@ -2445,8 +2499,8 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
                     }
                 *(int4*)dst = make_int4(w[0], w[1], w[2], w[3]);
                 *(int4*)(dst + 16) = make_int4(w[4], w[5], w[6], w[7]);
-                Ad[2 * ul][r] = ld_f16(sr + u * 4);
-                Ad[2 * ul + 1][r] = ld_f16(sr + u * 4 + 2);
+                Ad[2 * ul][r] = q6_scale(sr, 2 * u);
+                Ad[2 * ul + 1][r] = q6_scale(sr, 2 * u + 1);
             }
         }
         // Stage activations.

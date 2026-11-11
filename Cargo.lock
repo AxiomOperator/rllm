@@ -1003,6 +1003,8 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "hyper",
+ "hyper-util",
  "libc",
  "rllm-core",
  "rllm-cpu",

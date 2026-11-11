@@ -35,7 +35,7 @@ use rllm_model::{AnyModel, Dist, KvPool, Model, RowSample, Sampler, SamplerConfi
 use rllm_tokenizer::Tokenizer;
 use tokio::sync::{mpsc as tmpsc, oneshot};
 
-use crate::json_constraint::JsonState;
+use crate::json_constraint::{Fed, JsonState};
 use crate::metrics::Metrics;
 
 /// Sampling and stopping parameters for one generation.
@@ -119,8 +119,9 @@ pub struct EngineInfo {
 #[derive(Clone)]
 pub struct EngineHandle {
     jobs: mpsc::Sender<Job>,
-    /// Generations submitted but not yet taken by the engine thread; with
-    /// the engine's waiting queue (`metrics.waiting`), capped by `max_queue`.
+    /// Generations submitted but not yet taken by the engine thread, and
+    /// unfinished embedding jobs; with the engine's waiting queue
+    /// (`metrics.waiting`), capped by `max_queue`.
     queued: Arc<AtomicUsize>,
     metrics: Arc<Metrics>,
     max_queue: usize,
@@ -128,19 +129,73 @@ pub struct EngineHandle {
     alive: Arc<AtomicBool>,
 }
 
+/// Queue places held for a request before its response starts, so a full
+/// queue is a 503 before a stream's 200 head, not an error event after it.
+/// Each [`EngineHandle::submit_with`] uses one; unused ones are released on
+/// drop.
+pub struct Slots {
+    queued: Arc<AtomicUsize>,
+    left: AtomicUsize,
+}
+
+impl Slots {
+    /// Take one held place; false when all are used.
+    fn take(&self) -> bool {
+        self.left.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).is_ok()
+    }
+}
+
+impl Drop for Slots {
+    fn drop(&mut self) {
+        let n = *self.left.get_mut();
+        if n > 0 {
+            self.queued.fetch_sub(n, Ordering::Relaxed);
+        }
+    }
+}
+
+impl std::fmt::Debug for Slots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Slots({})", self.left.load(Ordering::Relaxed))
+    }
+}
+
 impl EngineHandle {
     pub fn submit(&self, job: Job) -> Result<()> {
+        self.submit_with(job, None)
+    }
+
+    /// Hold `n` queue places, or fail now if they aren't free.
+    pub fn reserve(&self, n: usize) -> Result<Arc<Slots>> {
         if !self.is_alive() {
             anyhow::bail!("engine stopped");
         }
-        if let Job::Generate { .. } = job {
+        let waiting = self.metrics.waiting.load(Ordering::Relaxed) as usize;
+        let max = self.max_queue;
+        self.queued
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |q| (max == 0 || q + waiting + n <= max).then_some(q + n))
+            .map_err(|q| anyhow::anyhow!("server busy: {} requests already queued (--max-queue {max})", q + waiting))?;
+        Ok(Arc::new(Slots { queued: self.queued.clone(), left: AtomicUsize::new(n) }))
+    }
+
+    /// Submit, using one of `slots` (already counted) if any are left.
+    pub fn submit_with(&self, job: Job, slots: Option<&Slots>) -> Result<()> {
+        if !self.is_alive() {
+            anyhow::bail!("engine stopped");
+        }
+        // Embedding jobs count until they finish (they run between steps,
+        // a chunk at a time); generations until the engine takes them.
+        if !slots.is_some_and(Slots::take) {
             let n = self.queued.fetch_add(1, Ordering::Relaxed) + self.metrics.waiting.load(Ordering::Relaxed) as usize;
             if self.max_queue > 0 && n >= self.max_queue {
                 self.queued.fetch_sub(1, Ordering::Relaxed);
                 anyhow::bail!("server busy: {n} requests already queued (--max-queue {})", self.max_queue);
             }
         }
-        self.jobs.send(job).map_err(|_| anyhow::anyhow!("engine stopped"))
+        self.jobs.send(job).map_err(|_| {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
+            anyhow::anyhow!("engine stopped")
+        })
     }
 
     pub fn is_alive(&self) -> bool {
@@ -157,17 +212,19 @@ impl Drop for AliveGuard {
     }
 }
 
-/// Token texts for constrained decoding: decoded text per id, and whether
-/// the id is a special/control token (never allowed inside JSON).
+/// Token texts for constrained decoding: the bytes each id adds to the
+/// output, and whether the id is a special/control token (never allowed
+/// inside JSON). A token can hold part of a UTF-8 character (byte tokens,
+/// byte-level BPE pieces), so these are bytes, not text.
 pub struct Vocab {
-    pub text: Vec<String>,
+    pub bytes: Vec<Box<[u8]>>,
     pub special: Vec<bool>,
 }
 
 impl Vocab {
     pub fn build(tok: &Tokenizer) -> Self {
         let n = tok.vocab_size();
-        let mut text = Vec::with_capacity(n);
+        let mut bytes = Vec::with_capacity(n);
         let mut special = Vec::with_capacity(n);
         // SentencePiece decoders drop a leading space at the start of the
         // text, so a token decoded alone loses it: decode each after an
@@ -181,9 +238,12 @@ impl Vocab {
             let in_context = anchor
                 .and_then(|a| tok.decode(&[a, id], false).ok())
                 .and_then(|t| t.strip_prefix(anchor_text.as_str()).map(str::to_owned));
-            text.push(in_context.unwrap_or(raw));
+            let text = in_context.unwrap_or(raw);
+            // Part of a character decodes as U+FFFD: use the token's bytes.
+            let partial = text.contains('\u{FFFD}').then(|| tok.token_bytes(id)).flatten().filter(|b| std::str::from_utf8(b).is_err());
+            bytes.push(partial.unwrap_or_else(|| text.into_bytes()).into_boxed_slice());
         }
-        Self { text, special }
+        Self { bytes, special }
     }
 }
 
@@ -246,6 +306,12 @@ pub fn draft_pool_tokens(kv_tokens: usize) -> usize {
 /// sequence, then shorter tails down to LOOKUP_MIN_NGRAM.
 const LOOKUP_MAX_NGRAM: usize = 4;
 const LOOKUP_MIN_NGRAM: usize = 2;
+
+/// Parser steps the JSON constraint may spend choosing one token, across
+/// all candidates (a full-vocabulary scan of an ordinary schema takes
+/// about a million; 8M is ~2 s at worst). Beyond it the request fails
+/// instead of stalling the engine on a pathologically ambiguous schema.
+const PICK_JSON_WORK: usize = 8_000_000;
 
 /// Start the engine thread. `make_backend` runs on that thread (CUDA
 /// contexts are tied to it). Returns once the model is loaded.
@@ -463,6 +529,18 @@ impl Proposal {
     }
 }
 
+/// An embedding request, computed a prompt chunk at a time between steps.
+struct EmbedJob {
+    inputs: Vec<Vec<u32>>,
+    reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
+    /// Vectors of the inputs done so far.
+    out: Vec<Vec<f32>>,
+    /// The input in progress (`inputs[out.len()]`): its temporary cache and
+    /// the sum of its final hidden states so far.
+    seq: SeqKv,
+    sum: Vec<f32>,
+}
+
 struct Scheduler<'a, 'm, B: Backend> {
     /// Shared with `EngineHandle`: jobs in the channel (decremented on accept).
     queued: Arc<AtomicUsize>,
@@ -475,7 +553,7 @@ struct Scheduler<'a, 'm, B: Backend> {
     cfg: &'a EngineConfig,
     metrics: &'a Metrics,
     waiting: VecDeque<Seq>,
-    embeds: VecDeque<Job>,
+    embeds: VecDeque<EmbedJob>,
     running: Vec<Seq>,
     admissions: u64,
     timing: StepTiming,
@@ -545,6 +623,8 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
     fn run(mut self, jobs: mpsc::Receiver<Job>) {
         loop {
             if self.running.is_empty() && self.waiting.is_empty() && self.embeds.is_empty() {
+                // Idle: the gauges still show the last step's batch.
+                self.publish();
                 match jobs.recv() {
                     Ok(j) => self.accept(j),
                     Err(_) => return,
@@ -558,7 +638,9 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             self.admit();
             self.publish();
             if self.running.is_empty() {
-                if let Some(s) = self.waiting.pop_front() {
+                // An embedding in progress holds blocks it will give back.
+                let embedding = self.embeds.front().is_some_and(|j| !j.seq.block_table.is_empty());
+                if !embedding && let Some(s) = self.waiting.pop_front() {
                     // Nothing running and it still doesn't fit: it never will.
                     let msg = format!("request needs more KV cache than the pool has ({} tokens)", self.pool.alloc.n_blocks() * BLOCK_SIZE);
                     let _ = s.events.send(GenEvent::Error(msg));
@@ -620,7 +702,9 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                     cancel,
                 });
             }
-            embed @ Job::Embed { .. } => self.embeds.push_back(embed),
+            Job::Embed { inputs, reply } => {
+                self.embeds.push_back(EmbedJob { out: Vec::with_capacity(inputs.len()), inputs, reply, seq: SeqKv::default(), sum: Vec::new() })
+            }
         }
     }
 
@@ -640,6 +724,20 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         for s in gone {
             self.finish(s, Finish::Cancelled);
         }
+        // Embedding requests whose client is gone.
+        let (keep, gone): (VecDeque<EmbedJob>, VecDeque<EmbedJob>) = self.embeds.drain(..).partition(|j| !j.reply.is_closed());
+        self.embeds = keep;
+        for j in gone {
+            self.end_embed(j, None);
+        }
+    }
+
+    /// Fail a generation whose state is unknown (its sampling panicked):
+    /// report the error and drop its KV rather than caching it.
+    fn fail(&mut self, mut s: Seq, msg: &str) {
+        let _ = s.events.send(GenEvent::Error(msg.to_owned()));
+        s.kv.free(&mut self.pool.alloc);
+        self.free_draft(&mut s);
     }
 
     /// Report the end of a generation and retire its KV into the prefix cache.
@@ -674,6 +772,9 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
     /// slot and KV blocks for their whole prompt (evicting cached prefixes
     /// as needed). Strictly in arrival order.
     fn admit(&mut self) {
+        // Blocks the prompts admitted in this pass will take (they are only
+        // allocated by the next step), so each admission sees what is left.
+        let mut reserved = 0;
         while self.running.len() < self.cfg.parallel.max(1) {
             let Some(mut s) = self.waiting.pop_front() else { return };
             if self.cfg.prefix_cache && s.kv.len == 0 {
@@ -682,7 +783,8 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             }
             // The prompt's blocks, plus one block of headroom per running
             // sequence so they can keep decoding.
-            let need = s.kv.blocks_needed(BLOCK_SIZE, s.todo().len()) + self.running.len();
+            let prompt = s.kv.blocks_needed(BLOCK_SIZE, s.todo().len());
+            let need = reserved + prompt + self.running.len();
             if !self.cache.make_room(&mut self.pool, need) {
                 s.kv.free(&mut self.pool.alloc);
                 self.waiting.push_front(s);
@@ -691,6 +793,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             if s.cached.is_none() {
                 s.cached = Some(s.kv.len);
             }
+            reserved += prompt;
             self.admissions += 1;
             s.admitted = self.admissions;
             self.running.push(s);
@@ -764,6 +867,15 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                 drafts = false;
                 continue;
             }
+            // Then take back the blocks of an embedding in progress (it
+            // restarts that input later): generations go first.
+            if let Some(j) = self.embeds.front_mut()
+                && !j.seq.block_table.is_empty()
+            {
+                j.seq.free(&mut self.pool.alloc);
+                j.sum.clear();
+                continue;
+            }
             // Then pause the newest generation and recompute it later.
             let newest = (0..self.running.len()).max_by_key(|&i| self.running[i].admitted).unwrap();
             let mut s = self.running.remove(newest);
@@ -814,7 +926,10 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                         }
                     }
                     Err(_) => {
-                        for i in 0..self.running.len() {
+                        // A failed draft pass leaves the draft caches it
+                        // touched in an unknown state: drop those (they
+                        // rebuild on the next proposal), keep the others.
+                        for i in (0..self.running.len()).filter(|&i| model_spec[i] > 0) {
                             let mut s = std::mem::take(&mut self.running[i].draft_kv);
                             if let Some(d) = &mut self.draft {
                                 s.free(&mut d.alloc);
@@ -913,11 +1028,13 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         let run = move |s: &mut Seq, rows: &mut [f32], p: Proposal| -> (Next, usize) {
             if p.tokens.is_empty() { (sample_next(s, rows, tok, vocab), 0) } else { verify_drafts(s, rows, vocab_n, &p, tok) }
         };
-        let results: Vec<(usize, Next, usize)> = if jobs.len() <= 1 {
+        // None: sampling panicked (a bug); that sequence fails, the others
+        // and the engine go on.
+        let results: Vec<(usize, Option<(Next, usize)>)> = if jobs.len() <= 1 {
             jobs.into_iter()
                 .map(|(i, l, p)| {
-                    let (n, kept) = run(&mut self.running[i], l, p);
-                    (i, n, kept)
+                    let s = &mut self.running[i];
+                    (i, std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(s, l, p))).ok())
                 })
                 .collect()
         } else {
@@ -928,17 +1045,20 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                     .into_iter()
                     .map(|(i, l, p)| {
                         let s = refs[i].take().unwrap();
-                        sc.spawn(move || {
-                            let (n, kept) = run(s, l, p);
-                            (i, n, kept)
-                        })
+                        (i, sc.spawn(move || run(s, l, p)))
                     })
                     .collect();
-                handles.into_iter().map(|h| h.join().expect("sampler thread panicked")).collect()
+                handles.into_iter().map(|(i, h)| (i, h.join().ok())).collect()
             })
         };
-        let mut done: Vec<(usize, Finish)> = Vec::new();
-        for (i, next, kept) in results.into_iter().chain(device_results) {
+        // Finished sequences: how, or None if they failed.
+        let mut done: Vec<(usize, Option<Finish>)> = Vec::new();
+        let device_results = device_results.into_iter().map(|(i, n, kept)| (i, Some((n, kept))));
+        for (i, r) in results.into_iter().chain(device_results) {
+            let Some((next, kept)) = r else {
+                done.push((i, None));
+                continue;
+            };
             if spec[i] > 0 && takes[i] > 1 {
                 // Keep the KV of the pending token and the accepted drafts;
                 // the draft cache keeps what it shares with them.
@@ -960,7 +1080,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                 }
             }
             if let Next::Done(f) = next {
-                done.push((i, f));
+                done.push((i, Some(f)));
             }
         }
         self.timing.sample += t_sample.elapsed();
@@ -970,20 +1090,24 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         done.sort_by_key(|d| std::cmp::Reverse(d.0));
         for (i, f) in done {
             let s = self.running.remove(i);
-            self.finish(s, f);
+            match f {
+                Some(f) => self.finish(s, f),
+                None => self.fail(s, "internal error while sampling (see the server log)"),
+            }
         }
         Ok(())
     }
 
     /// Run the draft model for the sequences with `spec[i] > 0`: catch its
     /// cache up with their tokens, then propose up to `spec[i]` tokens each
-    /// (one batched draft step per token). Fails only if the draft pool is
-    /// out of blocks.
+    /// (one batched draft step per token). Sequences the draft pool has no
+    /// room for stop proposing (keeping what they have); an error means a
+    /// draft pass failed.
     fn propose(&mut self, spec: &[usize]) -> Result<Vec<Proposal>> {
         let draft = self.draft.as_mut().context("no draft model")?;
         let vocab_n = draft.model().vocab_size();
         let mut props: Vec<Proposal> = (0..self.running.len()).map(|_| Proposal::default()).collect();
-        let idx: Vec<usize> = (0..self.running.len()).filter(|&i| spec[i] > 0).collect();
+        let mut idx: Vec<usize> = (0..self.running.len()).filter(|&i| spec[i] > 0).collect();
         // Logits after each sequence's latest token, as rows of `logits`.
         let mut logits: Vec<f32> = vec![0.0; self.running.len() * vocab_n];
         // Catch up: everything not yet in the draft cache (the last token,
@@ -991,7 +1115,9 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         loop {
             let mut items = Vec::new();
             let mut owners = Vec::new();
+            let mut free = draft.alloc.n_free();
             let mut refs: Vec<Option<&mut Seq>> = self.running.iter_mut().map(Some).collect();
+            let mut no_room = Vec::new();
             for &i in &idx {
                 let s = refs[i].take().unwrap();
                 let todo = s.tokens.len() - s.draft_kv.len;
@@ -999,6 +1125,12 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                     continue;
                 }
                 let take = todo.min(self.cfg.prefill_chunk.max(1));
+                let need = s.draft_kv.blocks_needed(BLOCK_SIZE, take);
+                if need > free {
+                    no_room.push(i);
+                    continue;
+                }
+                free -= need;
                 let start = s.draft_kv.len;
                 let last = take == todo;
                 let Seq { tokens, draft_kv, .. } = s;
@@ -1007,6 +1139,8 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                     owners.push(i);
                 }
             }
+            drop(refs);
+            idx.retain(|i| !no_room.contains(i));
             if items.is_empty() {
                 break;
             }
@@ -1036,6 +1170,16 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                     feed.push((i, t));
                 }
             }
+            // Without room for one more token, a sequence keeps its drafts so far.
+            let mut free = draft.alloc.n_free();
+            feed.retain(|&(i, _)| {
+                let need = self.running[i].draft_kv.blocks_needed(BLOCK_SIZE, 1);
+                let fits = need <= free;
+                if fits {
+                    free -= need;
+                }
+                fits
+            });
             if feed.is_empty() {
                 break;
             }
@@ -1054,56 +1198,83 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         Ok(props)
     }
 
-    /// Embedding jobs run between steps, one input at a time, in their own
-    /// temporary sequences (not cached).
+    /// Advance the oldest embedding request by one prompt chunk, in its own
+    /// temporary sequence (not cached). Called once per engine iteration,
+    /// so long requests interleave with generation steps.
     fn run_embeds(&mut self) {
-        while let Some(Job::Embed { inputs, reply }) = self.embeds.pop_front() {
-            let longest = inputs.iter().map(Vec::len).max().unwrap_or(0);
-            if !self.cache.make_room(&mut self.pool, longest.div_ceil(BLOCK_SIZE)) {
+        let chunk = self.cfg.prefill_chunk.max(1);
+        let ctx = self.cfg.ctx;
+        let Some(job) = self.embeds.front_mut() else { return };
+        let ids = &job.inputs[job.out.len()];
+        let start = job.seq.len;
+        let outcome: Result<(), String> = 'run: {
+            if ids.is_empty() {
+                break 'run Err("empty input".into());
+            }
+            if ids.len() > ctx {
+                break 'run Err(format!("input ({} tokens) exceeds the context ({ctx} tokens)", ids.len()));
+            }
+            let take = (ids.len() - start).min(chunk);
+            // Room for the whole input before starting it, so it doesn't
+            // stall halfway; then for each chunk (generations may have
+            // taken blocks in between).
+            let need = if start == 0 { ids.len().div_ceil(BLOCK_SIZE) } else { job.seq.blocks_needed(BLOCK_SIZE, take) };
+            if !self.cache.make_room(&mut self.pool, need) {
                 if self.running.is_empty() {
-                    let _ = reply.send(Err(format!("input needs more KV cache than the pool has ({longest} tokens)")));
-                    continue;
+                    break 'run Err(format!("input needs more KV cache than the pool has ({} tokens)", ids.len()));
                 }
                 // Wait for running generations to free blocks.
-                self.embeds.push_front(Job::Embed { inputs, reply });
                 return;
             }
             let t0 = Instant::now();
-            let r = self.embed(&inputs).map_err(|e| format!("{e:#}"));
+            let part = &ids[start..start + take];
+            let r = self.pool.step(&mut [StepItem { seq: &mut job.seq, tokens: part, want: Want::All }], true);
             Metrics::add(&self.metrics.busy_us, t0.elapsed().as_micros() as usize);
-            let _ = reply.send(r);
+            let h = match r {
+                Ok(h) => h,
+                Err(e) => break 'run Err(format!("{e:#}")),
+            };
+            let d = h.len() / part.len();
+            job.sum.resize(d, 0.0);
+            for row in h.chunks_exact(d) {
+                for (a, &b) in job.sum.iter_mut().zip(row) {
+                    *a += b;
+                }
+            }
+            if job.seq.len == ids.len() {
+                // Mean-pooled (the mean's scale drops out), L2-normalized.
+                let n = ids.len();
+                job.seq.free(&mut self.pool.alloc);
+                let mut v = std::mem::take(&mut job.sum);
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+                v.iter_mut().for_each(|x| *x /= norm);
+                job.out.push(v);
+                Metrics::add(&self.metrics.embedded_tokens, n);
+            }
+            Ok(())
+        };
+        match outcome {
+            Err(e) => {
+                let job = self.embeds.pop_front().expect("front job");
+                self.end_embed(job, Some(Err(e)));
+            }
+            Ok(()) if job.out.len() == job.inputs.len() => {
+                let mut job = self.embeds.pop_front().expect("front job");
+                let out = std::mem::take(&mut job.out);
+                self.end_embed(job, Some(Ok(out)));
+            }
+            Ok(()) => {}
         }
     }
 
-    /// Mean-pooled, L2-normalized final hidden states, one vector per input.
-    fn embed(&mut self, inputs: &[Vec<u32>]) -> Result<Vec<Vec<f32>>> {
-        let mut out = Vec::with_capacity(inputs.len());
-        for ids in inputs {
-            anyhow::ensure!(!ids.is_empty(), "empty input");
-            anyhow::ensure!(ids.len() <= self.cfg.ctx, "input ({} tokens) exceeds the context ({} tokens)", ids.len(), self.cfg.ctx);
-            let mut seq = SeqKv::default();
-            let mut v: Vec<f32> = Vec::new();
-            let r = (|| -> Result<()> {
-                for part in ids.chunks(self.cfg.prefill_chunk.max(1)) {
-                    let h = self.pool.step(&mut [StepItem { seq: &mut seq, tokens: part, want: Want::All }], true)?;
-                    let d = h.len() / part.len();
-                    v.resize(d, 0.0);
-                    for row in h.chunks_exact(d) {
-                        for (a, &b) in v.iter_mut().zip(row) {
-                            *a += b;
-                        }
-                    }
-                }
-                Ok(())
-            })();
-            seq.free(&mut self.pool.alloc);
-            r?;
-            Metrics::add(&self.metrics.embedded_tokens, ids.len());
-            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-            v.iter_mut().for_each(|x| *x /= norm);
-            out.push(v);
+    /// Finish an embedding request: release its cache and send `reply`
+    /// (None: its client is gone).
+    fn end_embed(&mut self, mut job: EmbedJob, reply: Option<Result<Vec<Vec<f32>>, String>>) {
+        job.seq.free(&mut self.pool.alloc);
+        if let Some(r) = reply {
+            let _ = job.reply.send(r);
         }
-        Ok(out)
+        self.queued.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1134,10 +1305,14 @@ fn sample_next(s: &mut Seq, logits: &mut [f32], tok: &Tokenizer, vocab: &Vocab) 
     let lp = process_logits(s, logits);
     let id = match &mut s.json {
         Some(state) => match pick_json(logits, state, vocab, &s.params, &mut s.sampler) {
-            Some(id) => id,
-            None => {
+            Ok(Some(id)) => id,
+            Ok(None) => {
                 // The output so far is not valid JSON: don't report success.
                 let _ = s.events.send(GenEvent::Error("the JSON constraint reached a dead end: no token continues the output as valid JSON".into()));
+                return Next::Done(Finish::Cancelled);
+            }
+            Err(e) => {
+                let _ = s.events.send(GenEvent::Error(e));
                 return Next::Done(Finish::Cancelled);
             }
         },
@@ -1243,16 +1418,29 @@ fn emit(s: &mut Seq, id: u32, lp: Option<LogSoftmax>, logits: &[f32], tok: &Toke
 /// Pick the next token under the JSON constraint: the best candidates (by
 /// processed logit) that keep the output a valid JSON prefix. Greedy when
 /// temperature is 0, otherwise sampled among the valid candidates.
-/// None if nothing valid is left (the caller stops).
-fn pick_json(logits: &[f32], state: &mut JsonState, vocab: &Vocab, params: &GenParams, sampler: &mut Sampler) -> Option<u32> {
-    let valid = |id: u32| -> Option<JsonState> {
+/// None if nothing valid is left (the caller stops); an error if checking
+/// candidates took more than the work budget (a pathologically ambiguous
+/// schema), so one token can't stall the engine.
+fn pick_json(logits: &[f32], state: &mut JsonState, vocab: &Vocab, params: &GenParams, sampler: &mut Sampler) -> Result<Option<u32>, String> {
+    let mut work = PICK_JSON_WORK;
+    let mut valid = |id: u32| -> Result<Option<JsonState>, String> {
         let i = id as usize;
         // The model's vocabulary can be padded past the tokenizer's.
-        if i >= vocab.text.len() || (vocab.special[i] && !state.allows_special(&vocab.text[i])) || vocab.text[i].is_empty() {
-            return None;
-        }
+        let Some(bytes) = vocab.bytes.get(i).filter(|b| !b.is_empty()) else { return Ok(None) };
         let mut s = state.clone();
-        s.feed(&vocab.text[i]).then_some(s)
+        let fed = if vocab.special[i] {
+            match std::str::from_utf8(bytes) {
+                Ok(t) if state.allows_special(t) => s.feed_text(t, &mut work),
+                _ => return Ok(None),
+            }
+        } else {
+            s.feed_bytes(bytes, &mut work)
+        };
+        match fed {
+            Fed::Ok => Ok(Some(s)),
+            Fed::Rejected if work > 0 => Ok(None),
+            _ => Err("the JSON schema is too ambiguous to enforce (constraint work limit exceeded)".to_owned()),
+        }
     };
     let mut order: Vec<u32> = (0..logits.len() as u32).collect();
     let head = 256.min(order.len());
@@ -1261,7 +1449,7 @@ fn pick_json(logits: &[f32], state: &mut JsonState, vocab: &Vocab, params: &GenP
     let want = if params.temperature <= 0.0 { 1 } else { 32 };
     let mut found: Vec<(u32, JsonState)> = Vec::new();
     for &id in &order[..head] {
-        if let Some(s) = valid(id) {
+        if let Some(s) = valid(id)? {
             found.push((id, s));
             if found.len() >= want {
                 break;
@@ -1271,10 +1459,15 @@ fn pick_json(logits: &[f32], state: &mut JsonState, vocab: &Vocab, params: &GenP
     if found.is_empty() {
         // Rare: nothing valid in the head; scan the rest in logit order.
         order[head..].sort_unstable_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
-        found.extend(order[head..].iter().find_map(|&id| valid(id).map(|s| (id, s))));
+        for &id in &order[head..] {
+            if let Some(s) = valid(id)? {
+                found.push((id, s));
+                break;
+            }
+        }
     }
     if found.is_empty() {
-        return None;
+        return Ok(None);
     }
     let pick = if found.len() == 1 {
         0
@@ -1288,7 +1481,7 @@ fn pick_json(logits: &[f32], state: &mut JsonState, vocab: &Vocab, params: &GenP
     };
     let (id, s) = found.swap_remove(pick);
     *state = s;
-    Some(id)
+    Ok(Some(id))
 }
 
 /// Log-softmax of the model's raw logits at one position, for logprobs.
@@ -1324,6 +1517,48 @@ impl LogSoftmax {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn handle(max_queue: usize) -> (EngineHandle, mpsc::Receiver<Job>) {
+        let (tx, rx) = mpsc::channel();
+        let h = EngineHandle {
+            jobs: tx,
+            queued: Arc::new(AtomicUsize::new(0)),
+            metrics: Arc::new(Metrics::default()),
+            max_queue,
+            alive: Arc::new(AtomicBool::new(true)),
+        };
+        (h, rx)
+    }
+
+    fn job() -> Job {
+        let (events, _) = tmpsc::unbounded_channel();
+        Job::Generate { prompt: vec![1], params: GenParams::default(), events, cancel: Arc::new(AtomicBool::new(false)) }
+    }
+
+    #[test]
+    fn reserved_slots_hold_queue_places() {
+        let (h, _rx) = handle(3);
+        let a = h.reserve(2).unwrap();
+        // Two of three places are held: one more fits, then nothing.
+        assert!(h.reserve(2).is_err());
+        let b = h.reserve(1).unwrap();
+        assert!(h.submit(job()).is_err());
+        // Submitting with a reservation uses it instead of a new place.
+        h.submit_with(job(), Some(&a)).unwrap();
+        h.submit_with(job(), Some(&a)).unwrap();
+        assert_eq!(h.queued.load(Ordering::Relaxed), 3);
+        // Unused places come back on drop; used ones stay until the engine takes the job.
+        drop(b);
+        assert_eq!(h.queued.load(Ordering::Relaxed), 2);
+        drop(a);
+        assert_eq!(h.queued.load(Ordering::Relaxed), 2);
+        // A used-up reservation falls back to the normal check.
+        let c = h.reserve(1).unwrap();
+        h.submit_with(job(), Some(&c)).unwrap();
+        assert!(h.submit_with(job(), Some(&c)).is_err());
+        let (h0, _rx0) = handle(0);
+        assert!(h0.reserve(10_000).is_ok());
+    }
 
     #[test]
     fn lookup_proposes_what_followed_the_latest_match() {

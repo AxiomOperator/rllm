@@ -40,12 +40,13 @@ impl Sampler {
         }
         // No truncation: sample the full distribution (no sort).
         if self.cfg.top_k == 0 && self.cfg.top_p >= 1.0 {
-            let (inv_t, max) = (1.0 / self.cfg.temperature, max_of(logits));
+            let (inv_t, max) = (self.inv_t(), max_of(logits));
             let w = &mut self.weights;
             w.resize(logits.len(), 0.0);
             let total = exp_weights(logits, max, inv_t, w);
             let mut r = self.rng.next_f32() * total;
-            // Skip whole blocks by their sums, then walk the block.
+            // Skip whole blocks by their sums, then walk the block. r > 0
+            // (next_f32 is never 0), so a zero weight is never drawn.
             const B: usize = 512;
             for (bi, block) in w.chunks(B).enumerate() {
                 let sum = sum_of(block);
@@ -64,14 +65,13 @@ impl Sampler {
         }
         let cand = self.head(logits);
         let kept: f32 = cand.iter().map(|c| c.1).sum();
-        let mut r = self.rng.next_f32() * kept;
-        for &(id, p) in &cand {
-            r -= p;
-            if r <= 0.0 {
-                return id;
-            }
-        }
-        cand.last().unwrap().0
+        draw_weighted(cand.iter().copied(), self.rng.next_f32() * kept)
+    }
+
+    /// 1 / temperature, with rllm_core's minimum temperature (as the device
+    /// sampler), so it stays finite. (temperature > 0.)
+    fn inv_t(&self) -> f32 {
+        1.0 / self.cfg.temperature.max(rllm_core::sample::MIN_TEMPERATURE)
     }
 
     /// The candidates truncated sampling draws from, as (id, probability
@@ -79,7 +79,7 @@ impl Sampler {
     /// mass; sampling draws from them in proportion. (temperature > 0 and
     /// top_k or top_p set.)
     fn head(&mut self, logits: &[f32]) -> Vec<(u32, f32)> {
-        let inv_t = 1.0 / self.cfg.temperature;
+        let inv_t = self.inv_t();
         let max = max_of(logits);
         // Only the head of the distribution is sorted. The top 256 (or
         // top_k) candidates almost always hold the top_p mass; if not, the
@@ -94,7 +94,20 @@ impl Sampler {
         };
         let p = |l: f32| ((l - max) * inv_t).exp();
         let mut cand = if self.cfg.top_k > 0 {
-            top_candidates(logits, self.cfg.top_k.min(logits.len()))
+            let mut c = top_candidates(logits, self.cfg.top_k.min(logits.len()));
+            // Every token tied with the k-th logit is kept, as the device
+            // sampler (rllm_core::sample) does.
+            if let Some(&(_, kth)) = c.last() {
+                if kth > f32::NEG_INFINITY && c.len() < logits.len() {
+                    let have: Vec<u32> = c.iter().filter(|x| x.1 == kth).map(|x| x.0).collect();
+                    for (i, &l) in logits.iter().enumerate() {
+                        if l == kth && !have.contains(&(i as u32)) {
+                            c.push((i as u32, l));
+                        }
+                    }
+                }
+            }
+            c
         } else {
             // Grow the head until it holds the top_p mass.
             let mut head = 256;
@@ -109,10 +122,12 @@ impl Sampler {
         };
         // Probabilities relative to the kept set (top_k) or the whole vocabulary.
         let norm = if self.cfg.top_k > 0 { cand.iter().map(|c| p(c.1)).sum::<f32>() } else { total };
+        let logit_at = |cand: &[(u32, f32)], i: usize| logits[cand[i].0 as usize];
         for c in &mut cand {
             c.1 = p(c.1) / norm;
         }
-        // Keep the smallest prefix whose probability mass reaches top_p.
+        // Keep the smallest prefix whose probability mass reaches top_p,
+        // plus any tokens tied with its last logit (as the device sampler).
         let mut cum = 0.0;
         let mut keep = cand.len();
         for (i, c) in cand.iter().enumerate() {
@@ -121,6 +136,9 @@ impl Sampler {
                 keep = i + 1;
                 break;
             }
+        }
+        while keep < cand.len() && logit_at(&cand, keep) == logit_at(&cand, keep - 1) {
+            keep += 1;
         }
         cand.truncate(keep);
         cand
@@ -138,7 +156,7 @@ impl Sampler {
         }
         if self.cfg.top_k == 0 && self.cfg.top_p >= 1.0 {
             let mut w = vec![0f32; logits.len()];
-            let total = exp_weights(logits, max_of(logits), 1.0 / self.cfg.temperature, &mut w);
+            let total = exp_weights(logits, max_of(logits), self.inv_t(), &mut w);
             w.iter_mut().for_each(|x| *x /= total);
             return Dist::Dense(w);
         }
@@ -415,8 +433,11 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 
+    /// Uniform strictly inside (0, 1): a 0 would draw the first token
+    /// whatever its weight. 23 bits, as rllm_core::sample::uniform: with 24
+    /// the top value rounds to 1.0.
     fn next_f32(&mut self) -> f32 {
-        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+        ((self.next_u64() >> 41) as f32 + 0.5) * (1.0 / (1u64 << 23) as f32)
     }
 }
 
@@ -472,6 +493,27 @@ mod tests {
             assert_eq!(s.sample(&[f32::NAN; 8]), 0);
             s.dist(&[f32::NAN; 8]);
         }
+    }
+
+    /// Draws are strictly inside (0, 1), so a zero-weight first token
+    /// is never picked; top_k keeps ties at the k-th logit, like the device.
+    #[test]
+    fn open_draws_and_top_k_ties() {
+        let f = |z: u64| ((z >> 41) as f32 + 0.5) * (1.0 / (1u64 << 23) as f32);
+        for z in [0, u64::MAX] {
+            assert!(f(z) > 0.0 && f(z) < 1.0);
+        }
+        let mut s = Sampler::new(SamplerConfig { temperature: 1.0, top_k: 0, top_p: 1.0, seed: 1 });
+        for _ in 0..10_000 {
+            assert_eq!(s.sample(&[f32::NEG_INFINITY, 0.0]), 1);
+        }
+        let mut s = Sampler::new(SamplerConfig { temperature: 1.0, top_k: 2, top_p: 1.0, seed: 1 });
+        match s.dist(&[1.0, 0.0, 1.0, 1.0]) {
+            Dist::Sparse(c) => assert_eq!(c.len(), 3, "{c:?}"),
+            d => panic!("{d:?}"),
+        }
+        let mut s = Sampler::new(SamplerConfig { temperature: 1e-30, top_k: 2, top_p: 0.9, seed: 1 });
+        assert_eq!(s.sample(&[0.0, 1.0, 0.5]), 1);
     }
 
     fn random_logits(n: usize, seed: u64, scale: f32) -> Vec<f32> {

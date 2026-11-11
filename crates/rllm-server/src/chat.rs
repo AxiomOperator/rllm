@@ -2,28 +2,29 @@
 //! completion endpoints.
 
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
-use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{Value, json};
+use tokio_stream::StreamMap;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::error::{ApiError, ApiResult};
-use crate::generation::{self, GenSpec, Out, TokenInfo};
+use crate::generation::{self, GenSpec, Out, Summary, TokenInfo};
 use crate::output::{OutputParser, Piece, ToolCall};
 use crate::params;
 use crate::prompt::{self, JsonFormat, ToolChoice};
 use crate::state::{AppState, StoredChat, list_object, paginate};
-use crate::util;
+use crate::util::{self, Recv, SseSink};
 
 /// Everything a chat request asks for, validated.
 struct ChatRequest {
+    /// Queue places held before responding (set after parsing).
+    slots: Option<Arc<crate::engine::Slots>>,
     model: String,
     messages_raw: Vec<Value>,
     prompt: prompt::ChatPrompt,
@@ -87,6 +88,7 @@ fn parse(state: &AppState, body: &[u8]) -> ApiResult<ChatRequest> {
         return Err(ApiError::invalid("The 'stream_options' parameter is only allowed when 'stream' is enabled.", Some("stream_options")));
     }
     Ok(ChatRequest {
+        slots: None,
         model,
         messages_raw,
         prompt,
@@ -114,12 +116,13 @@ fn spec(state: &AppState, req: &ChatRequest, choice: usize) -> GenSpec {
         forced: req.prompt.forced.clone(),
         suffix: req.prompt.suffix.clone(),
         skip_special: false,
+        slots: req.slots.clone(),
     }
 }
 
 fn logprob_entry(t: &TokenInfo) -> Value {
-    let top: Vec<Value> = t.top.iter().map(|(tok, lp)| json!({ "token": tok, "bytes": tok.as_bytes(), "logprob": lp })).collect();
-    json!({ "token": t.token, "bytes": t.token.as_bytes(), "logprob": t.logprob, "top_logprobs": top })
+    let top: Vec<Value> = t.top.iter().map(|(tok, bytes, lp)| json!({ "token": tok, "bytes": bytes, "logprob": lp })).collect();
+    json!({ "token": t.token, "bytes": t.bytes, "logprob": t.logprob, "top_logprobs": top })
 }
 
 fn tool_call_json(call: &ToolCall) -> Value {
@@ -137,58 +140,52 @@ fn usage(prompt: usize, cached: usize, completion: usize, reasoning: usize) -> V
 }
 
 pub async fn create(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResult<Response> {
-    let req = parse(&state, &body)?;
+    // Rendering and tokenizing the prompt is CPU work: off the async workers.
+    let s = state.clone();
+    let mut req = util::blocking(move || parse(&s, &body)).await?;
+    // Before a streaming response sends its 200 head: a full queue is a 503.
+    req.slots = Some(state.reserve(req.n)?);
     let id = util::alnum_id("chatcmpl-", 29);
     let created = util::now();
     if req.stream {
-        return Ok(stream(state, req, id, created).into_response());
+        return Ok(util::sse(move |sink| async move {
+            let chunk = |choices: Value, usage: Value| {
+                json!({
+                    "id": id, "object": "chat.completion.chunk", "created": created, "model": req.model,
+                    "service_tier": "default", "system_fingerprint": state.fingerprint, "choices": choices, "usage": usage,
+                })
+            };
+            match run(&state, &req, Some((&sink, &chunk))).await {
+                Ok(choices) => {
+                    if req.include_usage {
+                        sink.data(&chunk(json!([]), Usage::of(&req, &choices).json()));
+                    }
+                    sink.done();
+                    // Stored once the stream has finished.
+                    if req.store {
+                        save(&state, &req, &id, completion_object(&state, &req, &id, created, &choices));
+                    }
+                }
+                Err(Abort::Error(e)) => sink.error_done(&e),
+                Err(Abort::Gone) => {}
+            }
+        }));
     }
-    let mut choices = Vec::with_capacity(req.n);
-    let (mut completion, mut reasoning, mut prompt_tokens, mut cached) = (0, 0, req.prompt.ids.len(), 0);
-    let specs = (0..req.n).map(|i| spec(&state, &req, i)).collect();
-    for (i, c) in generation::collect_all(&state, specs).await?.into_iter().enumerate() {
-        let s = c.summary().clone();
-        prompt_tokens = s.prompt_tokens;
-        cached = cached.max(s.cached_tokens);
-        completion += s.completion_tokens;
-        reasoning += s.reasoning_tokens;
-        let mut calls: Vec<Value> = c.tool_calls.iter().map(tool_call_json).collect();
-        if !req.parallel_tool_calls {
-            calls.truncate(1);
-        }
-        let finish = if calls.is_empty() { s.finish.as_str() } else { "tool_calls" };
-        let mut message = json!({
-            "role": "assistant",
-            "content": if c.content.is_empty() && !calls.is_empty() { Value::Null } else { json!(c.content) },
-            "refusal": null,
-            "annotations": [],
-        });
-        if !calls.is_empty() {
-            message["tool_calls"] = Value::Array(calls);
-        }
-        if !c.reasoning.is_empty() {
-            // Not in the OpenAI schema; the de facto field for reasoning text.
-            message["reasoning_content"] = json!(c.reasoning);
-        }
-        let logprobs = if req.logprobs { json!({ "content": c.tokens.iter().map(logprob_entry).collect::<Vec<_>>(), "refusal": null }) } else { Value::Null };
-        choices.push(json!({ "index": i, "message": message, "logprobs": logprobs, "finish_reason": finish }));
-    }
-    let completion_obj = json!({
-        "id": id,
-        "object": "chat.completion",
-        "created": created,
-        "model": req.model,
-        "choices": choices,
-        "usage": usage(prompt_tokens, cached, completion, reasoning),
-        "service_tier": "default",
-        "system_fingerprint": state.fingerprint,
-        "metadata": req.metadata,
-    });
+    let choices = match run(&state, &req, None).await {
+        Ok(c) => c,
+        Err(Abort::Error(e)) => return Err(e),
+        Err(Abort::Gone) => return Err(ApiError::server("generation ended unexpectedly")),
+    };
+    let completion_obj = completion_object(&state, &req, &id, created, &choices);
     if req.store {
-        let messages = req.messages_raw.iter().enumerate().map(|(i, m)| with_id(m, &format!("{id}-{i}"))).collect();
-        state.store.lock().unwrap().chats.insert(id.clone(), StoredChat { completion: completion_obj.clone(), messages });
+        save(&state, &req, &id, completion_obj.clone());
     }
     Ok(Json(completion_obj).into_response())
+}
+
+fn save(state: &AppState, req: &ChatRequest, id: &str, completion: Value) {
+    let messages = req.messages_raw.iter().enumerate().map(|(i, m)| with_id(m, &format!("{id}-{i}"))).collect();
+    state.store.lock().unwrap().chats.insert(id.to_owned(), StoredChat { completion, messages });
 }
 
 fn with_id(m: &Value, id: &str) -> Value {
@@ -197,75 +194,176 @@ fn with_id(m: &Value, id: &str) -> Value {
     v
 }
 
-fn stream(state: Arc<AppState>, req: ChatRequest, id: String, created: u64) -> Sse<UnboundedReceiverStream<Result<Event, Infallible>>> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
-    tokio::spawn(async move {
-        let chunk = |choices: Value, usage: Value| {
-            json!({
-                "id": id, "object": "chat.completion.chunk", "created": created, "model": req.model,
-                "service_tier": "default", "system_fingerprint": state.fingerprint, "choices": choices, "usage": usage,
-            })
+/// One choice's output, accumulated as it streams.
+#[derive(Default)]
+struct Choice {
+    content: String,
+    reasoning: String,
+    /// Tool calls as returned (`tool_call_json`, without stream indexes).
+    calls: Vec<Value>,
+    /// Logprobs of the tokens that produced `content`.
+    logprobs: Vec<Value>,
+    /// Logprobs of tokens not yet attributed to any output.
+    pending: Vec<Value>,
+    summary: Option<Summary>,
+}
+
+impl Choice {
+    fn finish(&self) -> &'static str {
+        if !self.calls.is_empty() { "tool_calls" } else { self.summary.as_ref().map_or("stop", |s| s.finish.as_str()) }
+    }
+}
+
+struct Usage {
+    prompt: usize,
+    cached: usize,
+    completion: usize,
+    reasoning: usize,
+}
+
+impl Usage {
+    fn of(req: &ChatRequest, choices: &[Choice]) -> Self {
+        let mut u = Usage { prompt: req.prompt.ids.len(), cached: 0, completion: 0, reasoning: 0 };
+        for s in choices.iter().filter_map(|c| c.summary.as_ref()) {
+            u.prompt = s.prompt_tokens;
+            u.cached = u.cached.max(s.cached_tokens);
+            u.completion += s.completion_tokens;
+            u.reasoning += s.reasoning_tokens;
+        }
+        u
+    }
+
+    fn json(&self) -> Value {
+        usage(self.prompt, self.cached, self.completion, self.reasoning)
+    }
+}
+
+/// Why [`run`] stopped early.
+enum Abort {
+    Error(ApiError),
+    /// The streaming client disconnected; nothing more to send.
+    Gone,
+}
+
+/// A chunk builder: (choices, usage) → `chat.completion.chunk`.
+type Chunk<'a> = &'a (dyn Fn(Value, Value) -> Value + Send + Sync);
+
+/// Run the request's `n` choices concurrently (the engine batches them),
+/// streaming chunks to `sink` if given, and return what each produced.
+/// Returning early drops every generation's receiver, which cancels them.
+async fn run(state: &Arc<AppState>, req: &ChatRequest, sink: Option<(&SseSink, Chunk<'_>)>) -> Result<Vec<Choice>, Abort> {
+    let send = |choices: Value| match sink {
+        Some((s, chunk)) => s.data(&chunk(choices, Value::Null)),
+        None => true,
+    };
+    let lp_value = |entries: Vec<Value>| if req.logprobs { json!({ "content": entries, "refusal": null }) } else { Value::Null };
+    let mut gens = StreamMap::new();
+    for i in 0..req.n {
+        let first = json!([{ "index": i, "delta": { "role": "assistant", "content": "", "refusal": null }, "logprobs": null, "finish_reason": null }]);
+        if !send(first) {
+            return Err(Abort::Gone);
+        }
+        let rx = generation::spawn(state, spec(state, req, i), Arc::new(AtomicBool::new(false)));
+        gens.insert(i, UnboundedReceiverStream::new(rx));
+    }
+    let mut choices: Vec<Choice> = (0..req.n).map(|_| Choice::default()).collect();
+    loop {
+        let (i, ev) = match util::next_from(sink.map(|s| s.0), &mut gens).await {
+            Recv::Item(x) => x,
+            Recv::Ended => break,
+            Recv::Gone => return Err(Abort::Gone),
         };
-        let send = |v: Value| tx.send(Ok(Event::default().data(v.to_string()))).is_ok();
-        let (mut completion, mut reasoning, mut prompt_tokens, mut cached) = (0, 0, req.prompt.ids.len(), 0);
-        for i in 0..req.n {
-            let first = json!([{ "index": i, "delta": { "role": "assistant", "content": "", "refusal": null }, "logprobs": null, "finish_reason": null }]);
-            if !send(chunk(first, Value::Null)) {
-                return;
-            }
-            let mut rx = generation::spawn(&state, spec(&state, &req, i), Arc::new(AtomicBool::new(false)));
-            let mut pending_lp: Vec<Value> = Vec::new();
-            let mut n_calls = 0usize;
-            let lp_value = |pending: &mut Vec<Value>| {
-                if req.logprobs { json!({ "content": std::mem::take(pending), "refusal": null }) } else { Value::Null }
-            };
-            while let Some(ev) = rx.recv().await {
-                let delta = match ev {
-                    Err(e) => {
-                        send(e.body());
-                        let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                        return;
-                    }
-                    Ok(Out::Token(t)) => {
-                        pending_lp.push(logprob_entry(&t));
-                        continue;
-                    }
-                    Ok(Out::Piece(Piece::Content(t))) => json!({ "content": t }),
-                    Ok(Out::Piece(Piece::Reasoning(t))) => json!({ "reasoning_content": t }),
-                    Ok(Out::Piece(Piece::ToolCall(call))) => {
-                        if !req.parallel_tool_calls && n_calls > 0 {
-                            continue;
-                        }
-                        let mut tc = tool_call_json(&call);
-                        tc["index"] = json!(n_calls);
-                        n_calls += 1;
-                        json!({ "tool_calls": [tc] })
-                    }
-                    Ok(Out::Done(s)) => {
-                        prompt_tokens = s.prompt_tokens;
-                        cached = cached.max(s.cached_tokens);
-                        completion += s.completion_tokens;
-                        reasoning += s.reasoning_tokens;
-                        let finish = if n_calls > 0 { "tool_calls" } else { s.finish.as_str() };
-                        let lp = lp_value(&mut pending_lp);
-                        if !send(chunk(json!([{ "index": i, "delta": {}, "logprobs": lp, "finish_reason": finish }]), Value::Null)) {
-                            return;
-                        }
-                        break;
-                    }
-                };
-                let lp = lp_value(&mut pending_lp);
-                if !send(chunk(json!([{ "index": i, "delta": delta, "logprobs": lp, "finish_reason": null }]), Value::Null)) {
-                    return;
+        let c = &mut choices[i];
+        // Tokens arrive before the text they decode to; the text's kind
+        // decides whether their logprobs belong to the message content.
+        // Reasoning, tool-call and held-back (stop sequence, end of output)
+        // tokens are left out.
+        let delta = match ev.map_err(Abort::Error)? {
+            Out::Token(t) => {
+                if req.logprobs && !t.reasoning {
+                    c.pending.push(logprob_entry(&t));
                 }
+                continue;
             }
+            Out::Piece(Piece::Content(t)) => {
+                c.content.push_str(&t);
+                let lp = std::mem::take(&mut c.pending);
+                c.logprobs.extend(lp.iter().cloned());
+                if !send(json!([{ "index": i, "delta": { "content": t }, "logprobs": lp_value(lp), "finish_reason": null }])) {
+                    return Err(Abort::Gone);
+                }
+                continue;
+            }
+            Out::Piece(Piece::Reasoning(t)) => {
+                c.pending.clear();
+                c.reasoning.push_str(&t);
+                json!({ "reasoning_content": t })
+            }
+            Out::Piece(Piece::ToolCall(call)) => {
+                c.pending.clear();
+                if !req.parallel_tool_calls && !c.calls.is_empty() {
+                    continue;
+                }
+                let mut tc = tool_call_json(&call);
+                c.calls.push(tc.clone());
+                tc["index"] = json!(c.calls.len() - 1);
+                json!({ "tool_calls": [tc] })
+            }
+            Out::Done(s) => {
+                c.pending.clear();
+                c.summary = Some(s);
+                let finish = c.finish();
+                if !send(json!([{ "index": i, "delta": {}, "logprobs": lp_value(Vec::new()), "finish_reason": finish }])) {
+                    return Err(Abort::Gone);
+                }
+                // The generation's channel closes next; done with it.
+                gens.remove(&i);
+                continue;
+            }
+        };
+        if !send(json!([{ "index": i, "delta": delta, "logprobs": lp_value(Vec::new()), "finish_reason": null }])) {
+            return Err(Abort::Gone);
         }
-        if req.include_usage {
-            send(chunk(json!([]), usage(prompt_tokens, cached, completion, reasoning)));
-        }
-        let _ = tx.send(Ok(Event::default().data("[DONE]")));
-    });
-    Sse::new(UnboundedReceiverStream::new(rx))
+    }
+    if choices.iter().any(|c| c.summary.is_none()) {
+        return Err(Abort::Error(ApiError::server("generation ended without a result")));
+    }
+    Ok(choices)
+}
+
+fn completion_object(state: &AppState, req: &ChatRequest, id: &str, created: u64, choices: &[Choice]) -> Value {
+    let list: Vec<Value> = choices
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut message = json!({
+                "role": "assistant",
+                "content": if c.content.is_empty() && !c.calls.is_empty() { Value::Null } else { json!(c.content) },
+                "refusal": null,
+                "annotations": [],
+            });
+            if !c.calls.is_empty() {
+                message["tool_calls"] = json!(c.calls);
+            }
+            if !c.reasoning.is_empty() {
+                // Not in the OpenAI schema; the de facto field for reasoning text.
+                message["reasoning_content"] = json!(c.reasoning);
+            }
+            let logprobs = if req.logprobs { json!({ "content": c.logprobs, "refusal": null }) } else { Value::Null };
+            json!({ "index": i, "message": message, "logprobs": logprobs, "finish_reason": c.finish() })
+        })
+        .collect();
+    json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": created,
+        "model": req.model,
+        "choices": list,
+        "usage": Usage::of(req, choices).json(),
+        "service_tier": "default",
+        "system_fingerprint": state.fingerprint,
+        "metadata": req.metadata,
+    })
 }
 
 /// Parse `?a=b&metadata[k]=v` style query strings.
@@ -321,16 +419,16 @@ pub async fn list(State(state): State<Arc<AppState>>, RawQuery(q): RawQuery) -> 
     let model = q.iter().find(|(k, _)| k == "model").map(|(_, v)| v.clone());
     let meta: HashMap<String, String> =
         q.iter().filter_map(|(k, v)| k.strip_prefix("metadata[").and_then(|k| k.strip_suffix(']')).map(|k| (k.to_owned(), v.clone()))).collect();
+    // Page first, then copy only the page (the lock is held throughout).
     let store = state.store.lock().unwrap();
-    let items: Vec<(String, Value)> = store
+    let items: Vec<_> = store
         .chats
         .iter()
         .filter(|(_, c)| model.as_ref().is_none_or(|m| c.completion["model"] == m.as_str()))
         .filter(|(_, c)| meta.iter().all(|(k, v)| c.completion["metadata"][k] == v.as_str()))
-        .map(|(id, c)| (id.clone(), c.completion.clone()))
         .collect();
     let (page, has_more) = paginate(items, after.as_deref(), limit, desc);
-    Ok(Json(list_object(page.into_iter().map(|(_, v)| v).collect(), has_more)))
+    Ok(Json(list_object(page.into_iter().map(|(_, c)| c.completion.clone()).collect(), has_more)))
 }
 
 fn not_found(id: &str) -> ApiError {
@@ -349,9 +447,14 @@ pub async fn update(State(state): State<Arc<AppState>>, Path(id): Path<String>, 
     }
     let metadata = params::metadata(&m)?;
     let mut store = state.store.lock().unwrap();
-    let c = store.chats.get_mut(&id).ok_or_else(|| not_found(&id))?;
-    c.completion["metadata"] = metadata;
-    Ok(Json(c.completion.clone()))
+    let c = store
+        .chats
+        .update(&id, |c| {
+            c.completion["metadata"] = metadata;
+            c.completion.clone()
+        })
+        .ok_or_else(|| not_found(&id))?;
+    Ok(Json(c))
 }
 
 pub async fn delete(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
@@ -365,19 +468,18 @@ pub async fn messages(State(state): State<Arc<AppState>>, Path(id): Path<String>
     let (after, limit, desc) = list_params(&q, false)?;
     let store = state.store.lock().unwrap();
     let c = store.chats.get(&id).ok_or_else(|| not_found(&id))?;
-    let items: Vec<(String, Value)> = c
-        .messages
-        .iter()
-        .map(|m| {
-            let mid = m["id"].as_str().unwrap_or("").to_owned();
+    let items: Vec<(&str, &Value)> = c.messages.iter().map(|m| (m["id"].as_str().unwrap_or(""), m)).collect();
+    let (page, has_more) = paginate(items, after.as_deref(), limit, desc);
+    let page = page
+        .into_iter()
+        .map(|(mid, m)| {
             let content = match &m["content"] {
                 Value::Array(parts) => json!(parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("")),
                 other => other.clone(),
             };
             let parts = if m["content"].is_array() { m["content"].clone() } else { Value::Null };
-            (mid.clone(), json!({ "id": mid, "role": m["role"], "content": content, "content_parts": parts, "name": m.get("name") }))
+            json!({ "id": mid, "role": m["role"], "content": content, "content_parts": parts, "name": m.get("name") })
         })
         .collect();
-    let (page, has_more) = paginate(items, after.as_deref(), limit, desc);
-    Ok(Json(list_object(page.into_iter().map(|(_, v)| v).collect(), has_more)))
+    Ok(Json(list_object(page, has_more)))
 }

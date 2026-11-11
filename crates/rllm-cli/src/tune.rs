@@ -143,6 +143,8 @@ struct Plan {
     memory: Option<[usize; 5]>,
     reasons: Vec<String>,
     warnings: Vec<String>,
+    /// False when not even a minimal KV cache fits: there is no command to recommend.
+    fits: bool,
 }
 
 impl Plan {
@@ -206,6 +208,7 @@ fn plan(m: &ModelProfile, draft: Option<&Draft>, mach: &Machine, want_ctx: Optio
         memory: None,
         reasons: Vec::new(),
         warnings: Vec::new(),
+        fits: true,
     };
     if p.ctx > m.max_context {
         p.warnings.push(format!("--ctx {} is beyond the {} tokens the model was trained for; quality may drop past it.", p.ctx, m.max_context));
@@ -258,7 +261,7 @@ fn plan(m: &ModelProfile, draft: Option<&Draft>, mach: &Machine, want_ctx: Optio
     let mut with_draft = draft.is_some();
     let mut kv_tokens = tokens(p.kv_type, p.ctx, with_draft);
     if with_draft && kv_tokens < p.ctx {
-        if want_ctx.is_none() && kv_tokens >= p.ctx * 3 / 4 {
+        if want_ctx.is_none() && kv_tokens > 0 && kv_tokens >= p.ctx * 3 / 4 {
             // A slightly shorter context is worth the draft's speedup.
             p.reasons.push(format!("--ctx {kv_tokens} (not {}): leaves room for the draft model's weights and KV cache.", p.ctx));
             p.ctx = kv_tokens;
@@ -270,15 +273,20 @@ fn plan(m: &ModelProfile, draft: Option<&Draft>, mach: &Machine, want_ctx: Optio
         }
     }
     if kv_tokens < 2048 {
-        p.kv_tokens = kv_tokens;
-        p.warnings.push(format!(
-            "Only {} tokens of KV cache fit: the model needs about {:.1} GiB of weights and runtime memory, and {:.1} GiB is free. Use a smaller quantization or free GPU memory.",
-            kv_tokens,
+        let need = format!(
+            "the model needs about {:.1} GiB of weights and runtime memory, and {:.1} GiB is free. Use a smaller quantization or free GPU memory.",
             fixed(p.kv_type, p.ctx, false) as f64 / GIB,
             free as f64 / GIB
-        ));
-        p.ctx = kv_tokens.max(BLOCK);
+        );
+        p.kv_tokens = kv_tokens;
         p.parallel = 1;
+        if kv_tokens == 0 {
+            p.fits = false;
+            p.warnings.push(format!("The model does not fit on {}: {need}", p.device));
+        } else {
+            p.warnings.push(format!("Only {kv_tokens} tokens of KV cache fit: {need}"));
+            p.ctx = p.ctx.min(kv_tokens);
+        }
         return p;
     }
     if kv_tokens < p.ctx {
@@ -388,14 +396,30 @@ fn find_draft(model: &Path, g: &Gguf, profile: &ModelProfile, explicit: Option<&
     let candidates: Vec<PathBuf> = match explicit {
         Some(p) => vec![p.to_path_buf()],
         None => {
+            // Screen siblings cheaply before opening any: small enough to be a
+            // draft (a quarter of the weights, plus room for metadata), and
+            // a header saying same architecture family and vocabulary size.
+            let max_len = (profile.weight_bytes / 4 + 64 * MIB) as u64;
+            let tok_model = g.get_str("tokenizer.ggml.model").ok();
+            let n_tokens = g.get_array("tokenizer.ggml.tokens").ok().map(|t| t.len() as u64);
+            let plausible = |p: &Path| -> bool {
+                let Ok(h) = rllm_gguf::peek(p, &["general.architecture", "tokenizer.ggml.model"]) else { return false };
+                let arch = h.values.get("general.architecture").and_then(|v| v.as_str());
+                arch.is_some_and(|a| matches!(a, "qwen3" | "llama" | "gemma4"))
+                    && h.values.get("tokenizer.ggml.model").and_then(|v| v.as_str()) == tok_model
+                    && h.array_lens.get("tokenizer.ggml.tokens").copied() == n_tokens
+            };
             let dir = model.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-            let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+            let me = model.canonicalize().ok();
+            let mut v: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)
                 .ok()?
                 .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|e| e == "gguf") && p.canonicalize().ok() != model.canonicalize().ok())
+                .filter(|p| p.extension().is_some_and(|e| e == "gguf") && p.canonicalize().ok() != me)
+                .filter_map(|p| Some((std::fs::metadata(&p).ok()?.len(), p)))
+                .filter(|(len, _)| *len <= max_len)
                 .collect();
-            v.sort_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX));
-            v
+            v.sort();
+            v.into_iter().map(|(_, p)| p).filter(|p| plausible(p)).collect()
         }
     };
     candidates.into_iter().find_map(|path| {
@@ -544,7 +568,48 @@ fn measure<B: MemInfo>(b: &B, model_path: &Path, p: &Plan) -> Result<Measured> {
     })
 }
 
+/// Resize the plan's KV pool to what `--measure` found: `min_free` bytes
+/// were left at the busiest point, `margin` should be. Never recommends
+/// more than fits: a measured fit below the planned context shortens the
+/// context, and no room at all marks the plan as not fitting.
+fn fit_measured(p: &mut Plan, min_free: usize, margin: usize, per_token: usize, auto_parallel: bool) {
+    let adjust = (min_free as i64 - margin as i64) / per_token.max(1) as i64 / 1024 * 1024;
+    let before = p.kv_tokens;
+    let fit = p.kv_tokens as i64 + adjust;
+    if fit <= 0 {
+        p.fits = false;
+        p.warnings.push(format!(
+            "Measured memory: no room for a KV cache (lowest free {:.2} GiB, margin {:.2} GiB). The model does not fit; use a smaller quantization or free GPU memory.",
+            min_free as f64 / GIB,
+            margin as f64 / GIB
+        ));
+        return;
+    }
+    let fit = fit as usize;
+    if fit < p.ctx {
+        p.warnings.push(format!("Measured memory: context limited to {fit} tokens (planned {}).", p.ctx));
+        p.ctx = fit;
+    }
+    p.kv_tokens = fit;
+    if p.kv_tokens != before {
+        p.reasons.push(format!("Measured memory: KV pool adjusted from {before} to {} tokens.", p.kv_tokens));
+    }
+    if auto_parallel {
+        let parallel = (p.kv_tokens / 2048).clamp(1, MAX_PARALLEL);
+        if parallel < p.parallel {
+            p.reasons.push(format!("--parallel {parallel}: about 2k tokens of cache per running request (measured pool)."));
+            p.parallel = parallel;
+        }
+    }
+}
+
 pub fn tune(a: TuneArgs) -> Result<()> {
+    if let Some(c) = a.ctx {
+        crate::check_arg("ctx", c, BLOCK, crate::MAX_TOKENS)?;
+    }
+    if let Some(n) = a.parallel {
+        crate::check_arg("parallel", n, 1, 64)?;
+    }
     let g = Gguf::open(&a.model).with_context(|| format!("open {}", a.model.display()))?;
     let profile = ModelProfile::read(&g)?;
     let mach = read_machine(a.device.as_deref())?;
@@ -553,7 +618,7 @@ pub fn tune(a: TuneArgs) -> Result<()> {
 
     let mut measured = None;
     let estimated = p.memory;
-    if a.measure && let Some(gpu) = &mach.gpu {
+    if a.measure && p.fits && let Some(gpu) = &mach.gpu {
         if !a.json {
             eprintln!("[rllm] measuring: loading the model and running {} at --kv-tokens {} ...", p.ctx, p.kv_tokens);
         }
@@ -566,6 +631,9 @@ pub fn tune(a: TuneArgs) -> Result<()> {
                 Err(e) if tries < 3 && ["OUT_OF_MEMORY", "OutOfMemory"].iter().any(|s| format!("{e:#}").contains(s)) => {
                     tries += 1;
                     p.kv_tokens = p.kv_tokens * 85 / 100 / 1024 * 1024;
+                    if p.kv_tokens == 0 {
+                        return Err(e.context("measuring: out of memory even with a minimal KV cache; the model does not fit"));
+                    }
                     p.ctx = p.ctx.min(p.kv_tokens);
                     p.warnings.push(format!("Out of memory at the estimated pool size; retried with --kv-tokens {}.", p.kv_tokens));
                 }
@@ -574,19 +642,15 @@ pub fn tune(a: TuneArgs) -> Result<()> {
         };
         // Free memory left at the busiest point: grow or shrink the pool to
         // leave exactly the margin.
-        if let Some(mem) = &mut p.memory {
-            let margin = mem[4];
+        if let Some(margin) = p.memory.map(|mem| mem[4]) {
             let per_token = profile.kv_bytes_per_token(p.kv_type);
-            let adjust = (m.min_free as i64 - margin as i64) / per_token as i64 / 1024 * 1024;
-            let before = p.kv_tokens;
-            p.kv_tokens = (p.kv_tokens as i64 + adjust).max(p.ctx as i64) as usize;
-            if p.kv_tokens != before {
-                p.reasons.push(format!("Measured memory: KV pool adjusted from {before} to {} tokens.", p.kv_tokens));
-            }
+            fit_measured(&mut p, m.min_free, margin, per_token, a.parallel.is_none());
             // The draft's share stays as estimated (its pool is in `runtime`'s
             // complement: measured free memory already reflects it).
-            mem[1] = m.weights;
-            mem[3] = m.runtime;
+            if let Some(mem) = &mut p.memory {
+                mem[1] = m.weights;
+                mem[3] = m.runtime;
+            }
         }
         if let Some(r) = m.draft_ratio
             && r > 0.3
@@ -600,7 +664,8 @@ pub fn tune(a: TuneArgs) -> Result<()> {
 
     if a.json {
         let v = serde_json::json!({
-            "command": p.command(&a.model),
+            "fits": p.fits,
+            "command": p.fits.then(|| p.command(&a.model)),
             "device": p.device, "ctx": p.ctx, "parallel": p.parallel, "kv_tokens": p.kv_tokens,
             "kv_type": p.kv_type.to_string(), "prefill_chunk": p.prefill_chunk, "host_cache_gb": p.host_cache_gb,
             "draft": p.draft, "prompt_lookup": p.prompt_lookup,
@@ -687,7 +752,11 @@ pub fn tune(a: TuneArgs) -> Result<()> {
         println!("  Lowest free GPU memory during the run: {:.2} GiB", m.min_free as f64 / GIB);
     }
     println!("Recommended");
-    println!("  {}", p.command(&a.model));
+    if p.fits {
+        println!("  {}", p.command(&a.model));
+    } else {
+        println!("  nothing: the model does not fit on {} with room for a KV cache (see below).", p.device);
+    }
     println!("Why");
     for r in &p.reasons {
         println!("  - {r}");
@@ -695,7 +764,7 @@ pub fn tune(a: TuneArgs) -> Result<()> {
     for w in &p.warnings {
         println!("  ! {w}");
     }
-    if !a.measure && mach.gpu.is_some() {
+    if !a.measure && p.fits && mach.gpu.is_some() {
         println!("Memory figures are estimates; `rllm tune --measure` loads the model and checks them (under a minute, uses the GPU).");
     }
     Ok(())
@@ -765,6 +834,42 @@ mod tests {
     fn too_little_memory_warns() {
         let p = plan(&qwen8b(), None, &machine(5, 16), None, None);
         assert!(p.warnings.iter().any(|w| w.contains("smaller quantization")), "{:?}", p.warnings);
+    }
+
+    #[test]
+    fn no_room_at_all_does_not_fit() {
+        // 5 GB of weights on a 4 GiB GPU: no pool, no command, never `--kv-tokens 0`.
+        let p = plan(&qwen8b(), None, &machine(4, 16), None, None);
+        assert!(!p.fits, "{p:?}");
+        assert!(p.warnings.iter().any(|w| w.contains("does not fit")), "{:?}", p.warnings);
+        // A little room: the context shrinks to the pool, which is never 0.
+        let p = plan(&qwen8b(), None, &machine(7, 16), Some(32768), None);
+        assert!(p.fits && p.kv_tokens > 0 && p.ctx <= p.kv_tokens, "{p:?}");
+    }
+
+    #[test]
+    fn measurement_never_recommends_more_than_fits() {
+        let base = plan(&qwen8b(), None, &machine(40, 128), None, None);
+        let per_token = qwen8b().kv_bytes_per_token(base.kv_type);
+        let margin = base.memory.unwrap()[4];
+        // Plenty left over: the pool grows, the context stays.
+        let mut p = base.clone();
+        fit_measured(&mut p, margin + 1000 * per_token * 1024, margin, per_token, true);
+        assert!(p.kv_tokens > base.kv_tokens && p.ctx == base.ctx && p.fits);
+        // The measured fit is below the context: the context shrinks to it
+        // (it used to be clamped up to ctx, over-recommending the pool).
+        let mut p = base.clone();
+        p.kv_tokens = 40960;
+        let big_margin = 8usize << 30;
+        fit_measured(&mut p, big_margin - (40960 - 4096) * per_token, big_margin, per_token, true);
+        assert!(p.fits && p.kv_tokens < base.ctx && p.ctx == p.kv_tokens, "{} {}", p.ctx, p.kv_tokens);
+        assert!(p.kv_tokens <= 4096 + 1024 && p.parallel <= 2, "{} {}", p.kv_tokens, p.parallel);
+        assert!(p.warnings.iter().any(|w| w.contains("context limited")));
+        // Nothing fits.
+        let mut p = base.clone();
+        p.kv_tokens = 2048;
+        fit_measured(&mut p, 0, margin, per_token, true);
+        assert!(!p.fits);
     }
 
     #[test]

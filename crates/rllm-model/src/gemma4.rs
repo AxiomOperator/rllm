@@ -19,7 +19,9 @@ use anyhow::{Context, Result, bail};
 use rllm_core::{Activation, AttnMeta, Backend, HostTensor, KvLayout, KvType};
 use rllm_gguf::{Gguf, Value};
 
-use crate::loader::{host_tensor, load_weight};
+use crate::loader::{
+    MAX_CONTEXT, MAX_DIM, check_same_as_head_dim, check_shape, check_shape_opt, host_tensor, load_weight, meta_usize, meta_usize_or,
+};
 use crate::{Batch, Model, StepOut};
 
 #[derive(Debug, Clone)]
@@ -48,18 +50,24 @@ pub struct Gemma4Config {
 impl Gemma4Config {
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
         let k = |s: &str| format!("gemma4.{s}");
-        let u = |s: &str| -> Result<usize> { Ok(g.get_u64(&k(s))? as usize) };
+        let u = |s: &str| meta_usize(g, &k(s), MAX_DIM, false);
         let n_layers = u("block_count")?;
+        // One entry per layer, true (or nonzero) for sliding-window layers
+        // (llama.cpp reads it into `swa_layers`, a bool per layer).
         let is_swa: Vec<bool> = g
             .get_array(&k("attention.sliding_window_pattern"))?
             .iter()
-            .map(|v| matches!(v, Value::Bool(true)))
-            .collect();
+            .map(|v| match v {
+                Value::Bool(b) => Ok(*b),
+                Value::String(_) | Value::Array(_) | Value::F32(_) | Value::F64(_) => bail!("sliding_window_pattern: unexpected entry {}", v.summary()),
+                v => v.as_u64().map(|n| n != 0).with_context(|| format!("sliding_window_pattern: unexpected entry {}", v.summary())),
+            })
+            .collect::<Result<_>>()?;
         if is_swa.len() != n_layers {
             bail!("sliding_window_pattern has {} entries for {n_layers} layers", is_swa.len());
         }
-        let shared = g.get_u64(&k("attention.shared_kv_layers")).unwrap_or(0) as usize;
-        let n_kv_layers = n_layers - shared;
+        let shared = meta_usize_or(g, &k("attention.shared_kv_layers"), 0, MAX_DIM, true)?;
+        let n_kv_layers = n_layers.checked_sub(shared).filter(|&n| n > 0).with_context(|| format!("shared_kv_layers {shared} leaves no layer of {n_layers} with its own KV cache"))?;
         if shared > 0 && (n_kv_layers < 2 || is_swa[n_kv_layers - 1] || !is_swa[n_kv_layers - 2]) {
             // llama.cpp hard-codes the reuse sources as the last global (n-1) and
             // last sliding (n-2) layer; check the layout actually matches that.
@@ -73,25 +81,135 @@ impl Gemma4Config {
         if g.tensor("blk.0.ffn_gate_inp.weight").is_some() {
             bail!("Gemma 4 MoE variants not supported yet");
         }
-        Ok(Self {
+        let embd = g.require_tensor("token_embd.weight")?;
+        let [_, vocab] = embd.dims[..] else { bail!("token_embd.weight has shape {:?}, expected 2 dims", embd.dims) };
+        let vocab = usize::try_from(vocab).ok().filter(|&v| (1..=MAX_DIM).contains(&v)).context("token_embd.weight: vocabulary size out of range")?;
+        let f = |s: &str| -> Result<f32> {
+            let v = g.get_f64(&k(s))? as f32;
+            anyhow::ensure!(v.is_finite() && v > 0.0, "gemma4.{s} = {v} must be a positive number");
+            Ok(v)
+        };
+        let head_dim_global = u("attention.key_length")?;
+        let head_dim_swa = u("attention.key_length_swa")?;
+        // Global layers' partial rotary is expressed through rope_freqs over
+        // the whole head; a smaller rotary width, or V heads of another
+        // size, would load and compute garbage.
+        check_same_as_head_dim(g, &k("rope.dimension_count"), head_dim_global, "partial rotary embedding")?;
+        check_same_as_head_dim(g, &k("rope.dimension_count_swa"), head_dim_swa, "partial rotary embedding")?;
+        check_same_as_head_dim(g, &k("attention.value_length"), head_dim_global, "a value head size different from the key head size")?;
+        check_same_as_head_dim(g, &k("attention.value_length_swa"), head_dim_swa, "a value head size different from the key head size")?;
+        let cfg = Self {
             n_layers,
             hidden: u("embedding_length")?,
             ffn: u("feed_forward_length")?,
             n_heads: u("attention.head_count")?,
             n_kv_heads: u("attention.head_count_kv")?,
-            head_dim_global: u("attention.key_length")?,
-            head_dim_swa: u("attention.key_length_swa")?,
-            rope_theta_global: g.get_f64(&k("rope.freq_base"))? as f32,
-            rope_theta_swa: g.get_f64(&k("rope.freq_base_swa"))? as f32,
-            sliding_window: u("attention.sliding_window")?,
+            head_dim_global,
+            head_dim_swa,
+            rope_theta_global: f("rope.freq_base")?,
+            rope_theta_swa: f("rope.freq_base_swa")?,
+            sliding_window: meta_usize(g, &k("attention.sliding_window"), MAX_CONTEXT, false)?,
             is_swa,
             n_kv_layers,
-            per_layer_dim: g.get_u64(&k("embedding_length_per_layer_input")).unwrap_or(0) as usize,
-            vocab: g.require_tensor("token_embd.weight")?.dims[1] as usize,
-            rms_eps: g.get_f64(&k("attention.layer_norm_rms_epsilon"))? as f32,
-            logit_softcap: g.get_f64(&k("final_logit_softcapping")).ok().map(|v| v as f32).filter(|&v| v > 0.0),
-            max_context: u("context_length").unwrap_or(8192),
-        })
+            per_layer_dim: meta_usize_or(g, &k("embedding_length_per_layer_input"), 0, MAX_DIM, true)?,
+            vocab,
+            rms_eps: f("attention.layer_norm_rms_epsilon")?,
+            logit_softcap: g.get_f64(&k("final_logit_softcapping")).ok().map(|v| v as f32).filter(|&v| v.is_finite() && v > 0.0),
+            max_context: meta_usize_or(g, &k("context_length"), 8192, MAX_CONTEXT, false)?,
+        };
+        cfg.validate()?;
+        cfg.check_tensors(g)?;
+        Ok(cfg)
+    }
+
+    /// Check the hyperparameters are consistent (every count positive, KV
+    /// heads dividing query heads, KV sharing within the layer count).
+    pub fn validate(&self) -> Result<()> {
+        let c = self;
+        for (what, v) in [
+            ("block_count", c.n_layers),
+            ("embedding_length", c.hidden),
+            ("feed_forward_length", c.ffn),
+            ("head_count", c.n_heads),
+            ("head_count_kv", c.n_kv_heads),
+            ("key_length", c.head_dim_global),
+            ("key_length_swa", c.head_dim_swa),
+            ("sliding_window", c.sliding_window),
+            ("vocabulary", c.vocab),
+            ("context_length", c.max_context),
+        ] {
+            anyhow::ensure!(v > 0, "{what} must be positive");
+        }
+        anyhow::ensure!(
+            c.n_heads.is_multiple_of(c.n_kv_heads),
+            "head_count {} is not a multiple of head_count_kv {}",
+            c.n_heads,
+            c.n_kv_heads
+        );
+        anyhow::ensure!(
+            c.head_dim_global.is_multiple_of(2) && c.head_dim_swa.is_multiple_of(2),
+            "head sizes {}/{} must be even (RoPE rotates pairs)",
+            c.head_dim_swa,
+            c.head_dim_global
+        );
+        anyhow::ensure!(c.n_layers <= 4096 && c.n_heads <= 4096 && c.head_dim_global.max(c.head_dim_swa) <= 4096, "implausible model size");
+        anyhow::ensure!(c.is_swa.len() == c.n_layers, "sliding_window_pattern has {} entries for {} layers", c.is_swa.len(), c.n_layers);
+        anyhow::ensure!((1..=c.n_layers).contains(&c.n_kv_layers), "{} KV layers of {}", c.n_kv_layers, c.n_layers);
+        if c.n_kv_layers < c.n_layers {
+            anyhow::ensure!(
+                c.n_kv_layers >= 2 && !c.is_swa[c.n_kv_layers - 1] && c.is_swa[c.n_kv_layers - 2],
+                "unexpected layer layout for KV sharing"
+            );
+        }
+        anyhow::ensure!(c.per_layer_dim.checked_mul(c.n_layers).is_some_and(|n| n <= MAX_DIM), "per-layer input size too large");
+        Ok(())
+    }
+
+    /// Check every tensor the model loads has the shape the config implies.
+    fn check_tensors(&self, g: &Gguf) -> Result<()> {
+        let c = self;
+        let d = c.hidden;
+        check_shape(g, "token_embd.weight", &[d, c.vocab])?;
+        check_shape(g, "output_norm.weight", &[d])?;
+        check_shape_opt(g, "output.weight", &[d, c.vocab])?;
+        check_shape_opt(g, "rope_freqs.weight", &[c.head_dim_global / 2])?;
+        let p_all = c.n_layers * c.per_layer_dim;
+        if c.per_layer_dim > 0 {
+            check_shape(g, "per_layer_token_embd.weight", &[p_all, c.vocab])?;
+            check_shape(g, "per_layer_model_proj.weight", &[d, p_all])?;
+            check_shape(g, "per_layer_proj_norm.weight", &[c.per_layer_dim])?;
+        }
+        for i in 0..c.n_layers {
+            let p = |s: &str| format!("blk.{i}.{s}.weight");
+            let hd = c.head_dim(i);
+            let (qw, kvw) = (c.n_heads * hd, c.n_kv_heads * hd);
+            for (name, dims) in [
+                ("attn_norm", &[d][..]),
+                ("attn_q", &[d, qw]),
+                ("attn_q_norm", &[hd]),
+                ("attn_output", &[qw, d]),
+                ("post_attention_norm", &[d]),
+                ("ffn_norm", &[d]),
+                ("ffn_gate", &[d, c.ffn]),
+                ("ffn_up", &[d, c.ffn]),
+                ("ffn_down", &[c.ffn, d]),
+                ("post_ffw_norm", &[d]),
+            ] {
+                check_shape(g, &p(name), dims)?;
+            }
+            if i < c.n_kv_layers {
+                check_shape(g, &p("attn_k"), &[d, kvw])?;
+                check_shape_opt(g, &p("attn_v"), &[d, kvw])?;
+                check_shape(g, &p("attn_k_norm"), &[hd])?;
+            }
+            if c.per_layer_dim > 0 {
+                check_shape(g, &p("inp_gate"), &[d, c.per_layer_dim])?;
+                check_shape(g, &p("proj"), &[c.per_layer_dim, d])?;
+                check_shape(g, &p("post_norm"), &[d])?;
+            }
+            check_shape_opt(g, &p("layer_output_scale"), &[1])?;
+        }
+        Ok(())
     }
 
     /// Layers with their own sliding-window and global KV cache.
@@ -473,5 +591,130 @@ impl<B: Backend> Model<B> for Gemma4<B> {
             c.head_dim_global,
             c.per_layer_dim,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rllm_gguf::Value;
+
+    use super::*;
+    use crate::test_gguf::Spec;
+
+    const LAYERS: usize = 4;
+
+    /// Gemma-4-shaped: 4 layers (sliding, global, sliding, global) with the
+    /// last two sharing KV, hidden 8, 2 heads over 1 KV head, head sizes
+    /// 4 (sliding) and 8 (global), FFN 16, vocab 10, per-layer inputs of 2.
+    fn tiny() -> Spec {
+        let mut s = Spec::default();
+        s.set("general.architecture", Value::String("gemma4".into()));
+        for (k, v) in [
+            ("block_count", LAYERS as u32),
+            ("embedding_length", 8),
+            ("feed_forward_length", 16),
+            ("attention.head_count", 2),
+            ("attention.head_count_kv", 1),
+            ("attention.key_length", 8),
+            ("attention.key_length_swa", 4),
+            ("attention.sliding_window", 16),
+            ("attention.shared_kv_layers", 2),
+            ("embedding_length_per_layer_input", 2),
+            ("context_length", 64),
+        ] {
+            s.set(&format!("gemma4.{k}"), Value::U32(v));
+        }
+        for (k, v) in [("rope.freq_base", 1e6), ("rope.freq_base_swa", 1e4), ("attention.layer_norm_rms_epsilon", 1e-6)] {
+            s.set(&format!("gemma4.{k}"), Value::F32(v));
+        }
+        let pattern = [true, false, true, false].map(Value::Bool).to_vec();
+        s.set("gemma4.attention.sliding_window_pattern", Value::Array(pattern));
+        let p_all = (2 * LAYERS) as u64;
+        s.tensor("token_embd.weight", &[8, 10]).tensor("output_norm.weight", &[8]).tensor("rope_freqs.weight", &[4]);
+        s.tensor("per_layer_token_embd.weight", &[p_all, 10]).tensor("per_layer_model_proj.weight", &[8, p_all]).tensor("per_layer_proj_norm.weight", &[2]);
+        for i in 0..LAYERS {
+            let hd = if i % 2 == 0 { 4 } else { 8 };
+            for (n, d) in [
+                ("attn_norm", &[8][..]),
+                ("attn_q", &[8, 2 * hd]),
+                ("attn_k", &[8, hd]),
+                ("attn_v", &[8, hd]),
+                ("attn_q_norm", &[hd]),
+                ("attn_k_norm", &[hd]),
+                ("attn_output", &[2 * hd, 8]),
+                ("post_attention_norm", &[8]),
+                ("ffn_norm", &[8]),
+                ("ffn_gate", &[8, 16]),
+                ("ffn_up", &[8, 16]),
+                ("ffn_down", &[16, 8]),
+                ("post_ffw_norm", &[8]),
+                ("inp_gate", &[8, 2]),
+                ("proj", &[2, 8]),
+                ("post_norm", &[8]),
+                ("layer_output_scale", &[1]),
+            ] {
+                s.tensor(&format!("blk.{i}.{n}.weight"), d);
+            }
+        }
+        s
+    }
+
+    fn err(s: &Spec) -> String {
+        format!("{:#}", Gemma4Config::from_gguf(&s.build().unwrap()).unwrap_err())
+    }
+
+    #[test]
+    fn valid_config_loads() {
+        let c = Gemma4Config::from_gguf(&tiny().build().unwrap()).unwrap();
+        assert_eq!((c.n_layers, c.n_kv_layers, c.vocab, c.kv_layer_counts()), (4, 2, 10, (1, 1)));
+        assert_eq!(c.is_swa, [true, false, true, false]);
+    }
+
+    #[test]
+    fn sliding_window_pattern_accepts_bools_and_integers_only() {
+        let ints = [1u8, 0, 1, 0].map(Value::U8).to_vec();
+        let c = Gemma4Config::from_gguf(&tiny().set("gemma4.attention.sliding_window_pattern", Value::Array(ints)).build().unwrap()).unwrap();
+        assert_eq!(c.is_swa, [true, false, true, false]);
+        let ints = [7i32, 0, 1, 0].map(Value::I32).to_vec();
+        let c = Gemma4Config::from_gguf(&tiny().set("gemma4.attention.sliding_window_pattern", Value::Array(ints)).build().unwrap()).unwrap();
+        assert_eq!(c.is_swa, [true, false, true, false]);
+        let strs = ["a", "b", "c", "d"].map(|s| Value::String(s.into())).to_vec();
+        assert!(err(tiny().set("gemma4.attention.sliding_window_pattern", Value::Array(strs))).contains("sliding_window_pattern"));
+        let neg = [-1i32, 0, 1, 0].map(Value::I32).to_vec();
+        assert!(err(tiny().set("gemma4.attention.sliding_window_pattern", Value::Array(neg))).contains("sliding_window_pattern"));
+        // A scalar instead of an array.
+        assert!(Gemma4Config::from_gguf(&tiny().set("gemma4.attention.sliding_window_pattern", Value::U32(2)).build().unwrap()).is_err());
+    }
+
+    #[test]
+    fn malformed_configs_are_errors() {
+        // More shared layers than layers (used to underflow), or all of them.
+        assert!(err(tiny().set("gemma4.attention.shared_kv_layers", Value::U32(9))).contains("shared_kv_layers"));
+        assert!(err(tiny().set("gemma4.attention.shared_kv_layers", Value::U32(4))).contains("shared_kv_layers"));
+        // 1-D embedding table.
+        assert!(err(tiny().tensor("token_embd.weight", &[80])).contains("token_embd"));
+        // Head counts.
+        assert!(err(tiny().set("gemma4.attention.head_count_kv", Value::U32(0))).contains("head_count_kv"));
+        assert!(err(tiny().set("gemma4.attention.head_count_kv", Value::U32(3))).contains("multiple"));
+        // Pattern length.
+        assert!(err(tiny().set("gemma4.attention.sliding_window_pattern", Value::Array(vec![Value::Bool(true)]))).contains("entries"));
+        // Mismatched tensors: a global layer's Q sized for a sliding one, the per-layer table.
+        assert!(err(tiny().tensor("blk.1.attn_q.weight", &[8, 8])).contains("blk.1.attn_q"));
+        assert!(err(tiny().tensor("per_layer_token_embd.weight", &[6, 10])).contains("per_layer_token_embd"));
+        // Shared layers' K isn't loaded, so its shape doesn't matter.
+        assert!(Gemma4Config::from_gguf(&tiny().tensor("blk.3.attn_k.weight", &[8, 1]).build().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn unsupported_head_layouts_are_rejected() {
+        assert!(err(tiny().set("gemma4.rope.dimension_count", Value::U32(4))).contains("partial rotary"));
+        assert!(err(tiny().set("gemma4.rope.dimension_count_swa", Value::U32(2))).contains("partial rotary"));
+        assert!(err(tiny().set("gemma4.attention.value_length", Value::U32(4))).contains("value head"));
+        assert!(err(tiny().set("gemma4.attention.value_length_swa", Value::U32(8))).contains("value head"));
+        let mut s = tiny();
+        for (k, v) in [("rope.dimension_count", 8), ("rope.dimension_count_swa", 4), ("attention.value_length", 8), ("attention.value_length_swa", 4)] {
+            s.set(&format!("gemma4.{k}"), Value::U32(v));
+        }
+        assert!(Gemma4Config::from_gguf(&s.build().unwrap()).is_ok());
     }
 }

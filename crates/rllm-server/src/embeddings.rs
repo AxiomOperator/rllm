@@ -16,6 +16,12 @@ use crate::error::{ApiError, ApiResult};
 use crate::params;
 use crate::state::AppState;
 
+/// Most tokens one request may embed, over all its inputs (OpenAI allows
+/// 300k): at least one full-context input.
+fn max_request_tokens(ctx: usize) -> usize {
+    ctx.max(262_144)
+}
+
 fn inputs(state: &AppState, v: Option<&Value>) -> ApiResult<Vec<Vec<u32>>> {
     let tok = &state.tok;
     let text = |s: &str| -> ApiResult<Vec<u32>> {
@@ -41,6 +47,11 @@ fn inputs(state: &AppState, v: Option<&Value>) -> ApiResult<Vec<Vec<u32>>> {
         None | Some(Value::Null) => return Err(ApiError::invalid("Missing required parameter: 'input'.", Some("input"))),
         Some(_) => return Err(ApiError::invalid("Invalid type for 'input'.", Some("input"))),
     };
+    let total: usize = out.iter().map(Vec::len).sum();
+    let cap = max_request_tokens(state.ctx);
+    if total > cap {
+        return Err(ApiError::invalid(format!("Invalid 'input': at most {cap} tokens per request, got {total}."), Some("input")));
+    }
     for i in &out {
         if i.len() > state.ctx {
             return Err(ApiError::invalid_code(

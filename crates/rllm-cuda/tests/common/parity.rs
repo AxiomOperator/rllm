@@ -169,9 +169,9 @@ fn embed_all_dtypes() {
         let (mut oc, mut og) = (cpu.alloc(ids.len() * d).unwrap(), gpu.alloc(ids.len() * d).unwrap());
         cpu.embed(&tc, &ids, &mut oc).unwrap();
         gpu.embed(&tg, &ids, &mut og).unwrap();
-        // K-quants are repacked with per-unit f16 scales (d * sub-scale), which
-        // rounds them by up to ~5e-4 relative.
-        let tol = if matches!(dtype, DType::Q4K | DType::Q6K | DType::Q5K | DType::IQ4XS) { 1e-3 } else { 1e-6 };
+        // Every format dequantizes exactly as the CPU (and ggml) does: sub-block
+        // scales times the f16 super-block scale, in f32.
+        let tol = 1e-6;
         assert_close(&format!("embed {dtype}"), &download(&cpu, &oc, ids.len() * d), &download(&gpu, &og, ids.len() * d), tol);
     }
 }
@@ -648,5 +648,42 @@ fn sample_rows_matches_reference() {
             total += a.len();
         }
         assert!(same * 100 >= total * 95, "T={t} k={k} p={p}: {same}/{total} draws agree");
+    }
+}
+
+/// Masked (-inf) logits and tiny temperatures keep top_k / top_p in force on
+/// the device, as in the reference.
+#[test]
+fn sample_rows_masked_and_tiny_temperature() {
+    let Some(gpu) = gpu_backend() else { return };
+    let cpu = CpuBackend::new();
+    let mut rng = Rng(0x77_1d3);
+    let (rows, vocab) = (2, 3008);
+    let mut logits: Vec<f32> = (0..rows * vocab).map(|_| rng.f32() * 6.0).collect();
+    for i in (0..logits.len()).step_by(3) {
+        logits[i] = f32::NEG_INFINITY;
+    }
+    let top = |r: usize, k: usize| {
+        let mut ids: Vec<u32> = (0..vocab as u32).collect();
+        ids.sort_by(|&a, &b| logits[r * vocab + b as usize].total_cmp(&logits[r * vocab + a as usize]));
+        ids.truncate(k);
+        ids
+    };
+    for (t, k, p) in [(1.0, 3, 1.0), (0.1, 0, 0.05), (1e-30, 0, 1.0), (1e-30, 5, 0.5)] {
+        for counter in 0..10u64 {
+            let specs: Vec<rllm_core::RowSample> = (0..rows)
+                .map(|r| rllm_core::RowSample { temperature: t, top_k: k, top_p: p, seed: 9 + r as u64, counter, adjust: Vec::new() })
+                .collect();
+            let pick: Vec<(u32, &rllm_core::RowSample)> = (0..rows).map(|r| (r as u32, &specs[r])).collect();
+            let (mut a, mut b) = (vec![0u32; rows], vec![0u32; rows]);
+            cpu.sample_rows(&upload(&cpu, &logits), rows, vocab, &pick, &mut a).unwrap();
+            gpu.sample_rows(&upload(&gpu, &logits), rows, vocab, &pick, &mut b).unwrap();
+            for r in 0..rows {
+                // top_k 3 / tiny top_p / tiny T: only the head can be drawn.
+                let allowed = top(r, if t < 1e-3 { 1 } else if k > 0 { k as usize } else { 8 });
+                assert!(allowed.contains(&a[r]), "cpu T={t} k={k} p={p} row {r}: {} not in {allowed:?}", a[r]);
+                assert!(allowed.contains(&b[r]), "gpu T={t} k={k} p={p} row {r}: {} not in {allowed:?}", b[r]);
+            }
+        }
     }
 }

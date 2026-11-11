@@ -281,8 +281,76 @@ macro_rules! on_device {
     };
 }
 
+/// Largest token count accepted for contexts, pools and chunk sizes
+/// (positions and block ids are u32; far beyond any real context).
+const MAX_TOKENS: usize = 1 << 30;
+/// Largest KV block size accepted.
+const MAX_BLOCK_SIZE: usize = 1024;
+
+/// `--{name}` must be in `min..=max`.
+fn check_arg(name: &str, v: usize, min: usize, max: usize) -> Result<()> {
+    anyhow::ensure!((min..=max).contains(&v), "--{name} {v} is out of range (expected {min}..={max})");
+    Ok(())
+}
+
+/// Sampling options: temperature >= 0, top-p in [0, 1] (NaN would poison sampling).
+fn check_sampling(temperature: f32, top_p: f32) -> Result<()> {
+    anyhow::ensure!(temperature.is_finite() && temperature >= 0.0, "--temperature {temperature} must be a non-negative number");
+    anyhow::ensure!((0.0..=1.0).contains(&top_p), "--top-p {top_p} must be in [0, 1]");
+    Ok(())
+}
+
+/// Reject argument values that would panic or make no sense, before any loading.
+fn check_args(cmd: &Cmd) -> Result<()> {
+    match cmd {
+        Cmd::Run(a) => {
+            check_arg("ctx", a.ctx, 1, MAX_TOKENS)?;
+            check_arg("block-size", a.block_size, 1, MAX_BLOCK_SIZE)?;
+            check_arg("prefill-chunk", a.prefill_chunk, 1, MAX_TOKENS)?;
+            check_arg("max-tokens", a.max_tokens, 0, MAX_TOKENS)?;
+            check_sampling(a.temperature, a.top_p)?;
+        }
+        Cmd::Serve { ctx, parallel, prefill_chunk, kv_tokens, host_cache_gb, .. } => {
+            check_arg("ctx", *ctx, 1, MAX_TOKENS)?;
+            check_arg("parallel", *parallel, 1, 4096)?;
+            check_arg("prefill-chunk", *prefill_chunk, 1, MAX_TOKENS)?;
+            match kv_tokens {
+                Some(n) => check_arg("kv-tokens", *n, 1, MAX_TOKENS)?,
+                // The default pool, ctx * parallel.
+                None => anyhow::ensure!(ctx.checked_mul(*parallel).is_some_and(|n| n <= MAX_TOKENS), "--ctx * --parallel is too large; set --kv-tokens"),
+            }
+            anyhow::ensure!(host_cache_gb.is_finite() && *host_cache_gb >= 0.0 && *host_cache_gb <= (1u64 << 20) as f64, "--host-cache-gb {host_cache_gb} must be a non-negative size in GiB");
+        }
+        Cmd::Perplexity { ctx, chunks, .. } => {
+            // Each chunk scores its second half: at least two positions.
+            check_arg("ctx", *ctx, 4, MAX_TOKENS)?;
+            if let Some(c) = chunks {
+                check_arg("chunks", *c, 1, usize::MAX)?;
+            }
+        }
+        Cmd::Bench { n_prompt, n_gen, reps, depth, batch, .. } => {
+            check_arg("n-prompt", *n_prompt, 0, MAX_TOKENS)?;
+            check_arg("n-gen", *n_gen, 0, MAX_TOKENS)?;
+            check_arg("depth", *depth, 0, MAX_TOKENS)?;
+            check_arg("reps", *reps, 1, 1_000_000)?;
+            check_arg("batch", *batch, 1, 4096)?;
+            anyhow::ensure!(*n_prompt > 0 || *n_gen > 0, "nothing to measure: --n-prompt and --n-gen are both 0");
+        }
+        Cmd::CompareRef { prefill_chunk, .. } => check_arg("prefill-chunk", *prefill_chunk, 1, MAX_TOKENS)?,
+        Cmd::Compare { steps, block_size, prefill_chunk, .. } => {
+            check_arg("steps", *steps, 0, MAX_TOKENS)?;
+            check_arg("block-size", *block_size, 1, MAX_BLOCK_SIZE)?;
+            check_arg("prefill-chunk", *prefill_chunk, 1, MAX_TOKENS)?;
+        }
+        Cmd::Inspect { .. } | Cmd::Tokenize { .. } | Cmd::Tune(_) => {}
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
-    match Cli::parse().cmd {
+    let cmd = Cli::parse().cmd;
+    check_args(&cmd)?;
+    match cmd {
         Cmd::Inspect { model, tensors } => inspect(&model, tensors),
         Cmd::Tune(args) => tune::tune(args),
         Cmd::Tokenize { model, text } => tokenize(&model, &text),
@@ -411,7 +479,8 @@ fn run<B: Backend>(backend: &B, a: RunArgs) -> Result<()> {
         eprintln!("[rllm] {} tokens", prompt.len());
         return Ok(());
     }
-    anyhow::ensure!(prompt.len() + a.max_tokens <= a.ctx, "prompt + max_tokens exceeds --ctx {}", a.ctx);
+    anyhow::ensure!(!prompt.is_empty(), "the prompt is empty");
+    anyhow::ensure!(prompt.len().saturating_add(a.max_tokens) <= a.ctx, "prompt ({} tokens) + max_tokens exceeds --ctx {}", prompt.len(), a.ctx);
 
     let model = AnyModel::load(backend, &g)?;
     eprintln!(
@@ -449,7 +518,8 @@ fn run<B: Backend>(backend: &B, a: RunArgs) -> Result<()> {
         logits = generator.feed(&[id], 1)?;
     }
     let decode_s = t_decode.elapsed().as_secs_f64();
-    writeln!(out)?;
+    // Text the decoder held back (an incomplete character at the end).
+    writeln!(out, "{}", stream.finish()?)?;
     eprintln!(
         "[rllm] prompt {} tok in {:.2}s ({:.1} tok/s) | generated {} tok in {:.2}s ({:.1} tok/s)",
         prompt.len(),
@@ -527,8 +597,10 @@ fn read_ref(path: &std::path::Path) -> Result<RefDump> {
     anyhow::ensure!(bytes.len() >= 20 && &bytes[..8] == b"RLLMREF1", "{} is not a llama_ref dump", path.display());
     let u32_at = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
     let (n_vocab, n_prompt, n_total) = (u32_at(8), u32_at(12), u32_at(16));
+    anyhow::ensure!(n_total > 0 && n_vocab > 0 && n_prompt <= n_total, "malformed reference dump ({n_prompt} prompt of {n_total} tokens, vocab {n_vocab})");
     let tok_end = 20 + 4 * n_total;
-    anyhow::ensure!(bytes.len() == tok_end + 4 * n_total * n_vocab, "truncated reference dump");
+    let len = n_total.checked_mul(n_vocab).and_then(|n| n.checked_mul(4)).and_then(|n| n.checked_add(tok_end));
+    anyhow::ensure!(len == Some(bytes.len()), "truncated reference dump");
     let tokens = (0..n_total).map(|i| u32_at(20 + 4 * i) as u32).collect();
     let logits = bytes[tok_end..].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
     Ok(RefDump { n_vocab, n_prompt, tokens, logits })
@@ -618,7 +690,8 @@ fn perplexity<B: Backend>(
     let model = AnyModel::load(backend, &g)?;
     let text = std::fs::read_to_string(file)?;
     let tokens = tok.encode(&text)?;
-    anyhow::ensure!(n_ctx >= 4 && tokens.len() >= 2 * n_ctx, "need at least {} tokens for --ctx {n_ctx}", 2 * n_ctx);
+    anyhow::ensure!(n_ctx >= 4 && tokens.len() >= 2 * n_ctx, "need at least {} tokens for --ctx {n_ctx} (have {})", 2 * n_ctx, tokens.len());
+    anyhow::ensure!(max_chunks != Some(0), "--chunks must be at least 1");
     let n_chunk = (tokens.len() / n_ctx).min(max_chunks.unwrap_or(usize::MAX));
     let vocab = model.vocab_size();
     // Score positions first..n_ctx-2, each predicting the next token.
@@ -670,11 +743,9 @@ fn perplexity<B: Backend>(
     let ppl = mean.exp();
     // Same uncertainty estimate as llama-perplexity.
     let var = (nll2 / count as f64 - mean * mean).max(0.0);
-    let err = ppl * (var / (count - 1) as f64).sqrt();
-    println!(
-        "Final estimate: PPL = {ppl:.4} +/- {err:.5}  ({n_chunk} chunks, {count} scored tokens, {:.1} s)",
-        t0.elapsed().as_secs_f64()
-    );
+    // One scored token has no spread to estimate.
+    let err = if count > 1 { format!(" +/- {:.5}", ppl * (var / (count - 1) as f64).sqrt()) } else { String::new() };
+    println!("Final estimate: PPL = {ppl:.4}{err}  ({n_chunk} chunks, {count} scored tokens, {:.1} s)", t0.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -782,4 +853,34 @@ fn bench<B: Backend>(
         println!("| {name} | {} | tg{n_gen} x{batch}{at} | {mean:.2} ± {sd:.2} |", backend.name());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(args: &[&str]) -> Result<()> {
+        check_args(&Cli::try_parse_from(std::iter::once("rllm").chain(args.iter().copied()))?.cmd)
+    }
+
+    #[test]
+    fn bad_arguments_are_rejected_before_loading() {
+        assert!(check(&["run", "m.gguf", "hi"]).is_ok());
+        assert!(check(&["run", "m.gguf", "hi", "--block-size", "0"]).is_err());
+        assert!(check(&["run", "m.gguf", "hi", "--ctx", "0"]).is_err());
+        assert!(check(&["run", "m.gguf", "hi", "--top-p", "NaN"]).is_err());
+        assert!(check(&["run", "m.gguf", "hi", "-t", "-1"]).is_err());
+        assert!(check(&["compare", "m.gguf", "hi", "--block-size", "0"]).is_err());
+        assert!(check(&["perplexity", "m.gguf", "t.txt", "--chunks", "1", "--ctx", "4"]).is_ok());
+        assert!(check(&["perplexity", "m.gguf", "t.txt", "--chunks", "0"]).is_err());
+        assert!(check(&["perplexity", "m.gguf", "t.txt", "--ctx", "3"]).is_err());
+        assert!(check(&["bench", "m.gguf", "--reps", "0"]).is_err());
+        assert!(check(&["bench", "m.gguf", "-p", "0", "-n", "0"]).is_err());
+        assert!(check(&["bench", "m.gguf", "--batch", "0"]).is_err());
+        assert!(check(&["serve", "m.gguf", "--parallel", "0"]).is_err());
+        assert!(check(&["serve", "m.gguf", "--kv-tokens", "0"]).is_err());
+        assert!(check(&["serve", "m.gguf", "--ctx", "1073741824", "--parallel", "8"]).is_err());
+        assert!(check(&["serve", "m.gguf", "--host-cache-gb", "inf"]).is_err());
+        assert!(check(&["compare-ref", "m.gguf", "r.bin", "--prefill-chunk", "0"]).is_err());
+    }
 }

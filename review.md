@@ -224,3 +224,97 @@ Strix Halo (HIP parity, GPU model tests, a 17-check end-to-end server run on
 Mistral-7B). Speed on the Ada matches the previous build within noise (Qwen3-0.6B
 Q8_0 and BF16, Qwen3-8B Q4_K_M; pp512, tg128 and tg128 x32).
 
+
+## 7. Third review: findings and fixes (2026-11-11)
+
+A third pass (five reviewers, one per layer: server HTTP, engine/JSON/
+tokenizer, model/KV/GGUF/CLI, GPU host side, kernels) found the items
+below. All are fixed except where noted.
+
+**High**
+
+| Finding | Fix | Checked by |
+|---|---|---|
+| The sampler's uniform draw `((z>>40)+0.5)·2⁻²⁴` rounds to exactly 1.0 for the top value; the Gumbel key becomes +inf and that token wins. With every vocab entry a candidate (server defaults) about 0.9% (Qwen3) / 1.6% (Gemma) of sampled tokens were uniformly random. The CPU reference had the same bug, so parity passed | 23 bits, `((z>>41)+0.5)·2⁻²³`, strictly inside (0,1), GPU and CPU identical | unit test (old formula gave 1.0); parity |
+| A failed graph step left the backend in Replay/Capture mode; the next `kv_to_host` (prefix-cache eviction) launched nothing but reported success, so a later restore served garbage KV | `abort_step()`: every op outside a forward pass forces eager mode; any error inside a step aborts it (ends the capture, forgets index uploads, syncs) | GPU unit test (fails without the fix) |
+| A self-referencing `anyOf` schema passed the compile budget and cost exponential work per character on the engine thread | Left recursion rejected at compile (400); each `anyOf` expanded once per character; duplicate parses merged; a per-token work budget fails the request | unit tests; e2e (400 in < 5 s) |
+
+**Medium**
+
+| Finding | Fix | Checked by |
+|---|---|---|
+| `make_room` counted only refcount-1 blocks per entry, so a prefix shared by two cache entries was never freeable: idle servers rejected requests as "needs more KV than the pool", busy ones preempted | Count distinct blocks whose every reference is a cache entry; evict entries holding them | unit test (fails without the fix) |
+| Streaming clients that left while queued, prefilling or buffering a tool call weren't noticed | One SSE helper for all endpoints selects on the client channel; keep-alive every 15 s; streaming `n` runs concurrently | e2e (disconnect → request cancelled) |
+| CUDA libraries preloaded `RTLD_GLOBAL` from `./.cuda/lib` in the current directory; first prefix match in directory order | Only `$RLLM_CUDA_LIB_DIR` and the executable's ancestors; exact sonames | unit tests |
+| Gemma tool-argument parser recursed per bracket (stack overflow) | Depth 128 | unit test (100k levels) |
+| Stores bounded by count only; chains unbounded and dropped recursively; embeddings uncapped, uncancellable, outside `--max-queue`; metrics keyed by arbitrary HTTP methods | 256 MiB byte budget per store, pages cloned after paginating; iterative chain drop and 1000-turn limit; embeddings ≤ max(ctx, 262144) tokens, chunked between steps, cancellable, counted in the queue; unknown methods are `OTHER` | unit tests; e2e |
+| JSON constraint: `MAX_ALTS=32` silently dropped tools past the 32nd; tool `$ref`s resolved against the wrapper (became "any"); `allOf` dropped sibling `properties`/`required`; `$ref` ignored `nullable`; partial-UTF-8 tokens fed U+FFFD; Gemma's quote placeholder collided with `<0x01>` | Cap 1024 after dedup, overflow is an error; per-tool schema documents; proper merges; sibling keywords; byte-level feeding; placeholder U+10FFFF | unit tests; e2e (40 tools, `$ref`) |
+| Malformed GGUFs could still panic: upload checked `cols % 32` not the quant block (div by zero / device OOB); 1-D embeddings, zero heads, `n_kv_heads` not dividing `n_heads`, `shared_kv_layers > block_count`; duplicate/overlapping/misaligned tensors | Block-size and length checks on upload; per-architecture `validate()` and tensor shape checks; partial rotary and K≠V widths rejected; GGUF index rejects duplicates, overlaps, misalignment | unit tests; all real models still load (perplexity unchanged) |
+| Kernel cache: a bad cached file failed startup forever; no fsync; HIP loaded an empty buffer; key lacked compiler version and options | Recompile on load failure; fsync; magic checks; key includes NVRTC/hiprtc version and options; stale temp files removed | build; GPU tests |
+
+**Low** (all fixed)
+
+- Server:
+  - 503 now comes before the stream starts, using the engine's exact queue count. Responses return the engine's status, and a rejected Responses request isn't stored.
+  - Streamed completions with `store: true` are stored.
+  - Tool names must match `^[a-zA-Z0-9_-]{1,64}$`.
+  - Logprobs: exact token `bytes` from the vocabulary, and attached only to content (not reasoning or tool markup).
+  - Store file: written 0600, fsynced, saves serialized.
+  - Template render and tokenize run in `spawn_blocking`.
+  - A warning on non-loopback binds without `--api-key`.
+  - A 30 s header-read timeout (hand-written hyper accept loop; `axum::serve` has none).
+  - `ctx × parallel` overflow is checked.
+  - Request gauges are refreshed when the engine goes idle; they used to keep the last batch's values.
+- Samplers:
+  - Top-k/top-p bisection ignores ±inf, and the temperature has a floor of 1e-4.
+  - The host draw can't return 0.
+  - Host and device keep the same ties at the top-k cutoff.
+- Kernels:
+  - `f32_to_bf16` keeps NaN.
+  - `attn_wmma`'s three 32-byte loads from 16-byte-aligned shared memory are split in two.
+  - `qout` int8 copies are gated on the per-row width.
+- Host side:
+  - Scratch growth inside a graph step is guarded everywhere, and `kv_stage` invalidates graphs.
+  - `grid_1d` errors instead of truncating.
+  - Drop syncs and clears graphs before the module unloads.
+  - The graph and hipBLASLt plan caches are capped.
+  - HIP return codes are checked.
+  - The HIP staging buffer waits for its copy before being freed.
+- Engine:
+  - Admission reserves blocks within a pass.
+  - Allocator double-free and share-of-free-block are checked in release builds.
+  - A sampler-thread panic fails only its sequence.
+  - Draft-pool shortage skips the affected sequences instead of failing the whole batch.
+- CLI:
+  - Arguments are validated (`--block-size 0`, `--chunks 0`, …).
+  - `rllm run` flushes the decoder.
+  - `tune` never recommends a pool it measured won't fit.
+  - The draft search reads only metadata.
+
+**Follow-ups fixed after the first round**
+
+| Finding | Fix | Checked by |
+|---|---|---|
+| Q6_K/IQ4_XS repack stored `d·scale` rounded to f16 (≤ 2.4e-4 relative); ggml multiplies in f32 | Each super-block keeps its int8 scales and f16 `d` in the bytes the f16 scales used (Q6: 16 + 2 of 32, IQ4: 8 + 2 of 16), multiplied in f32 by every reader (dequant, matvec, MMQ, CUDA and HIP); strides unchanged | embed parity tightened to 1e-6 for every format (failed at 5e-4 before); perplexity moves toward llama.cpp (IQ4_XS 20.3015 → 20.3031 vs 20.31; Llama-3.2-1B 14.5504 → 14.5448 vs 14.56); Qwen3-8B tg128 149.5 → 148.3 tok/s (−0.8%), others within noise |
+| A marker token right before content (`</think>`) counted as content in logprobs | Tokens are tagged as reasoning when the parser is in reasoning before or after them; handlers skip them | e2e, streamed and not: no `<think>`/`</think>`, content tokens join to the content |
+| The 503 pre-check could lose a race for the last queue slot (200 + error event) | Handlers reserve their queue places (`Slots`) before responding; each generation uses one, unused ones are released on drop | unit test; e2e race: 20 concurrent streams on `--max-queue 2` gave 3 complete streams and 17 clean 503s, no error events |
+
+**Verified**
+
+- Laptop (sm_120):
+  - CPU workspace tests: 94, up from 57.
+  - CUDA parity (16) and backend unit tests (5).
+  - GPU model tests on Qwen3-0.6B Q8_0/Q4_K_M/BF16.
+  - A 14-check end-to-end server run: chat, streaming n=2, logprobs bytes, recursive schema → 400, JSON schema, 40 tools with `$ref`, tool-name 400, metrics labels, embeddings and the token cap, streamed store, response chain, disconnect cancels, header timeout.
+  - A full queue gives 503 for streaming and Responses; Ctrl-C shuts down cleanly.
+- RTX 6000 Ada (sm_89):
+  - Parity, backend unit tests and GPU model tests (Qwen3-0.6B ×3, Llama-3.2-1B).
+  - Perplexity unchanged: Qwen3 Q5_K_M 19.09, IQ4_XS 20.30, Llama 14.55, Nemotron 96.92, same as the previous build.
+  - Speed equal or better: Qwen3-0.6B Q8_0 pp512 78.3k / tg128 675; Qwen3-8B pp512 7.0k / tg128 150.
+- Strix Halo (gfx1151, HIP):
+  - hiprtc compiles the kernels for gfx1151 (including the split `attn_wmma` loads).
+  - HIP parity (16, with the embedding test at 1e-6 for every format) and unit tests (3).
+  - GPU model tests on Qwen3-0.6B Q8_0/Q4_K_M/BF16/Q6_K/IQ4_XS and Llama-3.2-1B.
+  - Perplexity matches: Qwen3 Q5_K_M 19.09, IQ4_XS 20.30, Q6_K 18.87, Llama 14.55, Mistral-7B Q4_K_M 5.95 / IQ4_XS 5.93, Nemotron 96.87.
+  - Speed within 1.5% of 2026-10-30: Qwen3-0.6B Q8_0 pp512 16955 / tg128 231.1 (was 16986 / 231.3), Q4_K_M tg128 306.6 (311.5), IQ4_XS 332.5 (333.4), Qwen3-8B 1329 / 39.03 (1333 / 39.34), Mistral-7B 1363 / 43.10 (1366 / 43.20).
+  - The 16-check end-to-end server run passes.

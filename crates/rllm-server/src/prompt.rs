@@ -210,6 +210,19 @@ pub fn chat_messages(messages: &[Value]) -> ApiResult<Vec<Value>> {
     Ok(out)
 }
 
+/// 400 unless `name` is a valid function name (OpenAI's
+/// `^[a-zA-Z0-9_-]{1,64}$`). Tool names reach the prompt text verbatim (a
+/// forced call's opening), so quotes, braces or markers must not get in.
+pub fn check_function_name(name: &str, param: &str) -> ApiResult<()> {
+    if crate::util::valid_function_name(name) {
+        return Ok(());
+    }
+    Err(ApiError::invalid(
+        format!("Invalid '{param}': string does not match pattern. Expected a string that matches the pattern '^[a-zA-Z0-9_-]{{1,64}}$'."),
+        Some(param),
+    ))
+}
+
 /// Chat Completions `tools` to the template shape; only function tools.
 pub fn chat_tools(tools: Option<&Value>) -> ApiResult<Vec<Value>> {
     let Some(arr) = tools.and_then(Value::as_array) else { return Ok(Vec::new()) };
@@ -218,9 +231,10 @@ pub fn chat_tools(tools: Option<&Value>) -> ApiResult<Vec<Value>> {
         .map(|(i, t)| match t.get("type").and_then(Value::as_str) {
             Some("function") => {
                 let f = t.get("function").ok_or_else(|| ApiError::invalid("Missing 'function'.", Some(&format!("tools[{i}].function"))))?;
-                if f.get("name").and_then(Value::as_str).is_none() {
+                let Some(name) = f.get("name").and_then(Value::as_str) else {
                     return Err(ApiError::invalid("Missing required parameter: 'name'.", Some(&format!("tools[{i}].function.name"))));
-                }
+                };
+                check_function_name(name, &format!("tools[{i}].function.name"))?;
                 Ok(json!({ "type": "function", "function": f }))
             }
             Some(other) => Err(ApiError::invalid(format!("Tool type '{other}' is not supported by this server."), Some(&format!("tools[{i}].type")))),
@@ -309,18 +323,10 @@ pub fn build(
             (Some(JsonState::with_schema(Arc::new(Schema::compile(&params)))), "}\n</tool_call>".to_owned())
         }
         _ => {
-            let calls: Vec<Value> = tools
-                .iter()
-                .map(|t| {
-                    json!({
-                        "type": "object",
-                        "properties": { "name": { "const": t["function"]["name"] }, "arguments": tool_params(t) },
-                        "required": ["name", "arguments"],
-                        "additionalProperties": false,
-                    })
-                })
-                .collect();
-            (Some(JsonState::with_schema(Arc::new(Schema::any_of(&calls)))), "\n</tool_call>".to_owned())
+            // Each tool's `$ref`s resolve against its own parameter schema.
+            let calls: Vec<(String, Value)> =
+                tools.iter().filter_map(|t| Some((t["function"]["name"].as_str()?.to_owned(), tool_params(t)))).collect();
+            (Some(JsonState::with_schema(Arc::new(Schema::tool_calls(&calls)))), "\n</tool_call>".to_owned())
         }
     };
     if constraint.as_ref().is_some_and(JsonState::too_complex) {
@@ -350,4 +356,20 @@ pub fn check_context(state: &AppState, prompt_tokens: usize) -> ApiResult<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_names_are_validated() {
+        let tools = |name: &str| json!([{ "type": "function", "function": { "name": name, "parameters": { "type": "object" } } }]);
+        assert!(chat_tools(Some(&tools("get_weather-v2"))).is_ok());
+        assert!(chat_tools(Some(&tools(&"a".repeat(64)))).is_ok());
+        for bad in ["", "a b", "x\", \"arguments\": {}}", "name{", "<tool_call>", "dotted.name", &"a".repeat(65)] {
+            let e = chat_tools(Some(&tools(bad))).unwrap_err();
+            assert_eq!(e.param.as_deref(), Some("tools[0].function.name"), "{bad:?}");
+        }
+    }
 }

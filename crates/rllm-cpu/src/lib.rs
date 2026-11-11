@@ -160,6 +160,9 @@ impl Backend for CpuBackend {
         if cols % t.dtype.block_size() != 0 {
             return Err(Error::Shape(format!("{}: {cols} columns not a multiple of {} block", t.name, t.dtype)));
         }
+        if rows.checked_mul(t.dtype.row_bytes(cols)) != Some(t.bytes.as_slice().len()) {
+            return Err(Error::Shape(format!("{}: {} bytes for {rows} x {cols} {}", t.name, t.bytes.as_slice().len(), t.dtype)));
+        }
         let dense = (t.shape.len() == 1).then(|| {
             let mut v = vec![0f32; cols];
             dequantize_row(t.dtype, t.bytes.as_slice(), &mut v);
@@ -173,7 +176,14 @@ impl Backend for CpuBackend {
     }
 
     fn alloc_kv(&self, layout: KvLayout) -> Result<CpuKvCache> {
-        let n = layout.n_blocks * layout.block_size * layout.slot_width();
+        let n = layout
+            .n_blocks
+            .checked_mul(layout.block_size)
+            .and_then(|n| n.checked_mul(layout.slot_width()))
+            .ok_or_else(|| Error::Shape(format!("KV cache size overflows: {layout:?}")))?;
+        if layout.block_size == 0 || layout.slot_width() == 0 {
+            return Err(Error::Shape(format!("empty KV cache layout: {layout:?}")));
+        }
         Ok(CpuKvCache {
             layout,
             k: (0..layout.n_layers).map(|_| vec![0f32; n]).collect(),
@@ -189,6 +199,9 @@ impl Backend for CpuBackend {
 
     fn embed(&self, table: &CpuWeight, tokens: &[u32], out: &mut Vec<f32>) -> Result<()> {
         let d = table.cols;
+        if d == 0 {
+            return Err(Error::Shape("embed: empty embedding rows".into()));
+        }
         check_len("embed", out.len(), tokens.len() * d)?;
         for (&tok, o) in tokens.iter().zip(out.chunks_exact_mut(d)) {
             if tok as usize >= table.rows {
@@ -203,6 +216,10 @@ impl Backend for CpuBackend {
         let (n, k) = (w.rows, w.cols);
         check_len("matmul x", x.len(), m * k)?;
         check_len("matmul out", out.len(), m * n)?;
+        if m == 0 || n == 0 || k == 0 {
+            out[..m * n].fill(0.0);
+            return Ok(());
+        }
         let rounded;
         let x: &[f32] = if llamacpp_numerics() {
             let mut v = x[..m * k].to_vec();
@@ -241,6 +258,9 @@ impl Backend for CpuBackend {
     fn rms_norm(&self, x: &Vec<f32>, w: &CpuWeight, out: &mut Vec<f32>, rows: usize, eps: f32) -> Result<()> {
         let w = w.dense.as_deref().ok_or_else(|| Error::Shape("rms_norm weight must be 1-D".into()))?;
         let d = w.len();
+        if d == 0 {
+            return Err(Error::Shape("rms_norm: empty weight".into()));
+        }
         check_len("rms_norm x", x.len(), rows * d)?;
         check_len("rms_norm out", out.len(), rows * d)?;
         out[..rows * d].par_chunks_mut(d).zip(x[..rows * d].par_chunks(d)).for_each(|(o, x)| {
@@ -263,6 +283,9 @@ impl Backend for CpuBackend {
         freq_factors: Option<&CpuWeight>,
     ) -> Result<()> {
         let width = n_heads * head_dim;
+        if width == 0 || !head_dim.is_multiple_of(2) {
+            return Err(Error::Shape(format!("rope: {n_heads} heads of size {head_dim}")));
+        }
         check_len("rope", x.len(), positions.len() * width)?;
         let half = head_dim / 2;
         let factors = match freq_factors {
@@ -334,6 +357,9 @@ impl Backend for CpuBackend {
     }
 
     fn gather_rows(&self, x: &Vec<f32>, rows: &[u32], width: usize, out: &mut Vec<f32>) -> Result<()> {
+        if width == 0 {
+            return Ok(());
+        }
         check_len("gather_rows out", out.len(), rows.len() * width)?;
         for (&r, o) in rows.iter().zip(out.chunks_exact_mut(width)) {
             let r = r as usize;
@@ -360,6 +386,9 @@ impl Backend for CpuBackend {
         let n_slots = kv.layout.n_blocks * kv.layout.block_size;
         check_len("kv_store k", k.len(), slots.len() * w)?;
         check_len("kv_store v", v.len(), slots.len() * w)?;
+        if layer >= kv.k.len() {
+            return Err(Error::Shape(format!("kv_store: layer {layer} of {}", kv.k.len())));
+        }
         let (kc, vc) = (&mut kv.k[layer], &mut kv.v[layer]);
         for (i, &s) in slots.iter().enumerate() {
             let s = s as usize;
@@ -391,8 +420,28 @@ impl Backend for CpuBackend {
         let n_tok = meta.positions.len();
         let w = nh * hd;
         let kv_w = nkv * hd;
-        let group = nh / nkv;
         let bs = meta.block_size;
+        // Everything the parallel loop below indexes is checked here: a
+        // panic inside rayon would take the process down.
+        if nkv == 0 || hd == 0 || !nh.is_multiple_of(nkv) {
+            return Err(Error::Shape(format!("attention: {nh} heads over {nkv} KV heads of size {hd}")));
+        }
+        let l = &kv.layout;
+        if (l.n_kv_heads, l.head_dim, l.block_size) != (nkv, hd, bs) || layer >= kv.k.len() {
+            return Err(Error::Shape(format!("attention: layer {layer}, {nkv} x {hd}, block {bs} vs cache {l:?}")));
+        }
+        if meta.token_seq.len() < n_tok {
+            return Err(Error::Shape(format!("attention: {} sequence ids for {n_tok} tokens", meta.token_seq.len())));
+        }
+        for t in 0..n_tok {
+            let ctx = meta.positions[t] as usize + 1;
+            let table = meta.block_tables.get(meta.token_seq[t] as usize);
+            let ok = table.is_some_and(|tb| tb.len() >= ctx.div_ceil(bs) && tb[..ctx.div_ceil(bs)].iter().all(|&b| (b as usize) < l.n_blocks));
+            if !ok {
+                return Err(Error::Shape(format!("attention: token {t} (position {}) has no valid block table", ctx - 1)));
+            }
+        }
+        let group = nh / nkv;
         check_len("attention q", q.len(), n_tok * w)?;
         check_len("attention out", out.len(), n_tok * w)?;
         let (kc, vc) = (&kv.k[layer], &kv.v[layer]);
@@ -450,5 +499,57 @@ fn q8_round(g: &mut [f32]) {
     let dh = half::f16::from_f32(d).to_f32();
     for x in g {
         *x = if d > 0.0 { (*x / d).round_ties_even() * dh } else { 0.0 };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(n_kv_heads: usize, head_dim: usize) -> KvLayout {
+        KvLayout { n_layers: 1, n_blocks: 2, block_size: 4, n_kv_heads, head_dim, dtype: KvType::F16 }
+    }
+
+    fn meta<'a>(n_heads: usize, n_kv_heads: usize, tables: &'a [Vec<u32>], positions: &'a [u32]) -> AttnMeta<'a> {
+        AttnMeta {
+            n_heads,
+            n_kv_heads,
+            head_dim: 4,
+            scale: 0.5,
+            window: 0,
+            token_seq: &[0, 0],
+            positions,
+            block_tables: tables,
+            block_size: 4,
+        }
+    }
+
+    #[test]
+    fn bad_attention_shapes_are_errors_not_panics() {
+        let b = CpuBackend::new();
+        let kv = b.alloc_kv(layout(2, 4)).unwrap();
+        let tables = [vec![0u32, 1]];
+        let (q, mut out) = (vec![0f32; 2 * 4 * 4], vec![0f32; 2 * 4 * 4]);
+        assert!(b.attention(&q, &kv, 0, &meta(4, 2, &tables, &[0, 1]), &mut out).is_ok());
+        // Zero KV heads, KV heads not dividing heads, a layout mismatch, a bad layer.
+        assert!(b.attention(&q, &kv, 0, &meta(4, 0, &tables, &[0, 1]), &mut out).is_err());
+        assert!(b.attention(&q, &kv, 0, &meta(3, 2, &tables, &[0, 1]), &mut out).is_err());
+        assert!(b.attention(&q, &kv, 0, &meta(4, 4, &tables, &[0, 1]), &mut out).is_err());
+        assert!(b.attention(&q, &kv, 1, &meta(4, 2, &tables, &[0, 1]), &mut out).is_err());
+        // Positions past the block table, block ids past the cache, a missing table.
+        assert!(b.attention(&q, &kv, 0, &meta(4, 2, &tables, &[0, 8]), &mut out).is_err());
+        assert!(b.attention(&q, &kv, 0, &meta(4, 2, &[vec![0, 5]], &[0, 5]), &mut out).is_err());
+        assert!(b.attention(&q, &kv, 0, &meta(4, 2, &[], &[0, 1]), &mut out).is_err());
+    }
+
+    #[test]
+    fn empty_layouts_and_short_weights_are_errors() {
+        let b = CpuBackend::new();
+        assert!(b.alloc_kv(layout(0, 4)).is_err());
+        assert!(b.alloc_kv(KvLayout { block_size: 0, ..layout(2, 4) }).is_err());
+        let t = HostTensor::from_f32("w", vec![2, 4], &[0.0; 8]);
+        assert!(b.upload(&t).is_ok());
+        let short = HostTensor { shape: vec![3, 4], ..t };
+        assert!(b.upload(&short).is_err());
     }
 }

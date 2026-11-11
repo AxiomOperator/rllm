@@ -7,7 +7,26 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// (method, route, status) -> (count, total seconds).
-type HttpStats = BTreeMap<(String, String, u16), (u64, f64)>;
+type HttpStats = BTreeMap<(&'static str, String, u16), (u64, f64)>;
+
+/// The method as a metric label: the standard methods by name, anything
+/// else (extension methods are arbitrary tokens) as `OTHER`, so clients
+/// can't grow the label set without bound.
+pub fn method_label(m: &axum::http::Method) -> &'static str {
+    use axum::http::Method;
+    const KNOWN: [(Method, &str); 9] = [
+        (Method::GET, "GET"),
+        (Method::POST, "POST"),
+        (Method::PUT, "PUT"),
+        (Method::DELETE, "DELETE"),
+        (Method::PATCH, "PATCH"),
+        (Method::HEAD, "HEAD"),
+        (Method::OPTIONS, "OPTIONS"),
+        (Method::CONNECT, "CONNECT"),
+        (Method::TRACE, "TRACE"),
+    ];
+    KNOWN.iter().find(|(k, _)| k == m).map_or("OTHER", |(_, s)| s)
+}
 
 #[derive(Default)]
 pub struct Metrics {
@@ -54,15 +73,18 @@ impl Metrics {
         g.store(n as u64, Ordering::Relaxed);
     }
 
-    pub fn record_http(&self, method: &str, route: &str, status: u16, seconds: f64) {
+    /// `route` must be a route pattern (or a fixed label), never a raw path.
+    pub fn record_http(&self, method: &axum::http::Method, route: &str, status: u16, seconds: f64) {
         let mut m = self.http.lock().unwrap();
-        let e = m.entry((method.to_owned(), route.to_owned(), status)).or_default();
+        let e = m.entry((method_label(method), route.to_owned(), status)).or_default();
         e.0 += 1;
         e.1 += seconds;
     }
 
     pub fn render(&self, model: &str) -> String {
         let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        // A label value (the model name comes from a file name or a flag).
+        let model = model.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
         let mut s = String::new();
         let mut one = |name: &str, kind: &str, help: &str, v: f64| {
             let _ = writeln!(s, "# HELP rllm_{name} {help}\n# TYPE rllm_{name} {kind}\nrllm_{name}{{model=\"{model}\"}} {v}");
@@ -104,5 +126,27 @@ impl Metrics {
             let _ = writeln!(s, "rllm_http_request_seconds_total{{method=\"{m}\",route=\"{r}\",status=\"{st}\"}} {t:.6}");
         }
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Method;
+
+    #[test]
+    fn extension_methods_share_one_label() {
+        let m = Metrics::default();
+        for i in 0..1000 {
+            let method = Method::from_bytes(format!("X{i}").as_bytes()).unwrap();
+            m.record_http(&method, "unmatched", 404, 0.0);
+        }
+        m.record_http(&Method::GET, "/v1/models", 200, 0.0);
+        m.record_http(&Method::DELETE, "/v1/responses/{id}", 200, 0.0);
+        assert_eq!(m.http.lock().unwrap().len(), 3);
+        let text = m.render("x");
+        assert!(text.contains("rllm_http_requests_total{method=\"OTHER\",route=\"unmatched\",status=\"404\"} 1000"));
+        assert!(text.contains("method=\"GET\",route=\"/v1/models\""));
+        assert!(text.contains("method=\"DELETE\",route=\"/v1/responses/{id}\""));
     }
 }

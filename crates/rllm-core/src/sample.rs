@@ -32,14 +32,22 @@ pub struct RowSample {
 /// Bisection steps for the top_k / top_p thresholds.
 pub const BISECT_STEPS: u32 = 40;
 
-/// Uniform in (0, 1) from (seed, counter, token): splitmix64 finalizer over a
-/// mix of the three (the GPU kernels compute the same bits).
+/// Smallest temperature used as given; lower ones (but > 0) are raised to
+/// it, so `x / T` stays finite (1 / T would overflow below ~3e-39, and
+/// `0 * inf` is NaN). At this temperature sampling is greedy in practice.
+pub const MIN_TEMPERATURE: f32 = 1e-4;
+
+/// Uniform strictly inside (0, 1) from (seed, counter, token): splitmix64
+/// finalizer over a mix of the three (the GPU kernels compute the same
+/// bits). 23 bits: `(n + 0.5) * 2^-23` is exact for n < 2^23, so the largest
+/// value is 1 - 2^-24 (with 24 bits the top one rounds to exactly 1.0, whose
+/// Gumbel noise is +inf).
 pub fn uniform(seed: u64, counter: u64, token: u32) -> f32 {
     let mut z = seed ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (token as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^= z >> 31;
-    ((z >> 40) as f32 + 0.5) * (1.0 / (1u64 << 24) as f32)
+    ((z >> 41) as f32 + 0.5) * (1.0 / (1u64 << 23) as f32)
 }
 
 /// Gumbel noise for (seed, counter, token).
@@ -65,7 +73,7 @@ pub fn sample_row(logits: &[f32], s: &RowSample) -> u32 {
         }
         return best.1;
     }
-    let inv_t = 1.0 / s.temperature;
+    let inv_t = 1.0 / s.temperature.max(MIN_TEMPERATURE);
     x.iter_mut().for_each(|v| *v *= inv_t);
     let thr = threshold(&x, s.top_k, s.top_p);
     let mut best = (f32::NEG_INFINITY, 0u32);
@@ -81,10 +89,25 @@ pub fn sample_row(logits: &[f32], s: &RowSample) -> u32 {
 }
 
 /// The candidate threshold for top_k / top_p over temperature-scaled `x`.
+///
+/// The bisection runs between the smallest and largest *finite* values:
+/// -inf (masked tokens) would make every midpoint -inf and silently turn
+/// the limits off. -inf and NaN are never candidates at a finite
+/// threshold; +inf ones always are (and win the Gumbel draw). With no
+/// finite value there is nothing to bisect: every non-NaN value competes.
+///
+/// Ties: every value equal to the threshold is kept, so top_k may keep more
+/// than k tokens when several tie at the k-th value (as the GPU kernel does).
 pub fn threshold(x: &[f32], top_k: u32, top_p: f32) -> f32 {
-    let (mut lo, hi) = x.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
-    let max = hi;
+    let (mut lo, hi) = x
+        .iter()
+        .filter(|v| v.is_finite())
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
     let mut thr = f32::NEG_INFINITY;
+    if !(lo <= hi) {
+        return thr;
+    }
+    let max = hi;
     if top_k > 0 && (top_k as usize) < x.len() {
         // Largest t with count(x >= t) >= k.
         let (mut a, mut b) = (lo, hi);
@@ -127,6 +150,49 @@ mod tests {
         assert_eq!(sample_row(&nan, &row(0.0, 0, 1.0, 0)), 1);
         assert_eq!(sample_row(&nan, &row(1.0, 2, 0.9, 0)), 1);
         assert_eq!(sample_row(&[f32::NAN; 4], &row(1.0, 2, 0.9, 0)), 0);
+    }
+
+    /// The extreme hash outputs map strictly inside (0, 1), with finite noise.
+    #[test]
+    fn uniform_is_open_interval() {
+        let u = |z: u64| ((z >> 41) as f32 + 0.5) * (1.0 / (1u64 << 23) as f32);
+        for z in [0, 1 << 41, u64::MAX, u64::MAX - (1 << 41), u64::MAX >> 1] {
+            let v = u(z);
+            assert!(v > 0.0 && v < 1.0, "{z:#x}: {v}");
+            assert!((-(-v.ln()).ln()).is_finite(), "{z:#x}: {v}");
+        }
+        // The old 24-bit form rounded the top value to exactly 1.0.
+        assert_eq!(((u64::MAX >> 40) as f32 + 0.5) * (1.0 / (1u64 << 24) as f32), 1.0);
+        for t in 0..100_000 {
+            let v = uniform(3, 9, t);
+            assert!(v > 0.0 && v < 1.0 && gumbel(3, 9, t).is_finite());
+        }
+    }
+
+    /// -inf logits (masked tokens) and tiny temperatures keep top_k / top_p working.
+    #[test]
+    fn limits_survive_inf_and_tiny_temperature() {
+        let mut logits = vec![f32::NEG_INFINITY; 8];
+        logits.extend([3.0, 2.9, 2.8, -1.0]);
+        for c in 0..2000 {
+            let mut s = row(1.0, 2, 1.0, 1);
+            s.counter = c;
+            assert!(matches!(sample_row(&logits, &s), 8 | 9));
+            let mut s = row(1.0, 0, 0.3, 1);
+            s.counter = c;
+            assert_eq!(sample_row(&logits, &s), 8);
+        }
+        assert!(threshold(&logits, 2, 1.0) > 2.8);
+        for t in [1e-30, 1e-45] {
+            for c in 0..200 {
+                let mut s = row(t, 3, 0.5, 2);
+                s.counter = c;
+                assert_eq!(sample_row(&[0.0, 1.0, 0.5, f32::NEG_INFINITY], &s), 1);
+            }
+        }
+        // No finite value: +inf wins, all -inf gives token 0.
+        assert_eq!(sample_row(&[f32::NEG_INFINITY, f32::INFINITY, 1.0], &row(1.0, 1, 0.5, 0)), 1);
+        assert_eq!(sample_row(&[f32::NEG_INFINITY; 3], &row(1.0, 1, 0.5, 0)), 0);
     }
 
     /// Frequencies over many draws match softmax(x / T), restricted by top_k / top_p.

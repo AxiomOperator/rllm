@@ -11,7 +11,10 @@ use anyhow::{Context, Result, bail};
 use rllm_core::{Activation, AttnMeta, Backend, KvLayout, KvType};
 use rllm_gguf::Gguf;
 
-use crate::loader::{load_weight, load_weight_rope_neox};
+use crate::loader::{
+    MAX_CONTEXT, MAX_DIM, check_same_as_head_dim, check_shape, check_shape_opt, load_weight, load_weight_rope_neox, meta_f32_or,
+    meta_usize, meta_usize_or,
+};
 use crate::{Batch, Model, StepOut};
 
 #[derive(Debug, Clone)]
@@ -40,13 +43,19 @@ impl Qwen3Config {
         }
         let llama = arch == "llama";
         let k = |s: &str| format!("{arch}.{s}");
-        let n_heads = g.get_u64(&k("attention.head_count"))? as usize;
-        let hidden = g.get_u64(&k("embedding_length"))? as usize;
+        let dim = |s: &str| meta_usize(g, &k(s), MAX_DIM, false);
+        let n_heads = dim("attention.head_count")?;
+        let hidden = dim("embedding_length")?;
         let head_dim = match g.get(&k("attention.key_length")) {
-            Some(v) => v.as_u64().context("attention.key_length")? as usize,
-            None => hidden / n_heads,
+            Some(_) => dim("attention.key_length")?,
+            None => {
+                anyhow::ensure!(hidden.is_multiple_of(n_heads), "embedding_length {hidden} is not a multiple of head_count {n_heads}");
+                hidden / n_heads
+            }
         };
-        let vocab = g.require_tensor("token_embd.weight")?.dims[1] as usize;
+        let embd = g.require_tensor("token_embd.weight")?;
+        let [_, vocab] = embd.dims[..] else { bail!("token_embd.weight has shape {:?}, expected 2 dims", embd.dims) };
+        let vocab = usize::try_from(vocab).ok().filter(|&v| (1..=MAX_DIM).contains(&v)).context("token_embd.weight: vocabulary size out of range")?;
         // Llama 3 scaling arrives as `rope_freqs.weight`; others would need
         // positions or frequencies changed, which isn't implemented.
         if let Some(t) = g.get(&k("rope.scaling.type")).and_then(|v| v.as_str())
@@ -59,20 +68,92 @@ impl Qwen3Config {
         {
             bail!("RoPE scaling (rope.scaling.factor) is not supported");
         }
-        Ok(Self {
+        // Partial rotary embeddings and V heads narrower or wider than K
+        // heads would load fine and compute garbage: refuse them.
+        check_same_as_head_dim(g, &k("rope.dimension_count"), head_dim, "partial rotary embedding")?;
+        check_same_as_head_dim(g, &k("attention.value_length"), head_dim, "a value head size different from the key head size")?;
+        // Per-layer head counts or sizes (arrays) aren't supported.
+        for key in ["feed_forward_length", "attention.head_count", "attention.head_count_kv"] {
+            if g.get(&k(key)).is_some_and(|v| v.as_array().is_some()) {
+                bail!("per-layer {key} not supported");
+            }
+        }
+        let cfg = Self {
             arch: arch.to_string(),
-            n_layers: g.get_u64(&k("block_count"))? as usize,
+            n_layers: dim("block_count")?,
             hidden,
-            ffn: g.get_u64(&k("feed_forward_length"))? as usize,
+            ffn: dim("feed_forward_length")?,
             n_heads,
-            n_kv_heads: g.get_u64(&k("attention.head_count_kv"))? as usize,
+            n_kv_heads: dim("attention.head_count_kv")?,
             head_dim,
             vocab,
-            rope_theta: g.get_f64(&k("rope.freq_base")).unwrap_or(if llama { 10_000.0 } else { 1_000_000.0 }) as f32,
-            rms_eps: g.get_f64(&k("attention.layer_norm_rms_epsilon")).unwrap_or(if llama { 1e-5 } else { 1e-6 }) as f32,
-            max_context: g.get_u64(&k("context_length")).unwrap_or(32768) as usize,
-            sliding_window: g.get(&k("attention.sliding_window")).and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-        })
+            rope_theta: meta_f32_or(g, &k("rope.freq_base"), if llama { 10_000.0 } else { 1_000_000.0 })?,
+            rms_eps: meta_f32_or(g, &k("attention.layer_norm_rms_epsilon"), if llama { 1e-5 } else { 1e-6 })?,
+            max_context: meta_usize_or(g, &k("context_length"), 32768, MAX_CONTEXT, false)?,
+            sliding_window: meta_usize_or(g, &k("attention.sliding_window"), 0, MAX_CONTEXT, true)?,
+        };
+        cfg.validate()?;
+        cfg.check_tensors(g)?;
+        Ok(cfg)
+    }
+
+    /// Check the hyperparameters are consistent (every count positive, KV
+    /// heads dividing query heads, RoPE on whole pairs).
+    pub fn validate(&self) -> Result<()> {
+        let c = self;
+        for (what, v) in [
+            ("block_count", c.n_layers),
+            ("embedding_length", c.hidden),
+            ("feed_forward_length", c.ffn),
+            ("head_count", c.n_heads),
+            ("head_count_kv", c.n_kv_heads),
+            ("head size", c.head_dim),
+            ("vocabulary", c.vocab),
+            ("context_length", c.max_context),
+        ] {
+            anyhow::ensure!(v > 0, "{what} must be positive");
+        }
+        anyhow::ensure!(
+            c.n_heads.is_multiple_of(c.n_kv_heads),
+            "head_count {} is not a multiple of head_count_kv {}",
+            c.n_heads,
+            c.n_kv_heads
+        );
+        anyhow::ensure!(c.head_dim.is_multiple_of(2), "head size {} must be even (RoPE rotates pairs)", c.head_dim);
+        anyhow::ensure!(c.n_layers <= 4096 && c.n_heads <= 4096 && c.head_dim <= 4096, "implausible model size: {c:?}");
+        anyhow::ensure!(c.rope_theta.is_finite() && c.rope_theta > 0.0 && c.rms_eps.is_finite() && c.rms_eps > 0.0, "invalid RoPE base or RMS epsilon");
+        Ok(())
+    }
+
+    /// Check every tensor the model loads has the shape the config implies.
+    fn check_tensors(&self, g: &Gguf) -> Result<()> {
+        let c = self;
+        let (d, qw, kvw) = (c.hidden, c.q_width(), c.kv_width());
+        check_shape(g, "token_embd.weight", &[d, c.vocab])?;
+        check_shape(g, "output_norm.weight", &[d])?;
+        check_shape_opt(g, "output.weight", &[d, c.vocab])?;
+        check_shape_opt(g, "rope_freqs.weight", &[c.head_dim / 2])?;
+        for i in 0..c.n_layers {
+            let p = |s: &str| format!("blk.{i}.{s}.weight");
+            for (name, dims) in [
+                ("attn_norm", &[d][..]),
+                ("attn_q", &[d, qw]),
+                ("attn_k", &[d, kvw]),
+                ("attn_v", &[d, kvw]),
+                ("attn_output", &[qw, d]),
+                ("ffn_norm", &[d]),
+                ("ffn_gate", &[d, c.ffn]),
+                ("ffn_up", &[d, c.ffn]),
+                ("ffn_down", &[c.ffn, d]),
+            ] {
+                check_shape(g, &p(name), dims)?;
+            }
+            if g.tensor(&p("attn_q_norm")).is_some() {
+                check_shape(g, &p("attn_q_norm"), &[c.head_dim])?;
+                check_shape(g, &p("attn_k_norm"), &[c.head_dim])?;
+            }
+        }
+        Ok(())
     }
 
     pub fn q_width(&self) -> usize {
@@ -270,5 +351,88 @@ impl<B: Backend> Model<B> for Qwen3<B> {
     fn summary(&self) -> String {
         let c = &self.cfg;
         format!("{}: {} layers, hidden {}, {} heads / {} kv", c.arch, c.n_layers, c.hidden, c.n_heads, c.n_kv_heads)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rllm_gguf::Value;
+
+    use super::*;
+    use crate::test_gguf::Spec;
+
+    /// Qwen3-shaped: 2 layers, hidden 8, 2 heads of 4 over 1 KV head, FFN 16, vocab 10.
+    fn tiny() -> Spec {
+        let mut s = Spec::default();
+        s.set("general.architecture", Value::String("qwen3".into()));
+        for (k, v) in [("block_count", 2), ("embedding_length", 8), ("feed_forward_length", 16), ("attention.head_count", 2), ("attention.head_count_kv", 1), ("attention.key_length", 4), ("context_length", 64)] {
+            s.set(&format!("qwen3.{k}"), Value::U32(v));
+        }
+        s.tensor("token_embd.weight", &[8, 10]).tensor("output_norm.weight", &[8]);
+        for i in 0..2 {
+            for (n, d) in [
+                ("attn_norm", &[8][..]),
+                ("attn_q", &[8, 8]),
+                ("attn_k", &[8, 4]),
+                ("attn_v", &[8, 4]),
+                ("attn_output", &[8, 8]),
+                ("attn_q_norm", &[4]),
+                ("attn_k_norm", &[4]),
+                ("ffn_norm", &[8]),
+                ("ffn_gate", &[8, 16]),
+                ("ffn_up", &[8, 16]),
+                ("ffn_down", &[16, 8]),
+            ] {
+                s.tensor(&format!("blk.{i}.{n}.weight"), d);
+            }
+        }
+        s
+    }
+
+    fn err(s: &Spec) -> String {
+        format!("{:#}", Qwen3Config::from_gguf(&s.build().unwrap()).unwrap_err())
+    }
+
+    #[test]
+    fn valid_config_loads() {
+        let g = tiny().build().unwrap();
+        let c = Qwen3Config::from_gguf(&g).unwrap();
+        assert_eq!((c.n_layers, c.vocab, c.head_dim, c.max_context), (2, 10, 4, 64));
+        assert!(crate::ModelProfile::read(&g).is_ok());
+    }
+
+    #[test]
+    fn malformed_configs_are_errors() {
+        // 1-D embedding table.
+        assert!(err(tiny().tensor("token_embd.weight", &[80])).contains("token_embd"));
+        // Zero heads / KV heads, KV heads not dividing heads.
+        assert!(err(tiny().set("qwen3.attention.head_count", Value::U32(0))).contains("head_count"));
+        assert!(err(tiny().set("qwen3.attention.head_count_kv", Value::U32(0))).contains("head_count_kv"));
+        assert!(err(tiny().set("qwen3.attention.head_count_kv", Value::U32(3))).contains("multiple"));
+        // No key_length and a hidden size heads don't divide.
+        assert!(err(tiny().remove("qwen3.attention.key_length").set("qwen3.attention.head_count", Value::U32(3))).contains("multiple"));
+        // Zero layers, context, absurd sizes.
+        assert!(err(tiny().set("qwen3.block_count", Value::U32(0))).contains("block_count"));
+        assert!(err(tiny().set("qwen3.context_length", Value::U32(0))).contains("context_length"));
+        assert!(err(tiny().set("qwen3.embedding_length", Value::U64(u64::MAX))).contains("out of range"));
+        // A tensor whose shape doesn't match the config.
+        assert!(err(tiny().tensor("blk.1.attn_k.weight", &[8, 8])).contains("blk.1.attn_k"));
+        assert!(err(tiny().tensor("blk.0.ffn_down.weight", &[8, 16])).contains("ffn_down"));
+        assert!(err(tiny().tensor("output.weight", &[8, 11])).contains("output.weight"));
+        // Bad floats.
+        assert!(err(tiny().set("qwen3.rope.freq_base", Value::F32(f32::NAN))).contains("freq_base"));
+        assert!(err(tiny().set("qwen3.attention.layer_norm_rms_epsilon", Value::F32(-1.0))).contains("epsilon"));
+    }
+
+    #[test]
+    fn unsupported_head_layouts_are_rejected() {
+        // Partial rotary.
+        assert!(err(tiny().set("qwen3.rope.dimension_count", Value::U32(2))).contains("partial rotary"));
+        // V heads wider than K heads.
+        assert!(err(tiny().set("qwen3.attention.value_length", Value::U32(8))).contains("value head"));
+        // Matching values are fine.
+        let mut s = tiny();
+        s.set("qwen3.rope.dimension_count", Value::U32(4)).set("qwen3.attention.value_length", Value::U32(4));
+        assert!(Qwen3Config::from_gguf(&s.build().unwrap()).is_ok());
     }
 }

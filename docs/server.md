@@ -116,14 +116,18 @@ Every response carries `x-request-id`, `openai-processing-ms` and
 Browser protections:
 - **CORS is off by default:** a web page can't read responses unless its origin is allowed with `--cors-origin`.
 - **POST bodies must be JSON:** requests with another `Content-Type` get 415, so a page can't send one as a plain form.
-- **DNS rebinding:** on a loopback address (the default), requests whose `Host` isn't `localhost` or a loopback IP get 403.
+- **DNS rebinding:** on a loopback address (the default), requests whose `Host` isn't `localhost` or a loopback IP get 403. On any other address there is no `Host` check, and the server logs a warning at startup if it has no `--api-key`.
 
 Errors use OpenAI's shape, `{"error": {"message", "type", "param", "code"}}`,
 with the same status codes: 400 `invalid_request_error` (naming the bad
 parameter in `param`), 401 for a missing or wrong key (`invalid_api_key`),
 404 for unknown models, objects and URLs, 400 `context_length_exceeded`,
 500 `server_error`, 503 if the queue is full (`--max-queue`) or the engine
-stopped (`/health` then answers 503 too).
+stopped (`/health` then answers 503 too). A request reserves its queue places
+(one per generation: `n`, prompts × `best_of`) before its response starts,
+so streaming requests get a real 503 too, never a 200 followed by an
+`error` event for a full queue. A Responses request turned away with 503 is not stored (unless it
+is a background one, which is stored as `failed`).
 
 ## Request parameters
 
@@ -131,9 +135,11 @@ Chat Completions:
 - **Sampling:** `temperature`, `top_p`, `seed` (reproducible for the same seed and server), `frequency_penalty`, `presence_penalty`, `logit_bias`, plus the common `top_k` extension.
 - **Length and stopping:** `max_completion_tokens` (or the deprecated `max_tokens`) and up to 4 `stop` sequences. A stop sequence ends the output and is not included.
 - **Choices and logprobs:** `n` (1–128), `logprobs` and `top_logprobs` (up to 20). Logprobs come from the model's raw distribution.
+  - `logprobs.content` covers the tokens that produced the message content. Tokens of reasoning (including the `<think>` / `</think>` markers), tool calls, a stop sequence or the end of the output are left out; `bytes` holds each token's exact bytes, also for tokens that carry part of a UTF-8 character.
+  - `bytes` is the UTF-8 of each token's decoded text, so a token that is part of a multi-byte character shows U+FFFD's bytes.
 - **Streaming:** `stream` and `stream_options.include_usage`.
 - **Tools:** `tools` (function tools), `tool_choice` (`none`, `auto`, `required`, a named function, `allowed_tools`), `parallel_tool_calls`, and the deprecated `functions` / `function_call`.
-  - Tool definitions go through the model's own chat template.
+  - Tool definitions go through the model's own chat template. Function names must match `^[a-zA-Z0-9_-]{1,64}$`, as on OpenAI (400 otherwise).
   - Tool calls are parsed from the model's native format: Qwen/Hermes `<tool_call>` JSON, or Gemma 4 `<|tool_call>call:…`.
   - `required` and named choices are enforced by starting the model's output with the tool-call opening, then constraining the call to the tools' names and parameter schemas (in either format), so the arguments always match a tool's `parameters`.
 - **`response_format`:** `json_object` and `json_schema`.
@@ -142,7 +148,7 @@ Chat Completions:
 - **`reasoning_effort`:** `none` or `minimal` turn the model's thinking mode off; any other value turns it on. Without it, the chat template's default applies.
   - Thinking text is returned as `message.reasoning_content` (the de facto field used by compatible servers), or `delta.reasoning_content` when streaming.
   - Usage counts it in `completion_tokens_details.reasoning_tokens`.
-- **Storage:** `store` and `metadata` (in memory; saved to disk with `--store-file`).
+- **Storage:** `store` and `metadata` (in memory; saved to disk with `--store-file`). A streamed completion is stored once its stream finishes.
 - **Usage:** `prompt_tokens_details.cached_tokens` counts prompt tokens served from the prefix cache.
 - **Accepted but without effect:** `user`, `safety_identifier`, `prompt_cache_key`, `service_tier` (reported as `default`) and `prediction`.
 - **Rejected with 400:**
@@ -158,7 +164,8 @@ Responses:
 - **Generation:** `instructions`, `max_output_tokens`, `temperature`, `top_p`, `top_logprobs` / `include: ["message.output_text.logprobs"]`.
 - **Tools:** `tools` (function tools), `tool_choice`, `parallel_tool_calls`, `max_tool_calls`.
 - **Output format:** `text.format` (`text`, `json_object`, `json_schema`, as above), and `reasoning.effort`.
-- **Conversation:** `previous_response_id` (the stored conversation, without the earlier `instructions`), and `truncation: "auto"`, which drops the fewest oldest turns (whole user-to-user turns, so roles keep alternating) that make the prompt fit.
+- **Conversation:** `previous_response_id` (the stored conversation, without the earlier `instructions`; at most 1000 chained turns, then 400), and `truncation: "auto"`, which drops the fewest oldest turns (whole user-to-user turns, so roles keep alternating) that make the prompt fit.
+- **Logprobs:** attached to the `output_text` they produced; reasoning and tool-call tokens are left out.
 - **Storage and execution:** `store`, `background` (requires `store`), `metadata`, `stream`.
 - **Output items:**
   - `reasoning` items (`content: [{"type": "reasoning_text"}]`)
@@ -216,7 +223,7 @@ retrieval-embedding model.
   - New requests join the batch as soon as a slot (`--parallel`) and KV blocks are free. Finished ones leave without waiting for the rest.
   - Steps of up to 8 tokens (decoding requests, or drafts being verified), and pure decode steps of up to 64 requests, replay CUDA/HIP graphs. Larger steps that mix in prompt chunks run directly.
   - Decode attention splits long contexts over several thread blocks per head and merges them in a fixed order (2× faster on Qwen3-0.6B at 8k context on the laptop GPU).
-  - HTTP handling, tokenization, chat templating, stop sequences and output parsing run on the async runtime.
+  - HTTP handling, stop sequences and output parsing run on the async runtime; chat templating and tokenizing a request run on its blocking pool, so a large prompt doesn't hold up other connections.
 - **Prefix cache.** When a request finishes, its KV blocks stay cached. A later request whose prompt starts with the same tokens reuses those blocks instead of recomputing them. That covers the next turn of a chat, a repeated system prompt, `n` choices or `previous_response_id`.
   - Only whole 16-token blocks are shared, so the last few tokens before the difference are recomputed.
   - Least recently used entries are evicted when blocks run out: dropped, or with `--host-cache-gb` moved to system memory (see [Host tier](#host-tier)).
@@ -225,12 +232,13 @@ retrieval-embedding model.
 - **Numerics.** A request batched with others runs through the multi-row int8 kernels (the ones prefill uses), and a lone request through the single-row decode kernels.
   - Logprobs agree to about 0.01–0.02 on average, but greedy text can drift apart after a few dozen tokens.
   - Results are reproducible for the same mix of concurrent requests: every GPU reduction sums in a fixed order, so the same tokens give bit-identical logits on every run. (Prefill matmuls split along k used to `atomicAdd` their parts in whatever order they finished.)
-- **Cancellation.** A client that disconnects (a closed stream, a dropped connection) cancels its generation at the next step and frees its slot, or its place in the queue if it hadn't started. Stop sequences cancel the rest of the generation too. A stored, non-background response whose client disconnects is saved as `failed`.
+- **Cancellation.** A client that disconnects (a closed stream, a dropped connection) cancels its generation at the next step and frees its slot, or its place in the queue if it hadn't started. Streams notice the disconnect while they wait too (queued, or reading a long prompt), not only when they next send. Stop sequences cancel the rest of the generation too. A stored, non-background response whose client disconnects is saved as `failed`.
+- **Keep-alive.** Streams send an SSE comment (`:`) after 15 s without an event, so proxies and client timeouts don't cut a stream that waits in the queue or on a long prompt.
 - **Special tokens in user text.** Text from `user` and `tool` messages is tokenized as plain text: typing `<|im_end|>` or `[INST]` there can't open or close a turn.
-- **`n` and `best_of`.** The choices run concurrently, so they share batches. They use seeds `seed`, `seed + 1`, …. Streaming with `n > 1` still sends the choices one after another. A legacy completions request may run at most 128 sequences (prompts × `best_of`).
-- **Storage.** Stored chat completions and responses live in memory, up to 10,000 of each; the oldest go first.
-  - A chain of responses (`previous_response_id`) shares its earlier turns, in memory and on disk.
-  - With `--store-file` they are written to that JSON file (atomically, at most every 2 s, and at shutdown, serialized outside the store's lock) and loaded at start. Files from earlier versions still load.
+- **`n` and `best_of`.** The choices run concurrently, so they share batches, streaming or not (streamed chunks of different choices interleave, each with its `index`). They use seeds `seed`, `seed + 1`, …. A legacy completions request may run at most 128 sequences (prompts × `best_of`).
+- **Storage.** Stored chat completions and responses live in memory, up to 10,000 and 256 MiB (serialized JSON) of each; the oldest go first.
+  - A chain of responses (`previous_response_id`) shares its earlier turns, in memory and on disk. Each response counts its whole conversation against the 256 MiB, since its chain keeps the earlier turns alive after their own responses are evicted.
+  - With `--store-file` they are written to that JSON file (atomically via a temporary file synced to disk, readable by the owner only, at most every 2 s, and at shutdown; serialized off the async runtime and outside the store's lock) and loaded at start. Files from earlier versions still load.
   - A response deleted while running stays deleted.
   - A background response still running at shutdown loads as `failed`.
 - **Logging.** One line per finished generation: prompt tokens (cached), generated tokens, time to first token, decode rate, total time and finish reason.
@@ -349,7 +357,7 @@ the context or concurrent requests in the same `--kv-tokens` budget.
 - **Engine counters:** `rllm_requests_finished_total`, `rllm_prompt_tokens_total`, `rllm_prompt_tokens_cached_total`, `rllm_generation_tokens_total`, `rllm_embedding_tokens_total`, `rllm_preemptions_total`, `rllm_engine_steps_total`, `rllm_engine_step_tokens_total`, `rllm_engine_busy_seconds_total`.
 - **Speculative decoding:** `rllm_draft_tokens_total` (proposed) and `rllm_draft_tokens_accepted_total`; for prompt lookup, `rllm_lookup_tokens_total` and `rllm_lookup_tokens_accepted_total`.
 - **Host tier:** `rllm_kv_host_blocks_total`, `rllm_kv_host_blocks_free`, `rllm_prefix_cache_host_entries`, `rllm_kv_offloaded_blocks_total`, `rllm_kv_restored_blocks_total`.
-- **HTTP:** `rllm_http_requests_total` and `rllm_http_request_seconds_total`, by method, route pattern (`/v1/responses/{id}`) and status.
+- **HTTP:** `rllm_http_requests_total` and `rllm_http_request_seconds_total`, by method, route pattern (`/v1/responses/{id}`, or `unmatched`) and status. Methods other than the standard nine are counted as `OTHER`, so the series stay bounded.
 
 ## Performance
 
@@ -446,4 +454,5 @@ Qwen3-0.6B, Qwen3-8B and Nemotron on both NVIDIA GPUs and on the Strix Halo
 (`--test gpu_hip`, the same tests on HIP). The CUDA parity tests
 (`crates/rllm-cuda/tests/common/parity.rs`) run every attention path on a q8 cache
 against the CPU backend, which emulates q8's rounding.
-- **The output parser:** reasoning and tool-call markers split at every possible point, Gemma argument syntax, stop sequences spanning chunks.
+- **The output parser:** reasoning and tool-call markers split at every possible point, Gemma argument syntax (100k nested brackets are rejected, not a stack overflow), stop sequences spanning chunks.
+- **The stores:** count and byte budgets, dropping a million-turn conversation chain, pagination; tool-name validation; bounded HTTP metric labels.

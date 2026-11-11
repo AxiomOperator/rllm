@@ -20,7 +20,8 @@
 //! bare keys, strings between `<|"|>` tokens (no escapes), and the function
 //! name before the arguments.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -50,8 +51,14 @@ enum Node {
 
 /// Gemma 4's string delimiter (one special token).
 pub const GEMMA_QUOTE: &str = "<|\"|>";
-/// What a Gemma quote becomes inside the validator.
-const QUOTE: char = '\u{1}';
+/// What a Gemma quote becomes inside the validator: a noncharacter that
+/// model output doesn't contain. Text that does contain it is rejected in
+/// Gemma mode, so no token (a byte token, say) can forge a quote.
+const QUOTE: char = '\u{10FFFF}';
+
+/// Schema keywords that don't constrain the value (ignored next to `$ref`).
+const ANNOTATIONS: &[&str] =
+    &["$defs", "definitions", "$schema", "$id", "$anchor", "$comment", "title", "description", "default", "examples", "deprecated", "readOnly", "writeOnly"];
 
 /// A compiled JSON schema.
 #[derive(Debug)]
@@ -60,7 +67,8 @@ pub struct Schema {
     root: NodeId,
     /// Gemma 4 argument syntax instead of JSON.
     gemma: bool,
-    /// Compiling hit the work budget (see `Compiler::budget`): the schema is
+    /// Compiling hit the work budget (see `Compiler::budget`), or the schema
+    /// refers to itself without consuming input (`a = anyOf[a, …]`): it is
     /// rejected rather than enforced partially.
     too_complex: bool,
 }
@@ -74,6 +82,11 @@ impl Schema {
             Node::Literals(vec!["true".into(), "false".into(), "null".into()]),
             Node::AnyOf(Vec::new()),
         ]
+    }
+
+    fn finish(c: Compiler, root: NodeId, gemma: bool) -> Self {
+        let too_complex = c.over_budget() || left_recursive(&c.nodes);
+        Self { too_complex, nodes: c.nodes, root, gemma }
     }
 
     /// Any JSON object (`json_object` mode).
@@ -92,10 +105,10 @@ impl Schema {
     pub fn compile(schema: &Value) -> Self {
         let mut c = Compiler::new(schema);
         let root = c.compile(schema);
-        Self { too_complex: c.over_budget(), nodes: c.nodes, root, gemma: false }
+        Self::finish(c, root, false)
     }
 
-    /// True if the schema was too large to compile (see `Compiler::budget`).
+    /// True if the schema was too large or too self-referencing to enforce.
     pub fn too_complex(&self) -> bool {
         self.too_complex
     }
@@ -117,20 +130,107 @@ impl Schema {
             alts.push(c.push(Node::Prefixed { text: name.clone(), then }));
         }
         let root = c.push(Node::AnyOf(alts));
-        Self { too_complex: c.over_budget(), nodes: c.nodes, root, gemma: true }
+        Self::finish(c, root, true)
     }
 
-    /// One of several schemas.
-    pub fn any_of(schemas: &[Value]) -> Self {
+    /// Any of these JSON tool calls, `{"name": <name>, "arguments": <args>}`
+    /// for each (name, parameter schema). Each tool's `$ref`s resolve
+    /// against its own parameter schema.
+    pub fn tool_calls(tools: &[(String, Value)]) -> Self {
         let mut c = Compiler::new(&Value::Null);
         let mut alts = Vec::new();
-        for s in schemas {
-            c.doc = s;
+        for (name, params) in tools {
+            c.doc = params;
             c.refs.clear();
-            alts.push(c.compile(s));
+            let args = c.compile(params);
+            let name_id = c.literal(&[Value::String(name.clone())]);
+            alts.push(c.push(Node::Object {
+                props: vec![("name".into(), name_id), ("arguments".into(), args)],
+                required: vec!["name".into(), "arguments".into()],
+                additional: None,
+            }));
         }
         let root = c.push(Node::AnyOf(alts));
-        Self { too_complex: c.over_budget(), nodes: c.nodes, root, gemma: false }
+        Self::finish(c, root, false)
+    }
+}
+
+/// Whether some `anyOf` reaches itself through `anyOf`s alone, without
+/// consuming input (`a = anyOf[a, …]`: left recursion through `$ref`s).
+/// Expanding such a value would never end.
+fn left_recursive(nodes: &[Node]) -> bool {
+    // 0: unvisited, 1: on the DFS path, 2: done.
+    let mut color = vec![0u8; nodes.len()];
+    for start in 0..nodes.len() {
+        if color[start] != 0 {
+            continue;
+        }
+        color[start] = 1;
+        let mut path: Vec<(NodeId, usize)> = vec![(start, 0)];
+        while let Some((n, next)) = path.last_mut() {
+            let n = *n;
+            let kids: &[NodeId] = match &nodes[n] {
+                Node::AnyOf(alts) => alts,
+                _ => &[],
+            };
+            if let Some(&k) = kids.get(*next) {
+                *next += 1;
+                match color[k] {
+                    0 => {
+                        color[k] = 1;
+                        path.push((k, 0));
+                    }
+                    1 => return true,
+                    _ => {}
+                }
+            } else {
+                color[n] = 2;
+                path.pop();
+            }
+        }
+    }
+    false
+}
+
+/// Merge schema object `add` into `merged` (for `allOf`): `properties` and
+/// `required` are unions; other keywords are replaced if `overwrite`.
+fn merge_schema(merged: &mut serde_json::Map<String, Value>, add: Value, overwrite: bool) {
+    let Value::Object(add) = add else { return };
+    for (k, v) in add {
+        let Some(cur) = merged.get_mut(&k) else {
+            merged.insert(k, v);
+            continue;
+        };
+        match (k.as_str(), cur, v) {
+            ("properties", Value::Object(m), Value::Object(add)) => {
+                for (pk, pv) in add {
+                    if overwrite || !m.contains_key(&pk) {
+                        m.insert(pk, pv);
+                    }
+                }
+            }
+            ("required", Value::Array(m), Value::Array(add)) => {
+                for r in add {
+                    if !m.contains(&r) {
+                        m.push(r);
+                    }
+                }
+            }
+            (_, cur, v) => {
+                if overwrite {
+                    *cur = v;
+                }
+            }
+        }
+    }
+}
+
+/// Whether a `type` keyword allows null.
+fn type_allows_null(t: Option<&Value>) -> bool {
+    match t {
+        Some(Value::String(t)) => t == "null",
+        Some(Value::Array(ts)) => ts.iter().any(|t| t == "null"),
+        _ => false,
     }
 }
 
@@ -174,6 +274,12 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// `id` or null.
+    fn nullable(&mut self, id: NodeId) -> NodeId {
+        let null = self.push(Node::Literals(vec!["null".into()]));
+        self.push(Node::AnyOf(vec![id, null]))
+    }
+
     fn resolve(&self, pointer: &str) -> Option<&Value> {
         let path = pointer.strip_prefix('#')?;
         if path.is_empty() {
@@ -194,6 +300,20 @@ impl<'a> Compiler<'a> {
         id
     }
 
+    /// A plain `$ref`: compiled once, shared by every use.
+    fn compile_ref(&mut self, r: &str) -> NodeId {
+        if let Some(&id) = self.refs.get(r) {
+            return id;
+        }
+        let Some(target) = self.resolve(r).cloned() else { return ANY };
+        // Placeholder first, so recursive references resolve to it.
+        let id = self.push(Node::AnyOf(Vec::new()));
+        self.refs.insert(r.to_owned(), id);
+        let t = self.compile(&target);
+        self.nodes[id] = Node::AnyOf(vec![t]);
+        id
+    }
+
     fn compile_inner(&mut self, s: &Value) -> NodeId {
         let o = match s {
             Value::Bool(true) => return ANY,
@@ -201,17 +321,27 @@ impl<'a> Compiler<'a> {
             Value::Object(o) => o,
             _ => return ANY,
         };
+        let null_ok = o.get("nullable").and_then(Value::as_bool) == Some(true);
         if let Some(r) = o.get("$ref").and_then(Value::as_str) {
-            if let Some(&id) = self.refs.get(r) {
-                return id;
-            }
-            let Some(target) = self.resolve(r).cloned() else { return ANY };
-            // Placeholder first, so recursive references resolve to it.
-            let id = self.push(Node::AnyOf(Vec::new()));
-            self.refs.insert(r.to_owned(), id);
-            let t = self.compile(&target);
-            self.nodes[id] = Node::AnyOf(vec![t]);
-            return id;
+            let null_ok = null_ok || type_allows_null(o.get("type"));
+            // Keywords next to a `$ref` apply too (as in JSON Schema 2019+):
+            // compiled as an `allOf` of the target and them. A lone `type`
+            // is taken as restating the target's.
+            let siblings = o.keys().any(|k| !matches!(k.as_str(), "$ref" | "nullable" | "type") && !ANNOTATIONS.contains(&k.as_str()));
+            let id = if siblings {
+                let mut rest = o.clone();
+                rest.remove("$ref");
+                rest.remove("nullable");
+                let mut parts = vec![serde_json::json!({ "$ref": r })];
+                if let Some(Value::Array(more)) = rest.remove("allOf") {
+                    parts.extend(more);
+                }
+                rest.insert("allOf".into(), Value::Array(parts));
+                self.compile(&Value::Object(rest))
+            } else {
+                self.compile_ref(r)
+            };
+            return if null_ok { self.nullable(id) } else { id };
         }
         let base = if let Some(v) = o.get("const") {
             self.literal(std::slice::from_ref(v))
@@ -221,28 +351,24 @@ impl<'a> Compiler<'a> {
             let ids = alts.iter().map(|a| self.compile(a)).collect();
             self.push(Node::AnyOf(ids))
         } else if let Some(Value::Array(parts)) = o.get("allOf") {
+            // Merged into one schema: the parts (later ones win conflicting
+            // keywords), then the keywords next to `allOf`; `properties` and
+            // `required` are unions.
             let mut merged = serde_json::Map::new();
             for p in parts {
-                let p = match p.get("$ref").and_then(Value::as_str) {
-                    Some(r) => self.resolve(r).cloned().unwrap_or(Value::Null),
-                    None => p.clone(),
-                };
-                let Value::Object(p) = p else { continue };
-                for (k, v) in p {
-                    match (k.as_str(), merged.get_mut(&k), &v) {
-                        ("properties", Some(Value::Object(m)), Value::Object(add)) => m.extend(add.clone()),
-                        ("required", Some(Value::Array(m)), Value::Array(add)) => m.extend(add.iter().cloned()),
-                        _ => {
-                            merged.insert(k, v);
-                        }
+                let mut p = p.clone();
+                if let Some(r) = p.get("$ref").and_then(Value::as_str) {
+                    let target = self.resolve(r).cloned().unwrap_or(Value::Null);
+                    merge_schema(&mut merged, target, true);
+                    if let Value::Object(m) = &mut p {
+                        m.remove("$ref");
                     }
                 }
+                merge_schema(&mut merged, p, true);
             }
-            for (k, v) in o {
-                if k != "allOf" {
-                    merged.entry(k.clone()).or_insert_with(|| v.clone());
-                }
-            }
+            let mut outer = o.clone();
+            outer.remove("allOf");
+            merge_schema(&mut merged, Value::Object(outer), false);
             self.compile(&Value::Object(merged))
         } else {
             match o.get("type") {
@@ -256,9 +382,8 @@ impl<'a> Compiler<'a> {
                 _ => ANY,
             }
         };
-        if o.get("nullable").and_then(Value::as_bool) == Some(true) {
-            let null = self.push(Node::Literals(vec!["null".into()]));
-            return self.push(Node::AnyOf(vec![base, null]));
+        if null_ok {
+            return self.nullable(base);
         }
         base
     }
@@ -310,7 +435,7 @@ impl<'a> Compiler<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Num {
     Minus,
     Zero,
@@ -346,7 +471,7 @@ impl Num {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ObjSt {
     /// After `{`: a key or `}`.
     First,
@@ -358,7 +483,7 @@ enum ObjSt {
     After,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Frame {
     /// Expecting a value of this node.
     Value(NodeId),
@@ -375,7 +500,7 @@ enum Frame {
     Prefix { node: NodeId, pos: usize },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Stack {
     frames: Vec<Frame>,
     done: bool,
@@ -385,11 +510,38 @@ struct Stack {
 }
 
 const MAX_WS_RUN: usize = 16;
-/// Upper bound on parallel parses (ambiguous `anyOf`s).
-const MAX_ALTS: usize = 32;
+/// Upper bound on parallel parses (ambiguous `anyOf`s) after merging
+/// identical ones. Beyond it the schema is too ambiguous to follow: the
+/// input fails as [`Fed::TooComplex`] rather than losing valid parses.
+const MAX_ALTS: usize = 1024;
+/// Parser steps one [`JsonState::feed`] may take (tests).
+#[cfg(test)]
+const FEED_WORK: usize = 1_000_000;
 
 fn is_ws(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r')
+}
+
+/// Result of feeding input to a [`JsonState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fed {
+    /// Still a valid prefix.
+    Ok,
+    /// Can't continue a valid document.
+    Rejected,
+    /// Following the schema took more than the work budget (or too many
+    /// parallel parses): the schema is too ambiguous to enforce.
+    TooComplex,
+}
+
+/// Return early unless `Fed::Ok`.
+macro_rules! try_fed {
+    ($e:expr) => {
+        match $e {
+            Fed::Ok => {}
+            other => return other,
+        }
+    };
 }
 
 /// Validator state: a schema and the possible parses of the text so far.
@@ -397,6 +549,9 @@ fn is_ws(c: char) -> bool {
 pub struct JsonState {
     schema: Arc<Schema>,
     alts: Vec<Stack>,
+    /// The start of a UTF-8 character split across tokens, waiting for the
+    /// rest of its bytes.
+    pending: Vec<u8>,
 }
 
 impl JsonState {
@@ -420,11 +575,11 @@ impl JsonState {
 
     pub fn with_schema(schema: Arc<Schema>) -> Self {
         let root = schema.root;
-        Self { schema, alts: vec![Stack { frames: vec![Frame::Value(root)], done: false, ws_run: 0 }] }
+        Self { schema, alts: vec![Stack { frames: vec![Frame::Value(root)], done: false, ws_run: 0 }], pending: Vec::new() }
     }
 
     pub fn is_done(&self) -> bool {
-        self.alts.iter().any(|s| s.done)
+        self.pending.is_empty() && self.alts.iter().any(|s| s.done)
     }
 
     /// Whether a special token with this text may appear (Gemma's quote).
@@ -432,29 +587,130 @@ impl JsonState {
         self.schema.gemma && text == GEMMA_QUOTE
     }
 
-    /// Feed `text`; false (and a partly updated state) if it can't continue
+    /// Feed `text` (tests); false (and a partly updated state) if it can't continue
     /// a valid document. Callers try candidates on a clone.
+    #[cfg(test)]
     pub fn feed(&mut self, text: &str) -> bool {
-        let mapped;
-        let text = if self.schema.gemma && text.contains(GEMMA_QUOTE) {
-            mapped = text.replace(GEMMA_QUOTE, &QUOTE.to_string());
-            mapped.as_str()
-        } else {
-            text
-        };
-        for c in text.chars() {
-            let mut next = Vec::new();
-            for s in self.alts.drain(..) {
-                push(&self.schema, s, c, &mut next);
-            }
-            next.truncate(MAX_ALTS);
-            self.alts = next;
-            if self.alts.is_empty() {
-                return false;
-            }
-        }
-        true
+        let mut work = FEED_WORK;
+        self.feed_text(text, &mut work) == Fed::Ok
     }
+
+    /// Feed whole-character text: a token's text, including a Gemma quote
+    /// token. Spends parser steps from `work`.
+    pub fn feed_text(&mut self, text: &str, work: &mut usize) -> Fed {
+        if !self.pending.is_empty() {
+            // A split character must be completed by its continuation bytes.
+            return Fed::Rejected;
+        }
+        for (i, part) in text.split(GEMMA_QUOTE).enumerate() {
+            if i > 0 {
+                if !self.schema.gemma {
+                    // Plain text in JSON mode.
+                    for c in GEMMA_QUOTE.chars() {
+                        try_fed!(self.feed_char(c, work));
+                    }
+                } else {
+                    try_fed!(self.feed_char(QUOTE, work));
+                }
+            }
+            try_fed!(self.feed_str(part, work));
+        }
+        Fed::Ok
+    }
+
+    /// Feed a token's bytes, which may start or finish a UTF-8 character
+    /// split across tokens (byte tokens). Incomplete characters wait in
+    /// `pending` and are checked once complete; meanwhile they must be able
+    /// to continue some parse (inside a string, a key or a name).
+    pub fn feed_bytes(&mut self, bytes: &[u8], work: &mut usize) -> Fed {
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.extend_from_slice(bytes);
+        let (text, rest) = match std::str::from_utf8(&buf) {
+            Ok(t) => (t, &[][..]),
+            Err(e) if e.error_len().is_none() => {
+                let (a, b) = buf.split_at(e.valid_up_to());
+                (std::str::from_utf8(a).expect("valid up to here"), b)
+            }
+            Err(_) => return Fed::Rejected,
+        };
+        try_fed!(self.feed_str(text, work));
+        if !rest.is_empty() {
+            if !self.partial_ok(rest) {
+                return Fed::Rejected;
+            }
+            self.pending = rest.to_vec();
+        }
+        Fed::Ok
+    }
+
+    /// Whether some parse can take a character starting with these bytes.
+    fn partial_ok(&self, start: &[u8]) -> bool {
+        let gemma = self.schema.gemma;
+        self.alts.iter().any(|s| match s.frames.last() {
+            Some(Frame::Str { esc: 0, choices, buf, .. }) => match choices {
+                None => true,
+                Some(ch) => ch.iter().any(|x| x.starts_with(buf.as_str()) && x.as_bytes()[buf.len()..].starts_with(start)),
+            },
+            Some(Frame::Prefix { node, pos }) => {
+                matches!(&self.schema.nodes[*node], Node::Prefixed { text, .. } if text.as_bytes()[*pos..].starts_with(start))
+            }
+            // A bare Gemma key or a call's name can start with it: checked
+            // once the character is complete.
+            Some(Frame::Obj { st: ObjSt::First | ObjSt::Key, .. } | Frame::Value(_)) => gemma,
+            _ => false,
+        })
+    }
+
+    /// Feed text from the model (no Gemma quotes in it).
+    fn feed_str(&mut self, text: &str, work: &mut usize) -> Fed {
+        for c in text.chars() {
+            if self.schema.gemma && c == QUOTE {
+                return Fed::Rejected;
+            }
+            try_fed!(self.feed_char(c, work));
+        }
+        Fed::Ok
+    }
+
+    /// Feed one character to every parse.
+    fn feed_char(&mut self, c: char, work: &mut usize) -> Fed {
+        let mut next = Vec::new();
+        for s in self.alts.drain(..) {
+            push(&self.schema, s, c, &mut next, work);
+        }
+        if *work == 0 {
+            return Fed::TooComplex;
+        }
+        let next = dedupe(next);
+        if next.len() > MAX_ALTS {
+            return Fed::TooComplex;
+        }
+        self.alts = next;
+        if self.alts.is_empty() {
+            return Fed::Rejected;
+        }
+        Fed::Ok
+    }
+}
+
+/// Drop parses identical to an earlier one: they would go on identically.
+fn dedupe(v: Vec<Stack>) -> Vec<Stack> {
+    if v.len() < 2 {
+        return v;
+    }
+    let mut seen: HashMap<u64, Vec<usize>> = HashMap::with_capacity(v.len());
+    let mut out: Vec<Stack> = Vec::with_capacity(v.len());
+    for s in v {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        s.hash(&mut h);
+        let same = seen.entry(h.finish()).or_default();
+        if same.iter().any(|&i| out[i] == s) {
+            continue;
+        }
+        same.push(out.len());
+        out.push(s);
+    }
+    out
 }
 
 fn value_done(s: &mut Stack) {
@@ -464,7 +720,11 @@ fn value_done(s: &mut Stack) {
     }
 }
 
-fn push(schema: &Schema, mut s: Stack, c: char, out: &mut Vec<Stack>) {
+fn push(schema: &Schema, mut s: Stack, c: char, out: &mut Vec<Stack>, work: &mut usize) {
+    if *work == 0 {
+        return;
+    }
+    *work -= 1;
     // Whitespace is content here, not padding.
     let in_string = matches!(s.frames.last(), Some(Frame::Str { .. } | Frame::Prefix { .. }));
     // Numbers and literals end at the first character that can't extend
@@ -530,7 +790,7 @@ fn push(schema: &Schema, mut s: Stack, c: char, out: &mut Vec<Stack>) {
         Frame::Value(node) => {
             let node = *node;
             s.frames.pop();
-            start_value(schema, s, node, c, out, 0);
+            start_value(schema, s, node, c, out, work);
         }
         Frame::Obj { node, seen, st } => {
             let Node::Object { props, required, additional } = &schema.nodes[*node] else { return };
@@ -555,7 +815,7 @@ fn push(schema: &Schema, mut s: Stack, c: char, out: &mut Vec<Stack>) {
                     s.frames.push(Frame::Str { key: true, bare, choices, buf: String::new(), esc: 0, hex: 0 });
                     if bare {
                         // The character is the key's first.
-                        push(schema, s, c, out);
+                        push(schema, s, c, out, work);
                     } else {
                         out.push(s);
                     }
@@ -593,7 +853,7 @@ fn push(schema: &Schema, mut s: Stack, c: char, out: &mut Vec<Stack>) {
                     *count = 1;
                     let e = elem(0);
                     s.frames.push(Frame::Value(e));
-                    push(schema, s, c, out);
+                    push(schema, s, c, out, work);
                 }
                 _ => {}
             }
@@ -747,16 +1007,49 @@ fn start_member(schema: &Schema, s: &mut Stack, key: String) {
 }
 
 /// Start a value of `node` with character `c` on top of stack `s`.
-fn start_value(schema: &Schema, mut s: Stack, node: NodeId, c: char, out: &mut Vec<Stack>, depth: usize) {
-    if depth > 32 {
+fn start_value(schema: &Schema, s: Stack, node: NodeId, c: char, out: &mut Vec<Stack>, work: &mut usize) {
+    let mut seen = Expanded::default();
+    expand(schema, &s, node, c, out, work, &mut seen, 0);
+}
+
+/// `anyOf` nodes already expanded for one character on one stack: reaching
+/// one again (shared `$ref`s, cycles) gives the same parses, so it's skipped.
+/// This keeps expansion linear in the schema size.
+#[derive(Default)]
+struct Expanded {
+    few: Vec<NodeId>,
+    many: HashSet<NodeId>,
+}
+
+impl Expanded {
+    fn insert(&mut self, n: NodeId) -> bool {
+        if self.few.contains(&n) {
+            return false;
+        }
+        if self.few.len() < 16 {
+            self.few.push(n);
+            return true;
+        }
+        self.many.insert(n)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand(schema: &Schema, s: &Stack, node: NodeId, c: char, out: &mut Vec<Stack>, work: &mut usize, seen: &mut Expanded, depth: usize) {
+    // Left-recursive schemas are rejected when compiled; the depth bound only
+    // guards the stack.
+    if *work == 0 || depth > 256 {
         return;
     }
+    *work -= 1;
     let quote = if schema.gemma { QUOTE } else { '"' };
     let string = |choices: Option<Arc<Vec<String>>>| Frame::Str { key: false, bare: false, choices, buf: String::new(), esc: 0, hex: 0 };
     let frame = match &schema.nodes[node] {
         Node::AnyOf(alts) => {
-            for &a in alts {
-                start_value(schema, s.clone(), a, c, out, depth + 1);
+            if seen.insert(node) {
+                for &a in alts {
+                    expand(schema, s, a, c, out, work, seen, depth + 1);
+                }
             }
             return;
         }
@@ -765,7 +1058,7 @@ fn start_value(schema: &Schema, mut s: Stack, node: NodeId, c: char, out: &mut V
             '[' => Frame::Arr { node: ANY_ARRAY, count: 0, open: true },
             c if c == quote => string(None),
             '-' | '0'..='9' => Frame::Num { st: Num::Minus.step(c, false).unwrap_or(Num::Minus), integer: false },
-            _ => return start_value(schema, s, ANY_LITERAL, c, out, depth + 1),
+            _ => return expand(schema, s, ANY_LITERAL, c, out, work, seen, depth + 1),
         },
         Node::Object { .. } if c == '{' => Frame::Obj { node, seen: Vec::new(), st: ObjSt::First },
         Node::Array { .. } if c == '[' => Frame::Arr { node, count: 0, open: true },
@@ -783,6 +1076,7 @@ fn start_value(schema: &Schema, mut s: Stack, node: NodeId, c: char, out: &mut V
         }
         _ => return,
     };
+    let mut s = s.clone();
     s.frames.push(frame);
     out.push(s);
 }
@@ -966,9 +1260,9 @@ mod tests {
         assert!(!j.clone().feed("["));
         assert!(j.feed(r#"{"x": [1, {"y": null}]}"#) && j.is_done());
 
-        let tools = Schema::any_of(&[
-            json!({"type": "object", "properties": {"name": {"const": "get_weather"}, "arguments": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}, "required": ["name", "arguments"]}),
-            json!({"type": "object", "properties": {"name": {"const": "get_time"}, "arguments": {"type": "object", "properties": {}}}, "required": ["name", "arguments"]}),
+        let tools = Schema::tool_calls(&[
+            ("get_weather".into(), json!({"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]})),
+            ("get_time".into(), json!({"type": "object", "properties": {}})),
         ]);
         let tools = Arc::new(tools);
         let ok = |s: &str| {
@@ -980,5 +1274,173 @@ mod tests {
         assert!(!ok(r#"{"name": "get_time", "arguments": {"city": "Paris"}}"#));
         assert!(!ok(r#"{"name": "get_weather", "arguments": {}}"#));
         assert!(!JsonState::with_schema(tools.clone()).feed(r#"{"name": "get_w0"#));
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+
+    fn state(schema: &Value) -> JsonState {
+        let s = Schema::compile(schema);
+        assert!(!s.too_complex(), "{schema}");
+        JsonState::with_schema(Arc::new(s))
+    }
+
+    fn matches(schema: &Value, text: &str) -> bool {
+        let mut j = state(schema);
+        j.feed(text) && j.is_done()
+    }
+
+    /// `a = anyOf[a, a, a]` expands without consuming input: rejected when
+    /// compiled instead of costing exponential time per character.
+    #[test]
+    fn left_recursive_any_of_is_rejected() {
+        let t = Instant::now();
+        let s = json!({"$defs": {"a": {"anyOf": [{"$ref": "#/$defs/a"}, {"$ref": "#/$defs/a"}, {"$ref": "#/$defs/a"}]}}, "$ref": "#/$defs/a"});
+        assert!(Schema::compile(&s).too_complex());
+        let s = json!({"anyOf": [{"$ref": "#"}, {"type": "string"}]});
+        assert!(Schema::compile(&s).too_complex());
+        // Recursion through a container consumes input: fine.
+        let ok = json!({"anyOf": [{"type": "array", "items": {"$ref": "#"}}, {"type": "integer"}]});
+        assert!(matches(&ok, "[1, [2, []]]"));
+        assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    /// A chain of shared `anyOf`s has exponentially many paths but few
+    /// nodes: each is expanded once per character.
+    #[test]
+    fn shared_any_of_paths_expand_once() {
+        let mut defs = serde_json::Map::new();
+        for i in 0..40 {
+            let next = json!({"$ref": format!("#/$defs/l{}", i + 1)});
+            defs.insert(format!("l{i}"), json!({"anyOf": [next.clone(), next]}));
+        }
+        defs.insert("l40".into(), json!({"type": "array", "items": {"$ref": "#/$defs/l0"}}));
+        let s = json!({"$defs": defs, "$ref": "#/$defs/l0"});
+        let t = Instant::now();
+        assert!(matches(&s, "[[[], [[]]], []]"));
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn too_many_parses_fail_instead_of_dropping_some() {
+        let alts: Vec<Value> = (0..2000).map(|i| json!({"type": "object", "properties": {format!("k{i}"): {"type": "integer"}}})).collect();
+        let mut j = state(&json!({"anyOf": alts}));
+        let mut work = FEED_WORK;
+        assert_eq!(j.feed_text("{", &mut work), Fed::TooComplex);
+        // Running out of work is reported as such too.
+        let mut j = state(&json!({"type": "string"}));
+        let mut work = 3;
+        assert_eq!(j.feed_text("\"abcdef\"", &mut work), Fed::TooComplex);
+    }
+
+    #[test]
+    fn forty_tools_are_all_callable() {
+        let tools: Vec<(String, Value)> = (0..40)
+            .map(|i| (format!("tool_{i}"), json!({"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]})))
+            .collect();
+        let schema = Arc::new(Schema::tool_calls(&tools));
+        for i in [0, 31, 32, 39] {
+            let mut j = JsonState::with_schema(schema.clone());
+            assert!(j.feed(&format!(r#"{{"name": "tool_{i}", "arguments": {{"x": 1}}}}"#)) && j.is_done(), "tool_{i}");
+            // Arguments first works too.
+            let mut j = JsonState::with_schema(schema.clone());
+            assert!(j.feed(&format!(r#"{{"arguments": {{"x": 1}}, "name": "tool_{i}"}}"#)) && j.is_done(), "tool_{i}");
+        }
+        assert!(!JsonState::with_schema(schema).feed(r#"{"name": "tool_40""#));
+    }
+
+    #[test]
+    fn tool_refs_resolve_in_their_own_schema() {
+        let params = json!({"type": "object", "properties": {"x": {"$ref": "#/$defs/X"}}, "required": ["x"], "$defs": {"X": {"type": "integer"}}});
+        let schema = Arc::new(Schema::tool_calls(&[("f".into(), params.clone()), ("g".into(), json!({"type": "object"}))]));
+        let ok = |s: &str| {
+            let mut j = JsonState::with_schema(schema.clone());
+            j.feed(s) && j.is_done()
+        };
+        assert!(ok(r#"{"name": "f", "arguments": {"x": 3}}"#));
+        assert!(!ok(r#"{"name":"f","arguments":{"x":"str"}}"#));
+        let gemma = Arc::new(Schema::gemma_calls(&[("f".into(), params)]));
+        let mut j = JsonState::with_schema(gemma);
+        assert!(!j.feed(&format!("f{{x:{GEMMA_QUOTE}")));
+    }
+
+    #[test]
+    fn all_of_merges_sibling_properties_and_required() {
+        let s = json!({
+            "$defs": {"B": {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"], "additionalProperties": false}},
+            "allOf": [{"$ref": "#/$defs/B"}],
+            "properties": {"b": {"type": "string"}},
+            "required": ["b"]
+        });
+        assert!(matches(&s, r#"{"a":1,"b":"x"}"#));
+        assert!(!matches(&s, r#"{"a":1}"#));
+        assert!(!matches(&s, r#"{"b":"x"}"#));
+        assert!(!matches(&s, r#"{"a":1,"b":"x","c":2}"#));
+    }
+
+    #[test]
+    fn ref_siblings_apply() {
+        let defs = json!({"P": {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]}});
+        let n = json!({"$defs": defs, "type": "object", "properties": {"p": {"$ref": "#/$defs/P", "nullable": true}}, "required": ["p"]});
+        assert!(matches(&n, r#"{"p": null}"#));
+        assert!(matches(&n, r#"{"p": {"a": 1}}"#));
+        assert!(!matches(&n, r#"{"p": 1}"#));
+        let t = json!({"$defs": defs, "type": "object", "properties": {"p": {"$ref": "#/$defs/P", "type": ["object", "null"]}}, "required": ["p"]});
+        assert!(matches(&t, r#"{"p": null}"#));
+        let more = json!({"$defs": defs, "$ref": "#/$defs/P", "properties": {"b": {"type": "boolean"}}, "required": ["b"]});
+        assert!(matches(&more, r#"{"a": 1, "b": true}"#));
+        assert!(!matches(&more, r#"{"a": 1}"#));
+        assert!(!matches(&more, r#"{"a": 1, "b": 2}"#));
+    }
+
+    #[test]
+    fn characters_split_across_tokens() {
+        let s = json!({"type": "object", "properties": {"k": {"enum": ["é", "ü"]}}, "required": ["k"], "additionalProperties": false});
+        let mut j = state(&s);
+        let mut w = FEED_WORK;
+        // "é" is C3 A9: its bytes arrive in two tokens.
+        assert_eq!(j.feed_bytes(br#"{"k": ""#, &mut w), Fed::Ok);
+        assert_eq!(j.clone().feed_bytes(&[0xC3], &mut w), Fed::Ok);
+        // "ü" is C3 BC; no choice starts with E2.
+        assert_eq!(j.clone().feed_bytes(&[0xE2], &mut w), Fed::Rejected);
+        assert_eq!(j.feed_bytes(&[0xC3], &mut w), Fed::Ok);
+        assert!(!j.is_done());
+        // An incomplete character can't be followed by a new one.
+        assert_eq!(j.clone().feed_bytes(b"\"", &mut w), Fed::Rejected);
+        assert_eq!(j.clone().feed_bytes(&[0xA8], &mut w), Fed::Rejected);
+        assert_eq!(j.feed_bytes(&[0xA9], &mut w), Fed::Ok);
+        assert_eq!(j.feed_bytes(b"\"}", &mut w), Fed::Ok);
+        assert!(j.is_done());
+        // Outside strings a partial character is invalid; keys may have them.
+        let mut j = JsonState::new();
+        assert_eq!(j.feed_bytes(&[b'{', 0xC3], &mut w), Fed::Rejected);
+        let mut j = JsonState::new();
+        assert_eq!(j.feed_bytes(&[b'{', b'"', 0xC3], &mut w), Fed::Ok);
+        assert_eq!(j.feed_bytes(&[0xA9, b'"', b':', b'1', b'}'], &mut w), Fed::Ok);
+        assert!(j.is_done());
+        // Invalid UTF-8 is rejected outright.
+        assert_eq!(JsonState::new().feed_bytes(&[b'[', b'"', 0xFF], &mut w), Fed::Rejected);
+    }
+
+    #[test]
+    fn gemma_quote_is_not_forgeable() {
+        let params = json!({"type": "object", "properties": {"s": {"type": "string"}}, "required": ["s"]});
+        let named = Arc::new(Schema::gemma(&params));
+        let mut w = FEED_WORK;
+        let mut j = JsonState::with_schema(named.clone());
+        assert_eq!(j.feed_text(&format!("{{s:{GEMMA_QUOTE}a"), &mut w), Fed::Ok);
+        // A control character (byte token <0x01>) is string content, not a quote.
+        assert_eq!(j.feed_bytes(&[0x01], &mut w), Fed::Ok);
+        assert_eq!(j.clone().feed_bytes(b"}", &mut w), Fed::Ok);
+        assert!(!j.is_done());
+        // Nor can the internal placeholder be fed as text.
+        assert_eq!(j.clone().feed_text(&QUOTE.to_string(), &mut w), Fed::Rejected);
+        assert_eq!(j.clone().feed_bytes(QUOTE.to_string().as_bytes(), &mut w), Fed::Rejected);
+        assert_eq!(j.feed_text(&format!("{GEMMA_QUOTE}}}"), &mut w), Fed::Ok);
+        assert!(j.is_done());
     }
 }

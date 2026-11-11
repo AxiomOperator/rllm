@@ -14,6 +14,8 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+use std::collections::{HashMap, HashSet};
+
 pub struct BlockAllocator {
     block_size: usize,
     free: Vec<u32>,
@@ -56,16 +58,31 @@ impl BlockAllocator {
     }
 
     /// Add a reference to an allocated block (prefix sharing).
+    ///
+    /// Sharing a free block is a bookkeeping bug. It is logged, and the
+    /// block is taken off the free list so it can't be handed out twice
+    /// (the caller then holds its only reference).
     pub fn share(&mut self, block: u32) {
         let rc = &mut self.refcount[block as usize];
-        debug_assert!(*rc > 0, "sharing free block {block}");
-        *rc += 1;
+        if *rc == 0 {
+            debug_assert!(false, "sharing free block {block}");
+            eprintln!("[rllm] KV bookkeeping error: sharing free block {block}");
+            self.free.retain(|&b| b != block);
+        }
+        *rc = rc.saturating_add(1);
     }
 
     /// Drop one reference; the block is free once none are left.
+    ///
+    /// Releasing a free block (a double free) is a bookkeeping bug. It is
+    /// logged and ignored, so the block isn't put on the free list twice.
     pub fn release(&mut self, block: u32) {
         let rc = &mut self.refcount[block as usize];
-        debug_assert!(*rc > 0, "double free of block {block}");
+        if *rc == 0 {
+            debug_assert!(false, "double free of block {block}");
+            eprintln!("[rllm] KV bookkeeping error: double free of block {block}");
+            return;
+        }
         *rc -= 1;
         if *rc == 0 {
             self.free.push(block);
@@ -424,19 +441,37 @@ impl PrefixCache {
         self.entries.push(Entry { tokens: e.tokens.clone(), blocks: host, used: e.used, on_host: true });
     }
 
+    /// Device blocks that evicting cache entries would free: those whose
+    /// every reference is held by device entries (several entries can share
+    /// a block; no sequence holds it).
+    fn freeable(&self, dev: &BlockAllocator) -> HashSet<u32> {
+        let mut refs: HashMap<u32, u32> = HashMap::new();
+        for e in self.entries.iter().filter(|e| !e.on_host) {
+            for &b in &e.blocks {
+                *refs.entry(b).or_default() += 1;
+            }
+        }
+        refs.into_iter().filter(|&(b, n)| dev.refcount(b) == n).map(|(b, _)| b).collect()
+    }
+
     /// Evict until `need` device blocks are free (or nothing is left to evict).
     pub fn make_room(&mut self, store: &mut impl BlockStore, need: usize) -> bool {
-        // Blocks only the cache holds: evicting is pointless (and costs a
-        // copy to the host tier) when even all of them are too few.
-        let sole = |e: &Entry, dev: &BlockAllocator| e.blocks.iter().filter(|&&b| dev.refcount(b) == 1).count();
-        let dev = store.device();
-        let freeable: usize = self.entries.iter().filter(|e| !e.on_host).map(|e| sole(e, dev)).sum();
-        if dev.n_free() + freeable < need {
+        if store.device().n_free() >= need {
+            return true;
+        }
+        // Evicting is pointless (and costs a copy to the host tier) when even
+        // all freeable blocks are too few.
+        let freeable = self.freeable(store.device());
+        if store.device().n_free() + freeable.len() < need {
             return false;
         }
         while store.device().n_free() < need {
-            // Skip entries whose blocks running sequences still hold.
-            if !self.evict_where(store, |e, dev| sole(e, dev) > 0) {
+            // Only entries holding freeable blocks: the others' blocks stay
+            // in use by running sequences. Evicting one entry of several that
+            // share a block frees it once the last of them goes. (Evicting
+            // keeps the set valid: a block's cache references and refcount
+            // drop together.)
+            if !self.evict_where(store, |e, _| e.blocks.iter().any(|b| freeable.contains(b))) {
                 return false;
             }
         }
@@ -697,6 +732,43 @@ mod tests {
         blocks.into_iter().for_each(|b| st.dev.release(b));
         pc.clear(&mut st);
         assert_eq!((st.dev.n_free(), st.host.n_free()), (8, 8));
+    }
+
+    /// Blocks shared only by cache entries (two entries with a common
+    /// prefix, no sequence) are freeable too.
+    #[test]
+    fn make_room_frees_blocks_shared_between_entries() {
+        let mut a = BlockAllocator::new(4, 2);
+        let mut pc = PrefixCache::default();
+        let mut s = SeqKv::default();
+        s.append(&mut a, 4).unwrap();
+        pc.insert(&mut a, &[0, 1, 2, 3], s);
+        // A second sequence shares block 0, then is cached too.
+        let (n, blocks) = pc.lookup(&mut a, &[0, 1, 5, 6, 9]);
+        assert_eq!(n, 2);
+        let mut s = SeqKv::with_prefix(blocks, n);
+        s.append(&mut a, 2).unwrap();
+        pc.insert(&mut a, &[0, 1, 5, 6], s);
+        assert_eq!((pc.len(), a.n_free()), (2, 1));
+        assert!(pc.make_room(&mut a, 4));
+        assert_eq!((pc.len(), a.n_free()), (0, 4));
+    }
+
+    #[test]
+    fn bad_release_and_share_keep_the_free_list_consistent() {
+        // Hard checks only in release builds (debug builds assert).
+        if cfg!(debug_assertions) {
+            return;
+        }
+        let mut a = BlockAllocator::new(2, 2);
+        let b = a.alloc_n(1).unwrap()[0];
+        a.release(b);
+        a.release(b);
+        assert_eq!((a.n_free(), a.refcount(b)), (2, 0));
+        a.share(b);
+        assert_eq!((a.n_free(), a.refcount(b)), (1, 1));
+        let other = a.alloc_n(1).unwrap()[0];
+        assert_ne!(other, b);
     }
 
     #[test]

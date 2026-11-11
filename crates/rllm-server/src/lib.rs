@@ -44,7 +44,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::extract::{MatchedPath, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderValue, Method, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -109,7 +109,11 @@ where
     let t0 = Instant::now();
     let vocab = Arc::new(engine::Vocab::build(&tok));
     let parallel = cfg.parallel.max(1);
-    let kv_tokens = cfg.kv_tokens.unwrap_or(cfg.ctx * parallel).max(cfg.ctx);
+    let kv_tokens = match cfg.kv_tokens {
+        Some(n) => n,
+        None => cfg.ctx.checked_mul(parallel).context("--ctx × --parallel overflows")?,
+    }
+    .max(cfg.ctx);
     let metrics = Arc::new(Metrics::default());
     let draft = match &cfg.draft {
         Some(p) => Some(Arc::new(Gguf::open(p).with_context(|| format!("open {}", p.display()))?)),
@@ -176,6 +180,7 @@ where
         store_file: cfg.store_file.clone(),
         metrics,
         log: cfg.log,
+        save_lock: Mutex::new(()),
     });
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
@@ -183,30 +188,79 @@ where
         let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("bind {addr}"))?;
         let loopback = listener.local_addr().is_ok_and(|a| a.ip().is_loopback());
         eprintln!("[rllm] listening on http://{addr}/v1");
+        if !loopback && state.api_key.is_none() {
+            eprintln!(
+                "[rllm] warning: listening on a non-loopback address without --api-key: anyone who can reach {addr} can run generations and read stored completions and responses"
+            );
+        }
         if state.store_file.is_some() {
             let s = state.clone();
             tokio::spawn(async move {
                 let mut saved = 0;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    saved = save_store(&s, saved);
+                    // Serializing a large store and writing it is blocking work.
+                    let s = s.clone();
+                    saved = tokio::task::spawn_blocking(move || save_store(&s, saved)).await.unwrap_or(saved);
                 }
             });
         }
-        axum::serve(listener, router(state.clone(), &cfg.cors_origins, loopback))
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
-            .await?;
-        save_store(&state, u64::MAX);
+        serve_http(listener, router(state.clone(), &cfg.cors_origins, loopback)).await;
+        let s = state.clone();
+        let _ = tokio::task::spawn_blocking(move || save_store(&s, u64::MAX)).await;
         Ok(())
     })
 }
 
+/// How long a client may take to send a request's headers. Without it, a
+/// client that opens connections and sends nothing holds them forever.
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Accept HTTP/1.1 connections until Ctrl-C, then wait for open requests
+/// (a second Ctrl-C stops waiting). `axum::serve` has no header-read
+/// timeout, hence the hand-written loop.
+async fn serve_http(listener: tokio::net::TcpListener, app: Router) {
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+    loop {
+        let stream = tokio::select! {
+            r = listener.accept() => match r {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    // Out of file descriptors and the like: back off, keep serving.
+                    eprintln!("[rllm] accept failed: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+            _ = &mut ctrl_c => break,
+        };
+        let _ = stream.set_nodelay(true);
+        let svc = hyper_util::service::TowerToHyperService::new(app.clone());
+        let conn = hyper::server::conn::http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(HEADER_READ_TIMEOUT)
+            .serve_connection(TokioIo::new(stream), svc);
+        let conn = graceful.watch(conn);
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+    }
+    drop(listener);
+    eprintln!("[rllm] shutting down: waiting for open requests (Ctrl-C again to stop now)");
+    tokio::select! {
+        _ = graceful.shutdown() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
 /// Write the store file if it changed since version `saved`; returns the
-/// version now on disk.
+/// version now on disk. Saves are serialized by `save_lock`, so the shutdown
+/// save waits for a periodic one in progress.
 fn save_store(state: &AppState, saved: u64) -> u64 {
     let Some(path) = &state.store_file else { return saved };
+    let _saving = state.save_lock.lock().unwrap_or_else(|e| e.into_inner());
     let (version, bytes) = {
         let store = state.store.lock().unwrap();
         let v = store.version();
@@ -335,7 +389,7 @@ async fn auth(State(state): State<Arc<AppState>>, req: Request, next: Next) -> R
 /// them; per-route request metrics.
 async fn headers(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     let t0 = Instant::now();
-    let method = req.method().to_string();
+    let method = req.method().clone();
     // The route pattern (`/v1/responses/{id}`), not the raw path, so ids
     // don't explode the metric labels.
     let route = req.extensions().get::<MatchedPath>().map_or_else(|| "unmatched".to_owned(), |p| p.as_str().to_owned());
@@ -363,9 +417,6 @@ async fn headers(State(state): State<Arc<AppState>>, req: Request, next: Next) -
         h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream; charset=utf-8"));
     }
     state.metrics.record_http(&method, &route, res.status().as_u16(), t0.elapsed().as_secs_f64());
-    if res.status() == StatusCode::METHOD_NOT_ALLOWED {
-        return res;
-    }
     res
 }
 

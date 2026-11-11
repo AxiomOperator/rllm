@@ -101,6 +101,8 @@ api!(Rtc {
     fn hiprtcGetCodeSize(Program, *mut usize) -> c_int;
     fn hiprtcGetCode(Program, *mut c_char) -> c_int;
     fn hiprtcDestroyProgram(*mut Program) -> c_int;
+    #[optional]
+    fn hiprtcVersion(*mut c_int, *mut c_int) -> c_int;
 });
 
 api!(Blas {

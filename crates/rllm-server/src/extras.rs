@@ -15,19 +15,24 @@ use crate::error::{ApiError, ApiResult};
 use crate::params;
 use crate::prompt;
 use crate::state::AppState;
+use crate::util;
 
 /// `{"content": "...", "add_special": false, "with_pieces": false}` →
 /// `{"tokens": [ids]}` or, with pieces, `{"tokens": [{"id", "piece"}]}`.
 pub async fn tokenize(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResult<Json<Value>> {
-    let m = params::object(&body)?;
-    let content = params::opt_str(&m, "content")?.unwrap_or("");
-    let add_special = params::opt_bool(&m, "add_special")?.unwrap_or(false);
-    let ids = state.tok.encode_with(content, add_special).map_err(ApiError::from)?;
-    if params::opt_bool(&m, "with_pieces")?.unwrap_or(false) {
-        let pieces: Vec<Value> = ids.iter().map(|&id| json!({ "id": id, "piece": state.tok.token_text(id) })).collect();
-        return Ok(Json(json!({ "tokens": pieces })));
-    }
-    Ok(Json(json!({ "tokens": ids })))
+    // Tokenizing up to the body limit is CPU work: off the async workers.
+    util::blocking(move || {
+        let m = params::object(&body)?;
+        let content = params::opt_str(&m, "content")?.unwrap_or("");
+        let add_special = params::opt_bool(&m, "add_special")?.unwrap_or(false);
+        let ids = state.tok.encode_with(content, add_special).map_err(ApiError::from)?;
+        if params::opt_bool(&m, "with_pieces")?.unwrap_or(false) {
+            let pieces: Vec<Value> = ids.iter().map(|&id| json!({ "id": id, "piece": state.tok.token_text(id) })).collect();
+            return Ok(Json(json!({ "tokens": pieces })));
+        }
+        Ok(Json(json!({ "tokens": ids })))
+    })
+    .await
 }
 
 /// `{"tokens": [ids]}` → `{"content": "..."}`.
@@ -49,15 +54,18 @@ pub async fn detokenize(State(state): State<Arc<AppState>>, body: Bytes) -> ApiR
 /// `{"messages": [...], "tools"?: [...]}` → `{"prompt": "..."}`: the chat
 /// template applied exactly as `/v1/chat/completions` would.
 pub async fn apply_template(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResult<Json<Value>> {
-    let m = params::object(&body)?;
-    let raw = m.get("messages").and_then(Value::as_array).ok_or_else(|| ApiError::invalid("Missing required parameter: 'messages'.", Some("messages")))?;
-    let messages = prompt::chat_messages(raw)?;
-    let tools = prompt::chat_tools(m.get("tools"))?;
-    let text = state
-        .tok
-        .apply_chat_template_json(&messages, (!tools.is_empty()).then_some(&tools[..]), true, None)
-        .map_err(|e| ApiError::invalid(format!("Could not apply the chat template: {e:#}"), Some("messages")))?;
-    Ok(Json(json!({ "prompt": text })))
+    util::blocking(move || {
+        let m = params::object(&body)?;
+        let raw = m.get("messages").and_then(Value::as_array).ok_or_else(|| ApiError::invalid("Missing required parameter: 'messages'.", Some("messages")))?;
+        let messages = prompt::chat_messages(raw)?;
+        let tools = prompt::chat_tools(m.get("tools"))?;
+        let text = state
+            .tok
+            .apply_chat_template_json(&messages, (!tools.is_empty()).then_some(&tools[..]), true, None)
+            .map_err(|e| ApiError::invalid(format!("Could not apply the chat template: {e:#}"), Some("messages")))?;
+        Ok(Json(json!({ "prompt": text })))
+    })
+    .await
 }
 
 pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {

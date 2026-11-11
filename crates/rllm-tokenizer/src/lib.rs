@@ -62,6 +62,8 @@ pub struct Tokenizer {
     /// Extra ids that end generation (e.g. `<|endoftext|>` alongside `<|im_end|>`).
     pub stop_ids: Vec<u32>,
     chat_template: Option<String>,
+    /// Byte-level BPE (GPT-2 style): token strings map characters to bytes.
+    byte_level: bool,
 }
 
 impl Tokenizer {
@@ -214,7 +216,26 @@ impl Tokenizer {
             add_bos: g.get("tokenizer.ggml.add_bos_token").is_some_and(|v| *v == rllm_gguf::Value::Bool(true)),
             stop_ids,
             chat_template: g.get_str("tokenizer.chat_template").ok().map(str::to_owned),
+            byte_level: !spm_style,
         })
+    }
+
+    /// The bytes a plain token adds to decoded output, where they are known
+    /// from its string alone: byte-level BPE tokens and `<0xXX>` byte
+    /// fallback tokens. Such a token can hold part of a UTF-8 character,
+    /// which [`Self::token_text`] can only show as U+FFFD. None for added
+    /// tokens and other SentencePiece tokens (always whole characters).
+    pub fn token_bytes(&self, id: u32) -> Option<Vec<u8>> {
+        if self.is_special(id) {
+            return None;
+        }
+        let piece = self.inner.id_to_token(id)?;
+        if self.byte_level {
+            piece.chars().map(byte_level_byte).collect()
+        } else {
+            let hex = piece.strip_prefix("<0x")?.strip_suffix('>')?;
+            (hex.len() == 2).then(|| u8::from_str_radix(hex, 16).ok().map(|b| vec![b]))?
+        }
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -494,6 +515,34 @@ fn strftime_utc(fmt: &str, now: std::time::SystemTime) -> String {
         }
     }
     out
+}
+
+/// The byte a byte-level BPE character stands for (the inverse of GPT-2's
+/// `bytes_to_unicode`): printable bytes stand for themselves, the others
+/// map in order to U+0100 and up.
+fn byte_level_byte(c: char) -> Option<u8> {
+    let direct = |b: u32| (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b);
+    let c = c as u32;
+    if c < 256 {
+        return direct(c).then_some(c as u8);
+    }
+    (0u32..256).filter(|&b| !direct(b)).nth((c - 256) as usize).map(|b| b as u8)
+}
+
+#[cfg(test)]
+mod byte_level_tests {
+    #[test]
+    fn byte_level_chars_map_back_to_bytes() {
+        use super::byte_level_byte as b;
+        assert_eq!(b('a'), Some(b'a'));
+        assert_eq!(b('Ġ'), Some(b' '));
+        assert_eq!(b('Ċ'), Some(b'\n'));
+        assert_eq!(b('\u{100}'), Some(0));
+        // "é" (C3 A9) is the pair "Ã©".
+        assert_eq!((b('Ã'), b('©')), (Some(0xC3), Some(0xA9)));
+        assert_eq!(b('\u{144}'), None);
+        assert_eq!(b(' '), None);
+    }
 }
 
 #[cfg(test)]

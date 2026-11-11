@@ -251,7 +251,7 @@ fn parse_tool_call(format: Format, body: &str) -> Option<ToolCall> {
             let rest = body.strip_prefix("call:")?;
             let brace = rest.find('{')?;
             let name = rest[..brace].trim().to_owned();
-            let mut p = GemmaArgs { s: &rest[brace..] };
+            let mut p = GemmaArgs { s: &rest[brace..], depth: 0 };
             let args = p.value()?;
             if !args.is_object() || !p.s.trim().is_empty() {
                 return None;
@@ -265,9 +265,15 @@ fn parse_tool_call(format: Format, body: &str) -> Option<ToolCall> {
 /// `<|"|>`-quoted keys and `<|"|>`-quoted strings.
 struct GemmaArgs<'a> {
     s: &'a str,
+    /// Objects and arrays open around the current value.
+    depth: usize,
 }
 
 const GQ: &str = "<|\"|>";
+
+/// Deepest nesting of arguments parsed (as serde_json's own limit): a
+/// model looping on `[[[[…` gets plain text back, not a stack overflow.
+const MAX_ARGS_DEPTH: usize = 128;
 
 impl GemmaArgs<'_> {
     fn ws(&mut self) {
@@ -297,6 +303,20 @@ impl GemmaArgs<'_> {
         if self.s.starts_with(GQ) {
             return self.quoted().map(Value::String);
         }
+        if !self.s.starts_with(['{', '[']) {
+            return self.scalar();
+        }
+        if self.depth >= MAX_ARGS_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let v = self.container();
+        self.depth -= 1;
+        v
+    }
+
+    /// An object or array (the input starts with `{` or `[`).
+    fn container(&mut self) -> Option<Value> {
         if self.eat("{") {
             let mut map = serde_json::Map::new();
             if self.eat("}") {
@@ -341,7 +361,11 @@ impl GemmaArgs<'_> {
                 return None;
             }
         }
-        // Scalar: up to the next delimiter.
+        None
+    }
+
+    /// A scalar: up to the next delimiter.
+    fn scalar(&mut self) -> Option<Value> {
         let end = self.s.find([',', '}', ']']).unwrap_or(self.s.len());
         let tok = self.s[..end].trim();
         self.s = &self.s[end..];
@@ -449,6 +473,21 @@ mod tests {
         assert_eq!(call.name, "get_weather");
         let v: Value = serde_json::from_str(&call.arguments).unwrap();
         assert_eq!(v, serde_json::json!({"location": "Boston, MA", "days": 3, "opts": {"metric": true}, "tags": ["a"]}));
+    }
+
+    /// A model looping on brackets must not overflow the parser's stack.
+    #[test]
+    fn gemma_deep_nesting_is_rejected() {
+        for open in ["[", "{a:"] {
+            let body = format!("call:f{{x:{}", open.repeat(100_000));
+            assert_eq!(parse_tool_call(Format::Gemma, &body), None);
+            let mut p = OutputParser::new(Format::Gemma, true, false);
+            let out = run(&mut p, &["<|tool_call>", &body, "<tool_call|>"]);
+            assert!(matches!(&out[..], [Piece::Content(_)]), "{open}");
+        }
+        // Nesting within the limit still parses.
+        let ok = format!("call:f{{x:{}1{}}}", "[".repeat(100), "]".repeat(100));
+        assert!(parse_tool_call(Format::Gemma, &ok).is_some());
     }
 
     #[test]

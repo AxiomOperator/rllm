@@ -1,14 +1,13 @@
 //! `/v1/responses`: create (streaming, background), retrieve, delete,
 //! cancel, input items and input token counts.
 
-use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
-use axum::response::sse::{Event, Sse};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value, json};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -19,11 +18,13 @@ use crate::generation::{self, FinishKind, GenSpec, Out, Summary, TokenInfo};
 use crate::output::{OutputParser, Piece, ToolCall};
 use crate::params;
 use crate::prompt::{self, ChatPrompt, JsonFormat, ToolChoice};
-use crate::state::{AppState, History, StoredResponse, list_object, paginate};
-use crate::util;
+use crate::state::{AppState, History, MAX_HISTORY_DEPTH, StoredResponse, list_object, paginate};
+use crate::util::{self, Recv, SseSink};
 
 /// A validated create request.
 struct Request {
+    /// Queue place held before responding (set after parsing).
+    slots: Option<Arc<crate::engine::Slots>>,
     id: String,
     created: u64,
     model: String,
@@ -131,6 +132,7 @@ fn tools(v: Option<&Value>) -> ApiResult<Vec<Value>> {
         .map(|(i, t)| match t.get("type").and_then(Value::as_str) {
             Some("function") => {
                 let name = t.get("name").and_then(Value::as_str).ok_or_else(|| ApiError::invalid("Missing required parameter: 'name'.", Some(&format!("tools[{i}].name"))))?;
+                prompt::check_function_name(name, &format!("tools[{i}].name"))?;
                 Ok(json!({ "type": "function", "function": { "name": name, "description": t.get("description").cloned().unwrap_or(json!("")), "parameters": t.get("parameters").cloned().unwrap_or(json!({"type": "object", "properties": {}})) } }))
             }
             Some(other) => Err(ApiError::invalid(format!("Tool type '{other}' is not supported by this server."), Some(&format!("tools[{i}].type")))),
@@ -152,6 +154,13 @@ fn build(state: &AppState, m: &Map<String, Value>) -> ApiResult<(ChatPrompt, Arc
         Some(prev) => {
             let store = state.store.lock().unwrap();
             let r = store.responses.get(prev).ok_or_else(|| ApiError::not_found(format!("Previous response with id '{prev}' not found.")))?;
+            // This turn adds two nodes (its input, then its output).
+            if r.history.depth() + 2 > MAX_HISTORY_DEPTH {
+                return Err(ApiError::invalid(
+                    format!("The conversation is too long to continue: at most {} turns can be chained with 'previous_response_id'.", MAX_HISTORY_DEPTH / 2),
+                    Some("previous_response_id"),
+                ));
+            }
             Some(r.history.clone())
         }
         None => None,
@@ -251,6 +260,7 @@ fn parse(state: &AppState, body: &[u8]) -> ApiResult<Request> {
     echo.insert("store".into(), json!(store));
     echo.insert("background".into(), json!(background));
     Ok(Request {
+        slots: None,
         id: util::hex_id("resp_", 48),
         created: util::now(),
         model,
@@ -315,8 +325,8 @@ fn logprobs_json(tokens: &[TokenInfo]) -> Vec<Value> {
     tokens
         .iter()
         .map(|t| {
-            let top: Vec<Value> = t.top.iter().map(|(tok, lp)| json!({ "token": tok, "bytes": tok.as_bytes(), "logprob": lp })).collect();
-            json!({ "token": t.token, "bytes": t.token.as_bytes(), "logprob": t.logprob, "top_logprobs": top })
+            let top: Vec<Value> = t.top.iter().map(|(tok, bytes, lp)| json!({ "token": tok, "bytes": bytes, "logprob": lp })).collect();
+            json!({ "token": t.token, "bytes": t.bytes, "logprob": t.logprob, "top_logprobs": top })
         })
         .collect()
 }
@@ -399,6 +409,9 @@ impl OutputBuilder {
     fn piece(&mut self, p: Piece, events: &mut Vec<Value>) {
         match p {
             Piece::Reasoning(t) => {
+                // Tokens arrive before the text they decode to: these were
+                // reasoning, not part of the message's logprobs.
+                self.pending_lp.clear();
                 let i = self.open_item("reasoning", events);
                 self.reasoning.push_str(&t);
                 let cur = self.items[i]["content"][0]["text"].as_str().unwrap_or("").to_owned();
@@ -417,6 +430,7 @@ impl OutputBuilder {
                 events.push(json!({ "type": "response.output_text.delta", "item_id": self.items[i]["id"], "output_index": i, "content_index": 0, "delta": t, "logprobs": lp }));
             }
             Piece::ToolCall(ToolCall { name, arguments }) => {
+                self.pending_lp.clear();
                 if self.tool_calls >= self.max_tool_calls {
                     return;
                 }
@@ -462,9 +476,27 @@ fn final_status(s: &Summary) -> (&'static str, Value) {
     }
 }
 
-/// Run the generation, feeding stream events to `emit`; returns the final
-/// Response object (also stored if requested).
-async fn run(state: Arc<AppState>, req: Arc<Request>, cancel: Arc<AtomicBool>, mut emit: impl FnMut(Value) -> bool) -> Value {
+/// A streaming client: its sink and the next `sequence_number`.
+struct Events<'a> {
+    sink: &'a SseSink,
+    seq: u64,
+}
+
+impl Events<'_> {
+    fn send(&mut self, mut v: Value) -> bool {
+        v["sequence_number"] = json!(self.seq);
+        self.seq += 1;
+        let kind = v["type"].as_str().unwrap_or("message").to_owned();
+        self.sink.event(&kind, &v)
+    }
+}
+
+/// Run the generation, streaming events to `events` if given. Returns the
+/// final Response object (stored if requested) and, if it failed, the error.
+/// A submission the engine rejected (503: queue full, engine stopped) is
+/// not stored unless the response is a background one, whose id the
+/// client already has.
+async fn run(state: Arc<AppState>, req: Arc<Request>, cancel: Arc<AtomicBool>, mut events: Option<&mut Events<'_>>) -> (Value, Option<ApiError>) {
     let spec = GenSpec {
         prompt: req.prompt.ids.clone(),
         params: req.params.clone(),
@@ -473,62 +505,75 @@ async fn run(state: Arc<AppState>, req: Arc<Request>, cancel: Arc<AtomicBool>, m
         forced: req.prompt.forced.clone(),
         suffix: req.prompt.suffix.clone(),
         skip_special: false,
+        slots: req.slots.clone(),
     };
-    let mut rx = generation::spawn(&state, spec, cancel);
+    let mut rx = UnboundedReceiverStream::new(generation::spawn(&state, spec, cancel));
     let mut b = OutputBuilder::new(&req);
-    let mut events = Vec::new();
-    let mut alive = true;
+    let mut pending = Vec::new();
+    let emit = |events: &mut Option<&mut Events<'_>>, pending: &mut Vec<Value>| {
+        let mut alive = true;
+        for e in pending.drain(..) {
+            if let Some(ev) = events.as_deref_mut() {
+                alive &= ev.send(e);
+            }
+        }
+        alive
+    };
+    let gone = || ApiError::server("The client disconnected before the response finished.");
     let fin = loop {
-        let Some(ev) = rx.recv().await else { break Err(ApiError::server("generation ended unexpectedly")) };
+        // Waiting on the client too: one that leaves while the request is
+        // queued or prefilling cancels it here (dropping `rx`).
+        let ev = match util::next_from(events.as_deref().map(|e| e.sink), &mut rx).await {
+            Recv::Item(ev) => ev,
+            Recv::Ended => break Err(ApiError::server("generation ended unexpectedly")),
+            Recv::Gone => break Err(gone()),
+        };
         match ev {
             Err(e) => break Err(e),
+            Ok(Out::Token(t)) if t.reasoning => {}
             Ok(Out::Token(t)) => b.pending_lp.push(t),
-            Ok(Out::Piece(p)) => b.piece(p, &mut events),
+            Ok(Out::Piece(p)) => b.piece(p, &mut pending),
             Ok(Out::Done(s)) => break Ok(s),
         }
-        for e in events.drain(..) {
-            alive &= emit(e);
-        }
-        if !alive {
-            // The client went away: dropping `rx` cancels the generation.
-            break Err(ApiError::server("client disconnected"));
+        if !emit(&mut events, &mut pending) {
+            break Err(gone());
         }
     };
-    let response = match fin {
+    let (response, error) = match fin {
         Ok(s) => {
             let (status, incomplete) = final_status(&s);
-            b.close(&mut events, if status == "incomplete" { "incomplete" } else { "completed" });
-            for e in events.drain(..) {
-                emit(e);
-            }
+            b.close(&mut pending, if status == "incomplete" { "incomplete" } else { "completed" });
+            emit(&mut events, &mut pending);
             let mut r = response_object(&state, &req, status, b.items.clone(), usage(&s), None);
             r["incomplete_details"] = incomplete;
-            r
+            (r, None)
         }
-        Err(e) => response_object(
-            &state,
-            &req,
-            "failed",
-            b.items.clone(),
-            Value::Null,
-            Some(("error", json!({ "code": e.code.clone().unwrap_or_else(|| "server_error".into()), "message": e.message }))),
-        ),
+        Err(e) => {
+            let code = e.code.clone().unwrap_or_else(|| "server_error".into());
+            let r = response_object(&state, &req, "failed", b.items.clone(), Value::Null, Some(("error", json!({ "code": code, "message": e.message }))));
+            (r, Some(e))
+        }
     };
+    let rejected = error.as_ref().is_some_and(|e| e.status == StatusCode::SERVICE_UNAVAILABLE) && b.items.is_empty();
     if req.store {
         let mut store = state.store.lock().unwrap();
-        // Deleted (or evicted) while running: stays gone.
-        if let Some(stored) = store.responses.get_mut(&req.id) {
-            // A cancel that arrived first wins.
-            let cancelled = stored.response["status"] == "cancelled";
-            stored.response = response.clone();
-            if cancelled {
-                stored.response["status"] = json!("cancelled");
-            }
-            stored.history = History::new(Some(req.history.clone()), vec![b.assistant_message()]);
-            stored.cancel = None;
+        if rejected && !req.background {
+            store.responses.remove(&req.id);
+        } else {
+            // Deleted (or evicted) while running: stays gone.
+            store.responses.update(&req.id, |stored| {
+                // A cancel that arrived first wins.
+                let cancelled = stored.response["status"] == "cancelled";
+                stored.response = response.clone();
+                if cancelled {
+                    stored.response["status"] = json!("cancelled");
+                }
+                stored.history = History::new(Some(req.history.clone()), vec![b.assistant_message()]);
+                stored.cancel = None;
+            });
         }
     }
-    response
+    (response, error)
 }
 
 /// Marks a stored response failed if its request is dropped (the client
@@ -542,13 +587,13 @@ impl Drop for Unfinished {
     fn drop(&mut self) {
         let Some(id) = self.id.take() else { return };
         let mut store = self.state.store.lock().unwrap();
-        if let Some(r) = store.responses.get_mut(&id)
-            && matches!(r.response["status"].as_str(), Some("queued" | "in_progress"))
-        {
-            r.response["status"] = json!("failed");
-            r.response["error"] = json!({ "code": "server_error", "message": "The client disconnected before the response finished." });
-            r.cancel = None;
-        }
+        store.responses.update(&id, |r| {
+            if matches!(r.response["status"].as_str(), Some("queued" | "in_progress")) {
+                r.response["status"] = json!("failed");
+                r.response["error"] = json!({ "code": "server_error", "message": "The client disconnected before the response finished." });
+                r.cancel = None;
+            }
+        });
     }
 }
 
@@ -556,7 +601,9 @@ pub async fn create(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResul
     // Rendering and tokenizing (several times for truncation "auto") is CPU
     // work: keep it off the async workers.
     let s = state.clone();
-    let req = tokio::task::spawn_blocking(move || parse(&s, &body)).await.map_err(|e| ApiError::server(format!("{e}")))??;
+    let mut req = util::blocking(move || parse(&s, &body)).await?;
+    // A full queue is a 503 before anything is stored or streamed.
+    req.slots = Some(state.reserve(1)?);
     let req = Arc::new(req);
     let cancel = Arc::new(AtomicBool::new(false));
     if req.store {
@@ -567,54 +614,46 @@ pub async fn create(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResul
         );
     }
     if req.stream {
-        return Ok(stream(state, req, cancel).into_response());
+        return Ok(util::sse(move |sink| stream(state, req, cancel, sink)));
     }
     if req.background {
         let initial = response_object(&state, &req, "queued", Vec::new(), Value::Null, None);
         let (s, r) = (state.clone(), req.clone());
         tokio::spawn(async move {
-            if let Some(stored) = s.store.lock().unwrap().responses.get_mut(&r.id) {
-                stored.response["status"] = json!("in_progress");
-            }
-            run(s, r, cancel, |_| true).await;
+            s.store.lock().unwrap().responses.update(&r.id, |stored| {
+                if stored.response["status"] == "queued" {
+                    stored.response["status"] = json!("in_progress");
+                }
+            });
+            run(s, r, cancel, None).await;
         });
         return Ok(Json(initial).into_response());
     }
     let mut guard = Unfinished { state: state.clone(), id: req.store.then(|| req.id.clone()) };
-    let response = run(state, req, cancel, |_| true).await;
+    let (response, error) = run(state, req, cancel, None).await;
     guard.id = None;
-    if response["status"] == "failed" {
-        let message = response["error"]["message"].as_str().unwrap_or("The server had an error while processing your request.");
-        return Err(ApiError::server(message));
+    match error {
+        // The engine's own status: 503 for a full queue, 500 otherwise.
+        Some(e) => Err(e),
+        None => Ok(Json(response).into_response()),
     }
-    Ok(Json(response).into_response())
 }
 
-fn stream(state: Arc<AppState>, req: Arc<Request>, cancel: Arc<AtomicBool>) -> Sse<UnboundedReceiverStream<Result<Event, Infallible>>> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
-    tokio::spawn(async move {
-        let mut seq = 0u64;
-        let mut send = move |mut v: Value| {
-            v["sequence_number"] = json!(seq);
-            seq += 1;
-            let kind = v["type"].as_str().unwrap_or("message").to_owned();
-            tx.send(Ok(Event::default().event(kind).data(v.to_string()))).is_ok()
-        };
-        let initial = response_object(&state, &req, "in_progress", Vec::new(), Value::Null, None);
-        send(json!({ "type": "response.created", "response": initial }));
-        send(json!({ "type": "response.in_progress", "response": initial }));
-        let final_resp = run(state, req, cancel, &mut send).await;
-        let kind = match final_resp["status"].as_str() {
-            Some("incomplete") => "response.incomplete",
-            Some("failed") => {
-                send(json!({ "type": "error", "code": final_resp["error"]["code"], "message": final_resp["error"]["message"], "param": null }));
-                "response.failed"
-            }
-            _ => "response.completed",
-        };
-        send(json!({ "type": kind, "response": final_resp }));
-    });
-    Sse::new(UnboundedReceiverStream::new(rx))
+async fn stream(state: Arc<AppState>, req: Arc<Request>, cancel: Arc<AtomicBool>, sink: SseSink) {
+    let mut events = Events { sink: &sink, seq: 0 };
+    let initial = response_object(&state, &req, "in_progress", Vec::new(), Value::Null, None);
+    events.send(json!({ "type": "response.created", "response": initial }));
+    events.send(json!({ "type": "response.in_progress", "response": initial }));
+    let (final_resp, _) = run(state, req, cancel, Some(&mut events)).await;
+    let kind = match final_resp["status"].as_str() {
+        Some("incomplete") => "response.incomplete",
+        Some("failed") => {
+            events.send(json!({ "type": "error", "code": final_resp["error"]["code"], "message": final_resp["error"]["message"], "param": null }));
+            "response.failed"
+        }
+        _ => "response.completed",
+    };
+    events.send(json!({ "type": kind, "response": final_resp }));
 }
 
 fn not_found(id: &str) -> ApiError {
@@ -637,17 +676,23 @@ pub async fn delete(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
 
 pub async fn cancel(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let mut store = state.store.lock().unwrap();
-    let r = store.responses.get_mut(&id).ok_or_else(|| not_found(&id))?;
+    let r = store.responses.get(&id).ok_or_else(|| not_found(&id))?;
     if r.response["background"] != true {
         return Err(ApiError::invalid("Only responses created with background=true can be cancelled.", None));
     }
-    if matches!(r.response["status"].as_str(), Some("queued" | "in_progress")) {
-        if let Some(c) = &r.cancel {
-            c.store(true, Ordering::Relaxed);
-        }
-        r.response["status"] = json!("cancelled");
-    }
-    Ok(Json(r.response.clone()))
+    let response = store
+        .responses
+        .update(&id, |r| {
+            if matches!(r.response["status"].as_str(), Some("queued" | "in_progress")) {
+                if let Some(c) = &r.cancel {
+                    c.store(true, Ordering::Relaxed);
+                }
+                r.response["status"] = json!("cancelled");
+            }
+            r.response.clone()
+        })
+        .ok_or_else(|| not_found(&id))?;
+    Ok(Json(response))
 }
 
 pub async fn input_items(State(state): State<Arc<AppState>>, Path(id): Path<String>, RawQuery(q): RawQuery) -> ApiResult<Json<Value>> {
@@ -655,9 +700,9 @@ pub async fn input_items(State(state): State<Arc<AppState>>, Path(id): Path<Stri
     let (after, limit, desc) = list_params(&q, true)?;
     let store = state.store.lock().unwrap();
     let r = store.responses.get(&id).ok_or_else(|| not_found(&id))?;
-    let items: Vec<(String, Value)> = r.input_items.iter().map(|i| (i["id"].as_str().unwrap_or("").to_owned(), i.clone())).collect();
+    let items: Vec<(&str, &Value)> = r.input_items.iter().map(|i| (i["id"].as_str().unwrap_or(""), i)).collect();
     let (page, has_more) = paginate(items, after.as_deref(), limit, desc);
-    Ok(Json(list_object(page.into_iter().map(|(_, v)| v).collect(), has_more)))
+    Ok(Json(list_object(page.into_iter().map(|(_, v)| v.clone()).collect(), has_more)))
 }
 
 pub async fn input_tokens(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResult<Json<Value>> {
@@ -665,6 +710,6 @@ pub async fn input_tokens(State(state): State<Arc<AppState>>, body: Bytes) -> Ap
     if m.contains_key("model") {
         state.resolve_model(m.get("model"))?;
     }
-    let (prompt, ..) = tokio::task::spawn_blocking(move || build(&state, &m)).await.map_err(|e| ApiError::server(format!("{e}")))??;
+    let (prompt, ..) = util::blocking(move || build(&state, &m)).await?;
     Ok(Json(json!({ "object": "response.input_tokens", "input_tokens": prompt.ids.len() })))
 }

@@ -23,14 +23,29 @@ pub struct GenSpec {
     pub suffix: String,
     /// Drop special tokens from the text (plain completions).
     pub skip_special: bool,
+    /// Queue places the handler reserved before responding (one is used).
+    pub slots: Option<Arc<crate::engine::Slots>>,
 }
 
 /// One generated token with its logprobs, as text.
 #[derive(Debug, Clone)]
 pub struct TokenInfo {
     pub token: String,
+    /// The token's exact bytes (a byte-fallback token can hold part of a
+    /// UTF-8 character, which `token` can only show as U+FFFD).
+    pub bytes: Vec<u8>,
     pub logprob: f32,
-    pub top: Vec<(String, f32)>,
+    /// (text, bytes, logprob) per alternative.
+    pub top: Vec<(String, Vec<u8>, f32)>,
+    /// Part of the reasoning (including its open/close markers), not of
+    /// the message content.
+    pub reasoning: bool,
+}
+
+fn token_info(tok: &rllm_tokenizer::Tokenizer, id: u32) -> (String, Vec<u8>) {
+    let text = tok.token_text(id);
+    let bytes = tok.token_bytes(id).unwrap_or_else(|| text.as_bytes().to_vec());
+    (text, bytes)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,11 +88,11 @@ pub fn spawn(state: &Arc<AppState>, spec: GenSpec, cancel: Arc<AtomicBool>) -> m
     let (out_tx, out_rx) = mpsc::unbounded_channel();
     let state = state.clone();
     tokio::spawn(async move {
-        let GenSpec { prompt, params, stops, mut parser, forced, suffix, skip_special } = spec;
+        let GenSpec { prompt, params, stops, mut parser, forced, suffix, skip_special, slots } = spec;
         let want_logprobs = params.logprobs.is_some();
         let (etx, mut erx) = mpsc::unbounded_channel();
         let user_cancel = cancel.clone();
-        if let Err(e) = state.engine.submit(Job::Generate { prompt, params, events: etx, cancel: cancel.clone() }) {
+        if let Err(e) = state.engine.submit_with(Job::Generate { prompt, params, events: etx, cancel: cancel.clone() }, slots.as_deref()) {
             let _ = out_tx.send(Err(ApiError::unavailable(format!("{e:#}"))));
             return;
         }
@@ -116,24 +131,36 @@ pub fn spawn(state: &Arc<AppState>, spec: GenSpec, cancel: Arc<AtomicBool>) -> m
                     }
                     completion += 1;
                     first_token.get_or_insert_with(|| t0.elapsed());
-                    if parser.in_reasoning() {
+                    let was_reasoning = parser.in_reasoning();
+                    if was_reasoning {
                         reasoning += 1;
                     }
-                    if want_logprobs && let Some(lp) = logprobs {
-                        let top = lp.top.iter().map(|&(t, l)| (tok.token_text(t), l)).collect();
-                        alive &= send(Out::Token(TokenInfo { token: tok.token_text(id), logprob: lp.logprob, top }));
-                    }
-                    let text = match dec.push(id) {
-                        Ok(Some(t)) => t,
-                        Ok(None) => continue,
+                    let pieces = match dec.push(id) {
+                        Ok(Some(text)) => parser.push(&stop.push(&text)),
+                        Ok(None) => Vec::new(),
                         Err(e) => {
                             let _ = out_tx.send(Err(ApiError::server(format!("{e:#}"))));
                             cancel.store(true, Ordering::Relaxed);
                             return;
                         }
                     };
-                    let passed = stop.push(&text);
-                    for p in parser.push(&passed) {
+                    // Sent before the pieces its text produced. A token that
+                    // opens, continues or closes reasoning (`<think>`,
+                    // `</think>`) is reasoning even when it yields no piece.
+                    if want_logprobs && let Some(lp) = logprobs {
+                        let top = lp
+                            .top
+                            .iter()
+                            .map(|&(t, l)| {
+                                let (text, bytes) = token_info(&tok, t);
+                                (text, bytes, l)
+                            })
+                            .collect();
+                        let (token, bytes) = token_info(&tok, id);
+                        let in_reasoning = was_reasoning || parser.in_reasoning();
+                        alive &= send(Out::Token(TokenInfo { token, bytes, logprob: lp.logprob, top, reasoning: in_reasoning }));
+                    }
+                    for p in pieces {
                         alive &= send(Out::Piece(p));
                     }
                     if stop.stopped() {

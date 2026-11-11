@@ -176,12 +176,40 @@ pub fn arch(ctx: &Context) -> Result<Arch, Error> {
     Ok(Arch { compile: name.clone(), name, tensor_cores: false, wmma })
 }
 
+/// Options passed to hiprtc besides `--offload-arch`.
+const COMPILE_OPTIONS: &[&str] = &["-O3", "-std=c++17", "-DRLLM_HIP"];
+
+/// What else determines [`compile`]'s output besides source and arch: the
+/// compiler version and options (part of the kernel cache key).
+pub fn compiler_id() -> String {
+    let version = ffi::RTC
+        .as_ref()
+        .ok()
+        .and_then(|rtc| rtc.hiprtcVersion)
+        .and_then(|f| {
+            let (mut major, mut minor) = (0, 0);
+            // SAFETY: plain out-pointers.
+            (unsafe { f(&mut major, &mut minor) } == 0).then(|| format!("{major}.{minor}"))
+        })
+        .unwrap_or_else(|| "unknown".into());
+    format!("hiprtc {version} {}", COMPILE_OPTIONS.join(" "))
+}
+
+/// Whether `code` is a plausible code object (checked before handing it to
+/// `hipModuleLoadData`, which takes no length): an ELF file or a clang
+/// offload bundle, of at least a header's size.
+pub fn valid_code(code: &[u8]) -> bool {
+    const ELF: &[u8] = b"\x7fELF";
+    const BUNDLE: &[u8] = b"__CLANG_OFFLOAD_BUNDLE__";
+    code.len() >= 64 && (code.starts_with(ELF) || code.starts_with(BUNDLE))
+}
+
 /// Compile the kernel source with hiprtc for `arch` (`gfx1151`): a code object.
 pub fn compile(src: &str, arch: &str) -> Result<Vec<u8>, String> {
     let rtc = ffi::RTC.as_ref().map_err(Clone::clone)?;
     let src = CString::new(src).map_err(|e| e.to_string())?;
-    let opts: Vec<CString> = [format!("--offload-arch={arch}"), "-O3".into(), "-std=c++17".into(), "-DRLLM_HIP".into()]
-        .into_iter()
+    let opts: Vec<CString> = std::iter::once(format!("--offload-arch={arch}"))
+        .chain(COMPILE_OPTIONS.iter().map(|o| o.to_string()))
         .map(|o| CString::new(o).unwrap())
         .collect();
     let opt_ptrs: Vec<_> = opts.iter().map(|o| o.as_ptr()).collect();
@@ -200,10 +228,18 @@ pub fn compile(src: &str, arch: &str) -> Result<Vec<u8>, String> {
             Err(format!("hiprtc error {status}:\n{}", String::from_utf8_lossy(&log).trim_end_matches('\0')))
         } else {
             let mut n = 0;
-            (rtc.hiprtcGetCodeSize)(prog, &mut n);
-            let mut code = vec![0u8; n];
-            (rtc.hiprtcGetCode)(prog, code.as_mut_ptr().cast());
-            Ok(code)
+            match (rtc.hiprtcGetCodeSize)(prog, &mut n) {
+                0 if n > 0 => {
+                    let mut code = vec![0u8; n];
+                    match (rtc.hiprtcGetCode)(prog, code.as_mut_ptr().cast()) {
+                        0 if valid_code(&code) => Ok(code),
+                        0 => Err(format!("hiprtc returned no usable code object ({n} bytes)")),
+                        st => Err(format!("hiprtcGetCode: status {st}")),
+                    }
+                }
+                0 => Err("hiprtc returned an empty code object".into()),
+                st => Err(format!("hiprtcGetCodeSize: status {st}")),
+            }
         };
         (rtc.hiprtcDestroyProgram)(&mut prog);
         result
@@ -220,6 +256,10 @@ unsafe impl Send for Module {}
 unsafe impl Sync for Module {}
 
 pub fn load_module(ctx: &Arc<Context>, code: Vec<u8>) -> Result<Arc<Module>, Error> {
+    // hipModuleLoadData takes no length: never hand it an empty or truncated buffer.
+    if !valid_code(&code) {
+        return Err(Error(format!("hipModuleLoadData: not a code object ({} bytes)", code.len())));
+    }
     ctx.bind()?;
     let mut m = std::ptr::null_mut();
     call!(hipModuleLoadData(&mut m, code.as_ptr().cast()))?;
@@ -461,6 +501,12 @@ impl<T> HostSrc<T> for PinnedSlice<T> {
 }
 
 /// Page-locked host memory.
+///
+/// Unlike cudarc's `PinnedHostSlice`, this tracks no event: dropping it frees
+/// the memory right away, even if an async copy out of it is still queued.
+/// Owners must make sure the stream is past such copies first (the backend
+/// waits on an event, or synchronizes the stream, before dropping or
+/// rewriting one).
 pub struct PinnedSlice<T> {
     ptr: *mut T,
     len: usize,
@@ -700,10 +746,35 @@ struct LtPlan {
     algo: [u64; 3],
 }
 
-/// hipBLASLt handle and plans by (n, m, k, input type).
+impl LtPlan {
+    /// Destroy the descriptors (null ones are skipped).
+    ///
+    /// # Safety
+    /// Each non-null handle was created by hipBLASLt and is not used again.
+    unsafe fn destroy(f: &ffi::Lt, desc: ffi::LtDesc, layouts: &[ffi::LtLayout; 3]) {
+        unsafe {
+            if !desc.is_null() {
+                (f.hipblasLtMatmulDescDestroy)(desc);
+            }
+            for &l in layouts.iter().filter(|l| !l.is_null()) {
+                (f.hipblasLtMatrixLayoutDestroy)(l);
+            }
+        }
+    }
+}
+
+/// GEMM shapes whose hipBLASLt plan is kept. Prefill sizes vary (m is the
+/// token count), so the least recently used plans are destroyed past this.
+const LT_MAX_PLANS: usize = 64;
+
+/// Plans by (n, m, k, input type), each with its last use (for eviction).
+type LtPlans = std::collections::HashMap<(usize, usize, usize, GemmIn), (Option<LtPlan>, u64)>;
+
+/// hipBLASLt handle and plans.
 struct Lt {
     handle: ffi::LtHandle,
-    plans: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize, GemmIn), Option<LtPlan>>>,
+    plans: LtPlans,
+    tick: u64,
 }
 
 /// hipBLAS on the backend's stream, with a workspace when the library takes
@@ -713,7 +784,9 @@ struct Lt {
 /// Qwen3-0.6B prefill 18% slower.
 pub struct Blas {
     handle: ffi::BlasHandle,
-    lt: Option<Lt>,
+    /// hipBLASLt state. The mutex also serializes every GEMM call: neither
+    /// library's handle may be used from two threads at once.
+    lt: std::sync::Mutex<Option<Lt>>,
     stream: Arc<Stream>,
     workspace: Slice<u8>,
 }
@@ -725,19 +798,26 @@ const LT_PREF_MAX_WORKSPACE_BYTES: c_int = 1;
 /// `sizeof(hipblasLtMatmulHeuristicResult_t)`; the algorithm is its first 24 bytes.
 const LT_HEURISTIC_BYTES: usize = 56;
 
+// SAFETY: the handles are plain pointers to library state. Every use goes
+// through `&self` methods that hold the `lt` mutex (or `&mut self` in drop),
+// so no two threads use a handle at once; the backend needs `Blas` to be
+// `Sync` because `Backend: Sync`.
 unsafe impl Send for Blas {}
 unsafe impl Sync for Blas {}
 
 impl Drop for Blas {
     fn drop(&mut self) {
+        // Work queued with the handles (and the workspace) must finish first.
+        let _ = self.stream.synchronize();
         if let Ok(b) = ffi::BLAS.as_ref() {
             unsafe { (b.hipblasDestroy)(self.handle) };
         }
-        if let (Some(lt), Ok(f)) = (&self.lt, ffi::LT.as_ref()) {
-            for plan in lt.plans.lock().unwrap().values().flatten() {
-                unsafe {
-                    (f.hipblasLtMatmulDescDestroy)(plan.desc);
-                    plan.layouts.iter().for_each(|&l| _ = (f.hipblasLtMatrixLayoutDestroy)(l));
+        let lt = self.lt.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let (Some(lt), Ok(f)) = (lt.as_mut(), ffi::LT.as_ref()) {
+            for (plan, _) in lt.plans.drain().map(|(_, v)| v) {
+                if let Some(plan) = plan {
+                    // SAFETY: created by lt_plan, never used again.
+                    unsafe { LtPlan::destroy(f, plan.desc, &plan.layouts) };
                 }
             }
             unsafe { (f.hipblasLtDestroy)(lt.handle) };
@@ -762,12 +842,17 @@ impl Blas {
             }
         };
         unsafe {
-            if (b.hipblasSetStream)(handle, stream.raw) != 0 {
+            let st = (b.hipblasSetStream)(handle, stream.raw);
+            if st != 0 {
                 (b.hipblasDestroy)(handle);
-                return Err("hipblasSetStream failed".into());
+                return Err(format!("hipblasSetStream: status {st}"));
             }
             if let Some(set) = b.hipblasSetWorkspace {
-                set(handle, workspace.ptr as *mut c_void, WORKSPACE);
+                let st = set(handle, workspace.ptr as *mut c_void, WORKSPACE);
+                if st != 0 {
+                    (b.hipblasDestroy)(handle);
+                    return Err(format!("hipblasSetWorkspace: status {st}"));
+                }
             }
         }
         let lt = if std::env::var_os("RLLM_NO_HIPBLASLT").is_some() {
@@ -775,60 +860,55 @@ impl Blas {
         } else {
             ffi::LT.as_ref().ok().and_then(|f| {
                 let mut h = std::ptr::null_mut();
-                (unsafe { (f.hipblasLtCreate)(&mut h) } == 0).then(|| Lt { handle: h, plans: Default::default() })
+                (unsafe { (f.hipblasLtCreate)(&mut h) } == 0).then(|| Lt { handle: h, plans: Default::default(), tick: 0 })
             })
         };
-        Ok(Self { handle, lt, stream: stream.clone(), workspace })
+        Ok(Self { handle, lt: std::sync::Mutex::new(lt), stream: stream.clone(), workspace })
     }
 
-    /// hipBLASLt's plan for this shape (made on first use; None if it has
-    /// no algorithm for it).
-    fn lt_plan<'a>(
-        &self,
-        lt: &'a Lt,
-        n: usize,
-        m: usize,
-        k: usize,
-        input: GemmIn,
-        ty: c_int,
-    ) -> std::sync::MutexGuard<'a, std::collections::HashMap<(usize, usize, usize, GemmIn), Option<LtPlan>>> {
-        let mut plans = lt.plans.lock().unwrap();
-        plans.entry((n, m, k, input)).or_insert_with(|| {
-            let f = ffi::LT.as_ref().ok()?;
-            // SAFETY: valid out-pointers and attribute buffers; everything
-            // created is either kept in the plan or destroyed here.
-            unsafe {
-                let mut desc = std::ptr::null_mut();
-                if (f.hipblasLtMatmulDescCreate)(&mut desc, HIPBLAS_COMPUTE_32F, HIP_R_32F) != 0 {
-                    return None;
-                }
-                let (ta, tb) = (HIPBLAS_OP_T, HIPBLAS_OP_N);
-                (f.hipblasLtMatmulDescSetAttribute)(desc, LT_DESC_TRANSA, (&ta as *const c_int).cast(), 4);
-                (f.hipblasLtMatmulDescSetAttribute)(desc, LT_DESC_TRANSB, (&tb as *const c_int).cast(), 4);
-                let mut layouts = [std::ptr::null_mut(); 3];
-                // A stored [n][k] (k-major, transposed in the op), B [m][k], C [m][n].
-                (f.hipblasLtMatrixLayoutCreate)(&mut layouts[0], ty, k as u64, n as u64, k as i64);
-                (f.hipblasLtMatrixLayoutCreate)(&mut layouts[1], ty, k as u64, m as u64, k as i64);
-                (f.hipblasLtMatrixLayoutCreate)(&mut layouts[2], ty, n as u64, m as u64, n as i64);
-                let mut pref = std::ptr::null_mut();
-                (f.hipblasLtMatmulPreferenceCreate)(&mut pref);
-                let ws = WORKSPACE as u64;
-                (f.hipblasLtMatmulPreferenceSetAttribute)(pref, LT_PREF_MAX_WORKSPACE_BYTES, (&ws as *const u64).cast(), 8);
-                let mut result = [0u64; LT_HEURISTIC_BYTES / 8];
-                let mut found = 0;
-                let st = (f.hipblasLtMatmulAlgoGetHeuristic)(
-                    lt.handle, desc, layouts[0], layouts[1], layouts[2], layouts[2], pref, 1, result.as_mut_ptr().cast(), &mut found,
-                );
-                (f.hipblasLtMatmulPreferenceDestroy)(pref);
-                if st != 0 || found < 1 {
-                    (f.hipblasLtMatmulDescDestroy)(desc);
-                    layouts.iter().for_each(|&l| _ = (f.hipblasLtMatrixLayoutDestroy)(l));
-                    return None;
-                }
-                Some(LtPlan { desc, layouts, algo: [result[0], result[1], result[2]] })
+    /// hipBLASLt's plan for this shape, made on first use (None if it has no
+    /// algorithm for it, or a descriptor call failed).
+    ///
+    /// # Safety
+    /// `f` is the library `lt.handle` came from.
+    unsafe fn make_lt_plan(f: &ffi::Lt, lt_handle: ffi::LtHandle, n: usize, m: usize, k: usize, ty: c_int) -> Option<LtPlan> {
+        // SAFETY: valid out-pointers and attribute buffers; everything
+        // created is either kept in the plan or destroyed here.
+        unsafe {
+            let mut desc = std::ptr::null_mut();
+            if (f.hipblasLtMatmulDescCreate)(&mut desc, HIPBLAS_COMPUTE_32F, HIP_R_32F) != 0 {
+                return None;
             }
-        });
-        plans
+            let mut layouts = [std::ptr::null_mut(); 3];
+            let (ta, tb) = (HIPBLAS_OP_T, HIPBLAS_OP_N);
+            let mut ok = (f.hipblasLtMatmulDescSetAttribute)(desc, LT_DESC_TRANSA, (&ta as *const c_int).cast(), 4) == 0
+                && (f.hipblasLtMatmulDescSetAttribute)(desc, LT_DESC_TRANSB, (&tb as *const c_int).cast(), 4) == 0;
+            // A stored [n][k] (k-major, transposed in the op), B [m][k], C [m][n].
+            let shapes = [(k, n, k), (k, m, k), (n, m, n)];
+            for (l, &(rows, cols, ld)) in layouts.iter_mut().zip(&shapes) {
+                ok = ok && (f.hipblasLtMatrixLayoutCreate)(l, ty, rows as u64, cols as u64, ld as i64) == 0;
+            }
+            let mut found = 0;
+            let mut result = [0u64; LT_HEURISTIC_BYTES / 8];
+            if ok {
+                let mut pref = std::ptr::null_mut();
+                if (f.hipblasLtMatmulPreferenceCreate)(&mut pref) == 0 {
+                    let ws = WORKSPACE as u64;
+                    ok = (f.hipblasLtMatmulPreferenceSetAttribute)(pref, LT_PREF_MAX_WORKSPACE_BYTES, (&ws as *const u64).cast(), 8) == 0
+                        && (f.hipblasLtMatmulAlgoGetHeuristic)(
+                            lt_handle, desc, layouts[0], layouts[1], layouts[2], layouts[2], pref, 1, result.as_mut_ptr().cast(), &mut found,
+                        ) == 0;
+                    (f.hipblasLtMatmulPreferenceDestroy)(pref);
+                } else {
+                    ok = false;
+                }
+            }
+            if !ok || found < 1 {
+                LtPlan::destroy(f, desc, &layouts);
+                return None;
+            }
+            Some(LtPlan { desc, layouts, algo: [result[0], result[1], result[2]] })
+        }
     }
 
     /// See `rllm-cuda`'s `Blas::gemm_tn`; `c` has the input's type when
@@ -845,9 +925,28 @@ impl Blas {
         };
         let beta = 0f32;
         const LT_MIN_WEIGHT: usize = 8 << 20;
-        if let Some(lt) = self.lt.as_ref().filter(|_| GEMM_HALF_OUT && n * k >= LT_MIN_WEIGHT) {
-            let plans = self.lt_plan(lt, n, m, k, input, ty);
-            if let (Some(plan), Ok(f)) = (&plans[&(n, m, k, input)], ffi::LT.as_ref()) {
+        // Held for the whole call: serializes use of both handles.
+        let mut lt_guard = self.lt.lock().unwrap_or_else(|e| e.into_inner());
+        if let (Some(lt), Ok(f)) = (lt_guard.as_mut().filter(|_| GEMM_HALF_OUT && n * k >= LT_MIN_WEIGHT), ffi::LT.as_ref()) {
+            let key = (n, m, k, input);
+            lt.tick += 1;
+            let tick = lt.tick;
+            if !lt.plans.contains_key(&key) {
+                if lt.plans.len() >= LT_MAX_PLANS
+                    && let Some(old) = lt.plans.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| *k)
+                    && let Some((Some(plan), _)) = lt.plans.remove(&old)
+                {
+                    // SAFETY: made by make_lt_plan; hipblasLtMatmul calls that
+                    // used it have already been enqueued with their arguments.
+                    unsafe { LtPlan::destroy(f, plan.desc, &plan.layouts) };
+                }
+                // SAFETY: `f` is the library the handle came from.
+                let plan = unsafe { Self::make_lt_plan(f, lt.handle, n, m, k, ty) };
+                lt.plans.insert(key, (plan, tick));
+            }
+            let entry = lt.plans.get_mut(&key).expect("plan inserted above");
+            entry.1 = tick;
+            if let Some(plan) = &entry.0 {
                 let [la, lb, lc] = plan.layouts;
                 // SAFETY: the plan describes exactly these shapes; the caller
                 // guarantees the pointers.
@@ -897,6 +996,7 @@ impl Blas {
                 HIPBLAS_GEMM_DEFAULT,
             )
         };
+        drop(lt_guard);
         if st != 0 { Err(format!("hipblasGemmEx: status {st}")) } else { Ok(()) }
     }
 }

@@ -275,3 +275,103 @@ impl<B: Backend> Model<B> for AnyModel<B> {
         }
     }
 }
+
+/// Tiny GGUF files for config validation tests.
+#[cfg(test)]
+pub(crate) mod test_gguf {
+    use rllm_gguf::{Gguf, Value};
+
+    fn put_str(b: &mut Vec<u8>, s: &str) {
+        b.extend((s.len() as u64).to_le_bytes());
+        b.extend(s.as_bytes());
+    }
+
+    fn put_value(b: &mut Vec<u8>, v: &Value) {
+        match v {
+            Value::U8(x) => b.push(*x),
+            Value::I32(x) => b.extend(x.to_le_bytes()),
+            Value::U32(x) => b.extend(x.to_le_bytes()),
+            Value::U64(x) => b.extend(x.to_le_bytes()),
+            Value::F32(x) => b.extend(x.to_le_bytes()),
+            Value::Bool(x) => b.push(*x as u8),
+            Value::String(s) => put_str(b, s),
+            Value::Array(a) => {
+                b.extend(type_id(a.first().unwrap_or(&Value::U32(0))).to_le_bytes());
+                b.extend((a.len() as u64).to_le_bytes());
+                a.iter().for_each(|v| put_value(b, v));
+            }
+            v => panic!("unsupported test value {v:?}"),
+        }
+    }
+
+    fn type_id(v: &Value) -> u32 {
+        match v {
+            Value::U8(_) => 0,
+            Value::U32(_) => 4,
+            Value::I32(_) => 5,
+            Value::F32(_) => 6,
+            Value::Bool(_) => 7,
+            Value::String(_) => 8,
+            Value::Array(_) => 9,
+            Value::U64(_) => 10,
+            v => panic!("unsupported test value {v:?}"),
+        }
+    }
+
+    /// A GGUF's metadata and zero-filled f32 tensors (GGUF dim order), editable before building.
+    #[derive(Clone, Default)]
+    pub struct Spec {
+        pub meta: Vec<(String, Value)>,
+        pub tensors: Vec<(String, Vec<u64>)>,
+    }
+
+    impl Spec {
+        pub fn set(&mut self, key: &str, v: Value) -> &mut Self {
+            self.meta.retain(|(k, _)| k != key);
+            self.meta.push((key.into(), v));
+            self
+        }
+
+        pub fn remove(&mut self, key: &str) -> &mut Self {
+            self.meta.retain(|(k, _)| k != key);
+            self
+        }
+
+        pub fn tensor(&mut self, name: &str, dims: &[u64]) -> &mut Self {
+            self.tensors.retain(|(n, _)| n != name);
+            self.tensors.push((name.into(), dims.to_vec()));
+            self
+        }
+
+        /// Write the file and open it.
+        pub fn build(&self) -> anyhow::Result<Gguf> {
+            let mut b = Vec::new();
+            b.extend(0x4655_4747u32.to_le_bytes());
+            b.extend(3u32.to_le_bytes());
+            b.extend((self.tensors.len() as u64).to_le_bytes());
+            b.extend((self.meta.len() as u64).to_le_bytes());
+            for (k, v) in &self.meta {
+                put_str(&mut b, k);
+                b.extend(type_id(v).to_le_bytes());
+                put_value(&mut b, v);
+            }
+            let mut offset = 0u64;
+            for (name, dims) in &self.tensors {
+                put_str(&mut b, name);
+                b.extend((dims.len() as u32).to_le_bytes());
+                dims.iter().for_each(|d| b.extend(d.to_le_bytes()));
+                b.extend(0u32.to_le_bytes());
+                b.extend(offset.to_le_bytes());
+                offset += (dims.iter().product::<u64>() * 4).next_multiple_of(32);
+            }
+            b.resize(b.len().next_multiple_of(32) + offset as usize, 0);
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("rllm-model-test-{}-{n}.gguf", std::process::id()));
+            std::fs::write(&path, &b)?;
+            let g = Gguf::open(&path);
+            std::fs::remove_file(&path)?;
+            Ok(g?)
+        }
+    }
+}

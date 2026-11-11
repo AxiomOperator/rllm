@@ -1,8 +1,70 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use rllm_core::{Backend, HostBytes, HostTensor};
 use rllm_gguf::Gguf;
+
+/// Largest model dimension (hidden size, heads, vocabulary, ...) accepted
+/// from metadata: far beyond real models, small enough that products of a
+/// few of them can't overflow.
+pub(crate) const MAX_DIM: usize = 1 << 24;
+/// Largest context accepted (positions are u32).
+pub(crate) const MAX_CONTEXT: usize = 1 << 30;
+
+/// Metadata integer `key` as a usize in `1..=max` (0 allowed if `zero_ok`).
+pub(crate) fn meta_usize(g: &Gguf, key: &str, max: usize, zero_ok: bool) -> Result<usize> {
+    let v = g.get_u64(key)?;
+    bounded(key, v, max, zero_ok)
+}
+
+/// Optional metadata integer: `default` when absent, an error when present but invalid.
+pub(crate) fn meta_usize_or(g: &Gguf, key: &str, default: usize, max: usize, zero_ok: bool) -> Result<usize> {
+    match g.get(key) {
+        None => Ok(default),
+        Some(v) => bounded(key, v.as_u64().with_context(|| format!("{key}: expected a non-negative integer"))?, max, zero_ok),
+    }
+}
+
+fn bounded(key: &str, v: u64, max: usize, zero_ok: bool) -> Result<usize> {
+    let n = usize::try_from(v).ok().filter(|&n| n <= max).with_context(|| format!("{key} = {v} is out of range (at most {max})"))?;
+    ensure!(zero_ok || n > 0, "{key} must be positive");
+    Ok(n)
+}
+
+/// Optional metadata float: `default` when absent; must be finite and positive.
+pub(crate) fn meta_f32_or(g: &Gguf, key: &str, default: f32) -> Result<f32> {
+    let v = match g.get(key) {
+        None => return Ok(default),
+        Some(v) => v.as_f64().with_context(|| format!("{key}: expected a number"))? as f32,
+    };
+    ensure!(v.is_finite() && v > 0.0, "{key} = {v} must be a positive number");
+    Ok(v)
+}
+
+/// Check that tensor `name` exists with GGUF dims `dims` (innermost first).
+pub(crate) fn check_shape(g: &Gguf, name: &str, dims: &[usize]) -> Result<()> {
+    let t = g.require_tensor(name)?;
+    if t.dims.len() != dims.len() || t.dims.iter().zip(dims).any(|(&a, &b)| a != b as u64) {
+        bail!("tensor {name} has shape {:?}, expected {dims:?}", t.dims);
+    }
+    Ok(())
+}
+
+/// [`check_shape`] for a tensor that may be absent.
+pub(crate) fn check_shape_opt(g: &Gguf, name: &str, dims: &[usize]) -> Result<()> {
+    if g.tensor(name).is_some() { check_shape(g, name, dims) } else { Ok(()) }
+}
+
+/// An optional head-size key (`rope.dimension_count`, `attention.value_length`)
+/// must, when present, equal `head_dim`: partial rotary embeddings and
+/// value heads of a different width than keys aren't implemented.
+pub(crate) fn check_same_as_head_dim(g: &Gguf, key: &str, head_dim: usize, what: &str) -> Result<()> {
+    if let Some(v) = g.get(key) {
+        let n = v.as_u64().with_context(|| format!("{key}: expected an integer"))?;
+        ensure!(n == head_dim as u64, "{key} = {n} differs from the head size {head_dim}: {what} is not supported");
+    }
+    Ok(())
+}
 
 /// View a GGUF tensor as a `HostTensor` without copying its data.
 pub fn host_tensor(g: &Gguf, name: &str) -> Result<HostTensor> {
@@ -25,9 +87,11 @@ pub fn load_weight<B: Backend>(backend: &B, g: &Gguf, name: &str) -> Result<B::W
 /// Load a Q or K projection stored for ggml's "normal" RoPE (rotating
 /// adjacent pairs; Llama's GGUF conversion permutes the rows for it) in
 /// NeoX order (rotating dims i and i + head_dim / 2), which is what rllm's
-/// RoPE kernels do: row `h * head_dim + i` becomes row `2i` of that head for
-/// i < head_dim / 2, else row `2(i - head_dim / 2) + 1`. Attention only sees
-/// dot products of rotated Q and K, so the order of their dims is free.
+/// RoPE kernels do: output row `h * head_dim + i` is taken from stored row
+/// `h * head_dim + 2i` for i < head_dim / 2, else from stored row
+/// `h * head_dim + 2(i - head_dim / 2) + 1` (each adjacent pair (2j, 2j+1)
+/// becomes the pair (j, j + head_dim / 2)). Attention only sees dot products
+/// of rotated Q and K, so the order of their dims is free.
 pub fn load_weight_rope_neox<B: Backend>(backend: &B, g: &Gguf, name: &str, head_dim: usize) -> Result<B::Weight> {
     let t = host_tensor(g, name)?;
     let (rows, cols) = t.as_2d();

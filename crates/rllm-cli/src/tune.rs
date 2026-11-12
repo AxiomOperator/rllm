@@ -32,6 +32,8 @@ const MAX_PARALLEL: usize = 8;
 const DEFAULT_CTX: usize = 32768;
 /// Prompt tokens per forward pass (the server's default).
 const PREFILL_CHUNK: usize = 512;
+/// Reported-free GTT an integrated GPU can't actually allocate (see `usable_bytes`).
+const INTEGRATED_RESERVE: usize = 4 << 30;
 
 #[derive(Args)]
 pub struct TuneArgs {
@@ -106,9 +108,16 @@ impl Gpu {
     }
 
     /// Memory rllm may plan to use. An integrated GPU's free memory is also
-    /// the system's, so leave 8 GiB of RAM for everything else.
+    /// the system's, so leave 8 GiB of RAM for everything else. Its last few
+    /// GiB of reported free GTT can't be allocated either (on the Strix Halo,
+    /// allocations failed with 2.7 GiB still reported free), so leave
+    /// INTEGRATED_RESERVE of it alone.
     fn usable_bytes(&self, ram_available: usize) -> usize {
-        if self.integrated { self.free_bytes.min(ram_available.saturating_sub(8 << 30)) } else { self.free_bytes }
+        if self.integrated {
+            self.free_bytes.saturating_sub(INTEGRATED_RESERVE).min(ram_available.saturating_sub(8 << 30))
+        } else {
+            self.free_bytes
+        }
     }
 }
 
@@ -180,7 +189,7 @@ impl Plan {
 /// 6000 Ada: Qwen3-0.6B Q8_0/BF16, Qwen3-8B Q4_K_M and Nemotron E4B Q8_K_XL
 /// measured 0.19-0.61 GiB at 32k context.
 fn runtime_overhead(m: &ModelProfile, kv: KvType, ctx: usize) -> usize {
-    let activations = PREFILL_CHUNK * (12 * m.hidden + 4 * m.ffn) * 4;
+    let activations = PREFILL_CHUNK * ((12 * m.hidden + 4 * m.ffn) * 4 + m.moe_bytes_per_token);
     let logits = (MAX_PARALLEL + 8) * m.vocab * 4;
     let stage = if kv == KvType::Q8 { 2 * ctx * m.max_layer_f16_bytes_per_token() } else { 0 };
     // Gemma 4's per-layer embeddings and wider vocabulary add buffers.
@@ -505,17 +514,20 @@ impl_mem_info!(HipBackend);
 
 /// [`measure`] on `gpu`, with a fresh backend.
 fn measure_on(gpu: &Gpu, model_path: &Path, p: &Plan) -> Result<Measured> {
-    match gpu.kind {
+    let r = match gpu.kind {
         GpuKind::Cuda => measure(&CudaBackend::new(gpu.ordinal)?, model_path, p),
         GpuKind::Hip => measure(&HipBackend::new(gpu.ordinal)?, model_path, p),
+    };
+    if let Err(e) = &r {
+        eprintln!("[rllm] measuring failed: {e:#}");
     }
+    r
 }
 
 /// Load the model and run the planned configuration: one request prefilled
 /// to near the full context, then 8 requests decoding together, then one
 /// alone; the draft model's decode step is timed against the target's.
 fn measure<B: MemInfo>(b: &B, model_path: &Path, p: &Plan) -> Result<Measured> {
-    b.hold_freed_memory()?;
     let (free0, _) = b.mem_info()?;
     let g = Gguf::open(model_path)?;
     let model = AnyModel::load(b, &g)?;
@@ -523,6 +535,11 @@ fn measure<B: MemInfo>(b: &B, model_path: &Path, p: &Plan) -> Result<Measured> {
     let dg = p.draft.as_ref().map(Gguf::open).transpose()?;
     let draft = dg.as_ref().map(|g| AnyModel::load(b, g)).transpose()?;
     let (free2, _) = b.mem_info()?;
+    // From here on, keep freed temporary buffers in the pool so mem_info
+    // shows the workload's peak. Not while loading: weights upload through
+    // per-tensor staging buffers which `serve` returns as it goes (held,
+    // they inflated the 27B's load from 26.8 to 36 GiB).
+    b.hold_freed_memory()?;
     let vocab = model.vocab_size();
 
     let mut pool = KvPool::new(b, &model, p.kv_tokens, BLOCK, p.kv_type, p.parallel + 2)?;

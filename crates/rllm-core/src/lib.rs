@@ -217,6 +217,61 @@ impl GdnShape {
     }
 }
 
+/// The routed experts of a mixture-of-experts FFN layer (see
+/// [`Backend::moe_ffn`]). The experts' weights are stacked along the rows:
+/// expert `e` is rows `e * n_ff..(e + 1) * n_ff` of `gate` and `up`
+/// (`[n_expert * n_ff, hidden]`) and rows `e * hidden..(e + 1) * hidden` of
+/// `down` (`[n_expert * hidden, n_ff]`), which is how GGUF stores 3-D
+/// expert tensors.
+pub struct MoeFfn<'a, W> {
+    pub gate: &'a W,
+    pub up: &'a W,
+    pub down: &'a W,
+    pub n_expert: usize,
+    /// Experts used per token (top-k).
+    pub n_used: usize,
+    /// Hidden width of one expert.
+    pub n_ff: usize,
+    /// Renormalize the selected experts' weights to sum to 1.
+    pub norm_topk: bool,
+    /// Multiplier on the expert weights (1 = none).
+    pub scale: f32,
+}
+
+/// Top-`k` expert selection for one token: softmax over `logits`, the `k`
+/// largest probabilities (ties to the lower index), optionally renormalized
+/// to sum to 1 (sum clamped below at 2^-14), times `scale`. Writes expert
+/// ids and weights in descending probability order. Backends share this
+/// definition so their routing agrees exactly.
+pub fn moe_route(logits: &[f32], k: usize, norm: bool, scale: f32, ids: &mut [u32], wts: &mut [f32]) {
+    let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+    let mut sum = 0f32;
+    for &v in logits {
+        sum += (v - max).exp();
+    }
+    let mut taken = 0usize;
+    for j in 0..k {
+        // Selection on the logits (softmax is monotonic); ties to the lower index.
+        let mut best = usize::MAX;
+        for (e, &v) in logits.iter().enumerate() {
+            if ids[..taken].contains(&(e as u32)) {
+                continue;
+            }
+            if best == usize::MAX || v > logits[best] {
+                best = e;
+            }
+        }
+        ids[j] = best as u32;
+        wts[j] = (logits[best] - max).exp() / sum;
+        taken += 1;
+    }
+    let total: f32 = wts[..k].iter().sum();
+    let div = if norm { total.max(6.103_515_6e-5) } else { 1.0 };
+    for w in &mut wts[..k] {
+        *w = *w / div * scale;
+    }
+}
+
 /// Activation of a gated FFN (see [`Backend::glu_matmul`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Activation {
@@ -415,6 +470,24 @@ pub trait Backend: Send + Sync {
         snaps: Option<(&mut Self::Buffer, usize)>,
     ) -> Result<()>;
 
+    /// Mixture-of-experts FFN over `m` tokens: per token `t`, route with
+    /// [`moe_route`] on `logits[t, :]` (`n_expert` wide), then
+    /// `out[t] = sum_j w_j * down_e(silu(gate_e x[t]) * up_e x[t])` over the
+    /// selected experts `e` (in selection order). With `shared = (y, g)` (a
+    /// gated shared expert's output `[m, hidden]` and gate logits `[m]`),
+    /// `out[t] += sigmoid(g[t]) * y[t]` after that sum.
+    fn moe_ffn(
+        &self,
+        x: &Self::Buffer,
+        logits: &Self::Buffer,
+        moe: &MoeFfn<Self::Weight>,
+        shared: Option<(&Self::Buffer, &Self::Buffer)>,
+        out: &mut Self::Buffer,
+        m: usize,
+    ) -> Result<()>;
+    /// `x[r, :] += sigmoid(g[r]) * y[r, :]` for `rows` rows of `width` (a
+    /// gated shared expert).
+    fn add_sigmoid_scaled(&self, x: &mut Self::Buffer, y: &Self::Buffer, g: &Self::Buffer, rows: usize, width: usize) -> Result<()>;
     /// `dst[dst_off..dst_off + len] = src[src_off..src_off + len]` (device
     /// copy; restoring recurrent-state snapshots).
     fn copy_span(&self, src: &Self::Buffer, src_off: usize, dst: &mut Self::Buffer, dst_off: usize, len: usize) -> Result<()>;
@@ -656,5 +729,29 @@ pub trait Backend: Send + Sync {
     /// Block until queued work is finished (no-op on synchronous backends).
     fn synchronize(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::moe_route;
+
+    #[test]
+    fn moe_route_picks_top_k_and_renormalizes() {
+        let logits = [0.5f32, 2.0, -1.0, 2.0, 1.0];
+        let (mut ids, mut w) = ([0u32; 3], [0f32; 3]);
+        moe_route(&logits, 3, true, 1.0, &mut ids, &mut w);
+        // Ties go to the lower index; descending order.
+        assert_eq!(ids, [1, 3, 4]);
+        let e = |v: f32| v.exp();
+        let total = e(2.0) + e(2.0) + e(1.0);
+        for (got, want) in w.iter().zip([e(2.0) / total, e(2.0) / total, e(1.0) / total]) {
+            assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+        }
+        // Without renormalization: softmax probabilities over all experts, scaled.
+        moe_route(&logits, 1, false, 2.0, &mut ids[..1], &mut w[..1]);
+        let all: f32 = logits.iter().map(|&v| v.exp()).sum();
+        assert_eq!(ids[0], 1);
+        assert!((w[0] - 2.0 * e(2.0) / all).abs() < 1e-6);
     }
 }

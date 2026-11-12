@@ -10,7 +10,7 @@ step lives.
 flowchart TD
     cli["rllm-cli<br/>the rllm binary: run, serve, bench, tune, …"]
     server["rllm-server<br/>HTTP API (axum) + engine thread"]
-    model["rllm-model<br/>Qwen3 / Qwen3.5 / Llama / Gemma 4 forward passes,<br/>KvPool, Generator, sampler"]
+    model["rllm-model<br/>Qwen3 / Qwen3.5 (dense, MoE) / Llama / Gemma 4 forward passes,<br/>KvPool, Generator, sampler"]
     tok["rllm-tokenizer<br/>BPE / SentencePiece + chat templates"]
     kv["rllm-kv<br/>block allocator, prefix cache"]
     gguf["rllm-gguf<br/>GGUF reader (mmap)"]

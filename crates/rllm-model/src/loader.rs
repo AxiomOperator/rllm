@@ -111,12 +111,13 @@ pub fn load_weight_rope_neox<B: Backend>(backend: &B, g: &Gguf, name: &str, head
     backend.upload(&t).with_context(|| format!("uploading {name}"))
 }
 
-/// Load rows `rows` of 2-D tensor `name`, in that order (any row of a
-/// quantized matrix is whole blocks, so rows can be picked freely).
+/// Load rows `rows` of tensor `name` (viewed as 2-D: every axis but the
+/// innermost counts rows), in that order (any row of a quantized matrix is
+/// whole blocks, so rows can be picked freely).
 pub fn load_weight_rows<B: Backend>(backend: &B, g: &Gguf, name: &str, rows: &[usize]) -> Result<B::Weight> {
     let t = host_tensor(g, name)?;
     let (n_rows, cols) = t.as_2d();
-    ensure!(t.shape.len() == 2, "{name}: expected a matrix, shape {:?}", t.shape);
+    ensure!(t.shape.len() >= 2, "{name}: expected a matrix, shape {:?}", t.shape);
     let row_bytes = t.dtype.row_bytes(cols);
     ensure!(n_rows * row_bytes == t.bytes.as_slice().len(), "{name}: {} bytes for {n_rows} rows", t.bytes.as_slice().len());
     let src = t.bytes.as_slice();

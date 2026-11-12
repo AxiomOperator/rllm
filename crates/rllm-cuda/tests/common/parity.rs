@@ -316,7 +316,7 @@ fn attention_case(head_dim: usize, window: usize, step: Step, kv: KvType) {
 /// Query-head groups beyond 4 (Qwen3.5-27B: 6) have decode kernels too.
 #[test]
 fn paged_attention_wide_groups() {
-    for (heads, hd) in [(12, 256), (12, 128), (16, 128)] {
+    for (heads, hd) in [(12, 256), (12, 128), (16, 128), (16, 256)] {
         for kv in [KvType::F16, KvType::Q8] {
             for step in [Step::Decode, Step::Mixed] {
                 attention_case_heads(hd, 0, step, kv, heads, 2);
@@ -819,6 +819,102 @@ fn gated_delta_net_snapshots_roll_back() {
                 cpu.copy_span(&snc, e * ssm_len, &mut ssc, slot * ssm_len, ssm_len).unwrap();
                 gpu.copy_span(&sng, e * ssm_len, &mut ssg, slot * ssm_len, ssm_len).unwrap();
             }
+        }
+    }
+}
+
+/// Mixture-of-experts FFN: decode (per-pair matvecs) and prefill (pairs
+/// sorted by expert, grouped MMQ) against the CPU reference, with fused
+/// (same-format gate/up) and split projections.
+#[test]
+fn moe_ffn_matches() {
+    let Some(gpu) = gpu_backend() else { return };
+    let cpu = CpuBackend::new();
+    let mut rng = Rng(0x00e0_7e57);
+    let (d, f, ne, k) = (512, 256, 16, 4);
+    let formats = [
+        (DType::Q4K, DType::Q4K, DType::Q6K),
+        (DType::Q8_0, DType::Q8_0, DType::Q8_0),
+        (DType::Q4K, DType::Q5K, DType::Q6K),
+        (DType::IQ4XS, DType::IQ4XS, DType::Q5K),
+    ];
+    for (fg, fu, fd) in formats {
+        let (gate, up, down) = (random_weight(&mut rng, fg, ne * f, d), random_weight(&mut rng, fu, ne * f, d), random_weight(&mut rng, fd, ne * d, f));
+        let wc = [&gate, &up, &down].map(|w| cpu.upload(w).unwrap());
+        let wg = [&gate, &up, &down].map(|w| gpu.upload(w).unwrap());
+        fn moe<W>(w: &[W; 3], ne: usize, k: usize, f: usize) -> rllm_core::MoeFfn<'_, W> {
+            rllm_core::MoeFfn { gate: &w[0], up: &w[1], down: &w[2], n_expert: ne, n_used: k, n_ff: f, norm_topk: true, scale: 1.0 }
+        }
+        let (mc, mg) = (moe(&wc, ne, k, f), moe(&wg, ne, k, f));
+        for (m, with_shared) in [(1, false), (3, true), (8, false), (9, true), (70, false), (70, true)] {
+            let x = rng.vec(m * d);
+            let logits: Vec<f32> = rng.vec(m * ne).iter().map(|v| 4.0 * v).collect();
+            let (sy, sg) = (rng.vec(m * d), rng.vec(m).iter().map(|v| 4.0 * v).collect::<Vec<_>>());
+            let want = {
+                let (xc, lc, mut out) = (upload(&cpu, &x), upload_any(&cpu, &logits), cpu.alloc(m * d).unwrap());
+                let (yc, gc) = (upload(&cpu, &sy), upload_any(&cpu, &sg));
+                cpu.moe_ffn(&xc, &lc, &mc, with_shared.then_some((&yc, &gc)), &mut out, m).unwrap();
+                download(&cpu, &out, m * d)
+            };
+            let run_gpu = |x: &[f32], logits: &[f32], sy: &[f32], sg: &[f32], m: usize| {
+                let (xg, lg, mut out) = (upload(&gpu, x), upload_any(&gpu, logits), gpu.alloc(m * d).unwrap());
+                let (yg, gg) = (upload(&gpu, sy), upload_any(&gpu, sg));
+                gpu.moe_ffn(&xg, &lg, &mg, with_shared.then_some((&yg, &gg)), &mut out, m).unwrap();
+                download(&gpu, &out, m * d)
+            };
+            let got = run_gpu(&x, &logits, &sy, &sg, m);
+            assert_close(&format!("moe_ffn {fg}/{fu}/{fd} m={m} shared={with_shared}"), &want, &got, 5e-2);
+            if m <= 8 {
+                // Decode rows don't depend on the rest of the batch (MTP
+                // verification must match single-token steps bit for bit).
+                let t = m - 1;
+                let r = |v: &[f32], w: usize| v[t * w..(t + 1) * w].to_vec();
+                let one = run_gpu(&r(&x, d), &r(&logits, ne), &r(&sy, d), &r(&sg, 1), 1);
+                assert!(one == got[t * d..(t + 1) * d], "moe_ffn {fg}/{fu}/{fd}: token {t} of {m} differs from a 1-token step");
+            }
+        }
+    }
+}
+
+#[test]
+fn add_sigmoid_scaled_matches() {
+    let Some(gpu) = gpu_backend() else { return };
+    let cpu = CpuBackend::new();
+    let mut rng = Rng(0x5160_1d);
+    let (rows, width) = (5, 96);
+    let (x, y, g) = (rng.vec(rows * width), rng.vec(rows * width), rng.vec(rows).iter().map(|v| 6.0 * v).collect::<Vec<_>>());
+    let run = |b: &dyn Fn() -> Vec<f32>| b();
+    let want = run(&|| {
+        let (mut xb, yb, gb) = (upload(&cpu, &x), upload(&cpu, &y), upload_any(&cpu, &g));
+        cpu.add_sigmoid_scaled(&mut xb, &yb, &gb, rows, width).unwrap();
+        download(&cpu, &xb, rows * width)
+    });
+    let got = run(&|| {
+        let (mut xb, yb, gb) = (upload(&gpu, &x), upload(&gpu, &y), upload_any(&gpu, &g));
+        gpu.add_sigmoid_scaled(&mut xb, &yb, &gb, rows, width).unwrap();
+        download(&gpu, &xb, rows * width)
+    });
+    assert_close("add_sigmoid_scaled", &want, &got, 1e-5);
+}
+
+/// Float weights with few rows in prefill (the `skinny_*` kernels).
+#[test]
+fn matmul_skinny_float() {
+    let Some(gpu) = gpu_backend() else { return };
+    let cpu = CpuBackend::new();
+    let mut rng = Rng(0x5c1e_77);
+    let k = 512;
+    for dtype in [DType::F32, DType::F16, DType::BF16] {
+        for n in [1, 32] {
+            let w = random_weight(&mut rng, dtype, n, k);
+            let (wc, wg) = (cpu.upload(&w).unwrap(), gpu.upload(&w).unwrap());
+            let m = 37;
+            let x = rng.vec(m * k);
+            let (xc, xg) = (upload(&cpu, &x), upload(&gpu, &x));
+            let (mut oc, mut og) = (cpu.alloc(m * n).unwrap(), gpu.alloc(m * n).unwrap());
+            cpu.matmul(&xc, &wc, &mut oc, m).unwrap();
+            gpu.matmul(&xg, &wg, &mut og, m).unwrap();
+            assert_close(&format!("skinny {dtype} n={n}"), &download(&cpu, &oc, m * n), &download(&gpu, &og, m * n), 1e-5);
         }
     }
 }

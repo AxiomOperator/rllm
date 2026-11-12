@@ -1,8 +1,11 @@
-//! Qwen3.5 / 3.6 / 3.8 dense hybrids (GGUF architecture `qwen35`).
+//! Qwen3.5 / 3.6 / 3.8 hybrids: dense (GGUF architecture `qwen35`) and
+//! mixture-of-experts (`qwen35moe`, e.g. Qwen3.6-35B-A3B).
 //!
 //! Three of every four layers are Gated DeltaNet (linear attention with a
 //! recurrent state per sequence); every fourth is gated full attention.
-//! Every layer has a SwiGLU MLP.
+//! Every layer has a SwiGLU MLP: dense, or (MoE) the top-k of `n_expert`
+//! routed experts (softmax router, weights renormalized over the chosen
+//! ones) plus a shared expert scaled by `sigmoid(x · w_gate)`.
 //!
 //! - **DeltaNet layer:** RMSNorm → `qkv` and `z` projections, `alpha` and
 //!   `beta` → causal conv (kernel 4) + SiLU over q|k|v → per head
@@ -32,7 +35,7 @@
 //! Recurrent state can't be rebuilt from cached KV, so prefix reuse is off.
 
 use anyhow::{Context, Result, bail, ensure};
-use rllm_core::{Activation, AttnMeta, Backend, GdnShape, HostTensor, KvLayout, KvType, SeqRuns};
+use rllm_core::{Activation, AttnMeta, Backend, GdnShape, HostTensor, KvLayout, KvType, MoeFfn, SeqRuns};
 use rllm_gguf::Gguf;
 
 use crate::loader::{
@@ -40,11 +43,28 @@ use crate::loader::{
 };
 use crate::{Batch, Model, MtpBatch, StepOut};
 
+/// The expert layout of a `qwen35moe` model.
+#[derive(Debug, Clone, Copy)]
+pub struct MoeConfig {
+    pub n_expert: usize,
+    /// Experts used per token.
+    pub n_used: usize,
+    /// Hidden width of one routed expert.
+    pub n_ff: usize,
+    /// Hidden width of the shared expert (0: none).
+    pub n_ff_shared: usize,
+    /// Multiplier on the routing weights.
+    pub scale: f32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Qwen35Config {
+    /// `qwen35` or `qwen35moe`.
+    pub arch: String,
     /// Decoder layers run in a forward pass (MTP blocks excluded).
     pub n_layers: usize,
     pub hidden: usize,
+    /// Dense MLP width (MoE: the shared expert's).
     pub ffn: usize,
     pub n_heads: usize,
     pub n_kv_heads: usize,
@@ -61,15 +81,17 @@ pub struct Qwen35Config {
     pub gdn: GdnShape,
     /// The file carries an MTP block (`blk.{n_layers}`).
     pub mtp: bool,
+    /// Routed experts (`qwen35moe`).
+    pub moe: Option<MoeConfig>,
 }
 
 impl Qwen35Config {
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
         let arch = g.get_str("general.architecture")?;
-        if arch != "qwen35" {
-            bail!("unsupported architecture {arch:?} (expected qwen35)");
+        if arch != "qwen35" && arch != "qwen35moe" {
+            bail!("unsupported architecture {arch:?} (expected qwen35 or qwen35moe)");
         }
-        let k = |s: &str| format!("qwen35.{s}");
+        let k = |s: &str| format!("{arch}.{s}");
         let dim = |s: &str| meta_usize(g, &k(s), MAX_DIM, false);
         let blocks = dim("block_count")?;
         let nextn = meta_usize_or(g, &k("nextn_predict_layers"), 0, 16, true)?;
@@ -103,10 +125,29 @@ impl Qwen35Config {
         let n_v_heads = dim("ssm.time_step_rank")?;
         let inner = dim("ssm.inner_size")?;
         ensure!(inner == n_v_heads * state, "ssm.inner_size {inner} is not time_step_rank {n_v_heads} x state_size {state}");
+        let moe = if arch == "qwen35moe" {
+            let n_expert = dim("expert_count")?;
+            let n_used = dim("expert_used_count")?;
+            let n_ff = dim("expert_feed_forward_length")?;
+            let n_ff_shared = meta_usize_or(g, &k("expert_shared_feed_forward_length"), 0, MAX_DIM, true)?;
+            // 0 (llama.cpp's default) means no scaling.
+            let scale = match g.get(&k("expert_weights_scale")).and_then(|v| v.as_f64()) {
+                Some(s) if s != 0.0 => s as f32,
+                _ => 1.0,
+            };
+            Some(MoeConfig { n_expert, n_used, n_ff, n_ff_shared, scale })
+        } else {
+            None
+        };
+        let ffn = match moe {
+            Some(m) => m.n_ff_shared,
+            None => dim("feed_forward_length")?,
+        };
         let cfg = Self {
+            arch: arch.to_string(),
             n_layers,
             hidden: dim("embedding_length")?,
-            ffn: dim("feed_forward_length")?,
+            ffn,
             n_heads: dim("attention.head_count")?,
             n_kv_heads: dim("attention.head_count_kv")?,
             head_dim,
@@ -119,6 +160,7 @@ impl Qwen35Config {
             conv_kernel: dim("ssm.conv_kernel")?,
             gdn: GdnShape { n_k_heads: dim("ssm.group_count")?, n_v_heads, head_dim: state },
             mtp: nextn > 0 && g.tensor(&format!("blk.{n_layers}.nextn.eh_proj.weight")).is_some(),
+            moe,
         };
         cfg.validate()?;
         cfg.check_tensors(g)?;
@@ -135,7 +177,44 @@ impl Qwen35Config {
         ensure!(c.recurrent.iter().any(|r| !r), "no full-attention layer");
         ensure!(c.n_layers <= 4096 && c.n_heads <= 4096 && c.head_dim <= 4096, "implausible model size: {c:?}");
         ensure!(c.rope_theta.is_finite() && c.rope_theta > 0.0 && c.rms_eps.is_finite() && c.rms_eps > 0.0, "invalid RoPE base or RMS epsilon");
+        if let Some(m) = c.moe {
+            ensure!(m.n_used >= 1 && m.n_used <= m.n_expert && m.n_used <= 32, "{} of {} experts per token not supported", m.n_used, m.n_expert);
+            ensure!(m.n_expert <= 1024, "{} experts not supported (at most 1024)", m.n_expert);
+            ensure!(m.scale.is_finite(), "invalid expert_weights_scale");
+        }
         Ok(())
+    }
+
+    /// GGUF names and dims (innermost first) of a decoder block's MLP tensors.
+    fn ffn_tensors(&self, g: &Gguf, p: &dyn Fn(&str) -> String) -> Vec<(String, Vec<usize>)> {
+        let d = self.hidden;
+        match self.moe {
+            None => vec![
+                (p("ffn_gate.weight"), vec![d, self.ffn]),
+                (p("ffn_up.weight"), vec![d, self.ffn]),
+                (p("ffn_down.weight"), vec![self.ffn, d]),
+            ],
+            Some(m) => {
+                let (e, f) = (m.n_expert, m.n_ff);
+                let mut v = vec![(p("ffn_gate_inp.weight"), vec![d, e]), (p("ffn_down_exps.weight"), vec![f, d, e])];
+                if g.tensor(&p("ffn_gate_up_exps.weight")).is_some() {
+                    v.push((p("ffn_gate_up_exps.weight"), vec![d, 2 * f, e]));
+                } else {
+                    v.push((p("ffn_gate_exps.weight"), vec![d, f, e]));
+                    v.push((p("ffn_up_exps.weight"), vec![d, f, e]));
+                }
+                if m.n_ff_shared > 0 {
+                    let s = m.n_ff_shared;
+                    v.extend([
+                        (p("ffn_gate_inp_shexp.weight"), vec![d]),
+                        (p("ffn_gate_shexp.weight"), vec![d, s]),
+                        (p("ffn_up_shexp.weight"), vec![d, s]),
+                        (p("ffn_down_shexp.weight"), vec![s, d]),
+                    ]);
+                }
+                v
+            }
+        }
     }
 
     fn check_tensors(&self, g: &Gguf) -> Result<()> {
@@ -148,13 +227,8 @@ impl Qwen35Config {
         check_shape_opt(g, "output.weight", &[d, c.vocab])?;
         for (i, &rec) in c.recurrent.iter().enumerate() {
             let p = |s: &str| format!("blk.{i}.{s}");
-            let mut want: Vec<(String, Vec<usize>)> = vec![
-                (p("attn_norm.weight"), vec![d]),
-                (p("post_attention_norm.weight"), vec![d]),
-                (p("ffn_gate.weight"), vec![d, c.ffn]),
-                (p("ffn_up.weight"), vec![d, c.ffn]),
-                (p("ffn_down.weight"), vec![c.ffn, d]),
-            ];
+            let mut want: Vec<(String, Vec<usize>)> = vec![(p("attn_norm.weight"), vec![d]), (p("post_attention_norm.weight"), vec![d])];
+            want.extend(c.ffn_tensors(g, &p));
             if rec {
                 let hv = c.gdn.n_v_heads;
                 want.extend([
@@ -196,10 +270,10 @@ impl Qwen35Config {
                 (p("attn_output.weight"), vec![qw, d]),
                 (p("attn_q_norm.weight"), vec![hd]),
                 (p("attn_k_norm.weight"), vec![hd]),
-                (p("ffn_gate.weight"), vec![d, c.ffn]),
-                (p("ffn_up.weight"), vec![d, c.ffn]),
-                (p("ffn_down.weight"), vec![c.ffn, d]),
-            ] {
+            ]
+            .into_iter()
+            .chain(c.ffn_tensors(g, &p))
+            {
                 check_shape(g, &name, &dims)?;
             }
             check_shape_opt(g, &p("nextn.shared_head_norm.weight"), &[d])?;
@@ -234,6 +308,16 @@ impl Qwen35Config {
         4 * (conv + ssm) * self.n_recurrent_layers()
     }
 
+    /// MoE activation memory per token of a step: router logits, and per
+    /// (token, expert) pair the expert's hidden row (f32 and int8) and its
+    /// output row, plus the routing indices (see the GPU `moe_ffn`).
+    pub fn moe_bytes_per_token(&self) -> usize {
+        match self.moe {
+            Some(m) => 4 * m.n_expert + m.n_used * (5 * m.n_ff + 4 * self.hidden + 32),
+            None => 0,
+        }
+    }
+
     /// Where head dim `j` of the reordered Q/K comes from (see the module docs).
     fn dim_order(&self) -> Vec<usize> {
         let (d, half, r2) = (self.head_dim, self.head_dim / 2, self.n_rot / 2);
@@ -260,6 +344,28 @@ impl Qwen35Config {
 
 struct Ffn<B: Backend> {
     post_norm: B::Weight,
+    kind: FfnKind<B>,
+}
+
+enum FfnKind<B: Backend> {
+    Dense {
+        gate: B::Weight,
+        up: B::Weight,
+        down: B::Weight,
+    },
+    Moe {
+        router: B::Weight,
+        /// Stacked experts (see [`MoeFfn`]).
+        gate: B::Weight,
+        up: B::Weight,
+        down: B::Weight,
+        shared: Option<SharedExpert<B>>,
+    },
+}
+
+struct SharedExpert<B: Backend> {
+    /// `[1, hidden]`: the shared expert's gate logit.
+    gate_inp: B::Weight,
     gate: B::Weight,
     up: B::Weight,
     down: B::Weight,
@@ -393,12 +499,34 @@ impl<B: Backend> Qwen35<B> {
             })
         };
         let ffn = |p: &dyn Fn(&str) -> String| -> Result<Ffn<B>> {
-            Ok(Ffn {
-                post_norm: w(&p("post_attention_norm.weight"))?,
-                gate: w(&p("ffn_gate.weight"))?,
-                up: w(&p("ffn_up.weight"))?,
-                down: w(&p("ffn_down.weight"))?,
-            })
+            let kind = match cfg.moe {
+                None => FfnKind::Dense { gate: w(&p("ffn_gate.weight"))?, up: w(&p("ffn_up.weight"))?, down: w(&p("ffn_down.weight"))? },
+                Some(m) => {
+                    let (gate, up) = if g.tensor(&p("ffn_gate_up_exps.weight")).is_some() {
+                        // Per expert: n_ff gate rows, then n_ff up rows.
+                        let f = m.n_ff;
+                        let rows = |off: usize| -> Vec<usize> { (0..m.n_expert).flat_map(|e| (0..f).map(move |r| e * 2 * f + off + r)).collect() };
+                        let name = p("ffn_gate_up_exps.weight");
+                        (load_weight_rows(backend, g, &name, &rows(0))?, load_weight_rows(backend, g, &name, &rows(f))?)
+                    } else {
+                        (w(&p("ffn_gate_exps.weight"))?, w(&p("ffn_up_exps.weight"))?)
+                    };
+                    let shared = if m.n_ff_shared > 0 {
+                        let gi = p("ffn_gate_inp_shexp.weight");
+                        let v = read_vector(g, &gi)?;
+                        Some(SharedExpert {
+                            gate_inp: backend.upload(&HostTensor::from_f32(&gi, vec![1, v.len()], &v)).with_context(|| format!("uploading {gi}"))?,
+                            gate: w(&p("ffn_gate_shexp.weight"))?,
+                            up: w(&p("ffn_up_shexp.weight"))?,
+                            down: w(&p("ffn_down_shexp.weight"))?,
+                        })
+                    } else {
+                        None
+                    };
+                    FfnKind::Moe { router: w(&p("ffn_gate_inp.weight"))?, gate, up, down: w(&p("ffn_down_exps.weight"))?, shared }
+                }
+            };
+            Ok(Ffn { post_norm: w(&p("post_attention_norm.weight"))?, kind })
         };
         let (mut n_attn, mut n_rec) = (0, 0);
         let layers = (0..cfg.n_layers)
@@ -498,8 +626,6 @@ impl<B: Backend> Qwen35<B> {
         let mut a3 = b.alloc(n * kvw.max(hv).max(conv_w))?;
         let mut a4 = b.alloc(n * kvw.max(hv))?;
         let mut a5 = b.alloc(n * qw.max(inner))?;
-        let mut gate = b.alloc(n * c.ffn)?;
-        let mut up = b.alloc(n * c.ffn)?;
 
         let meta = AttnMeta {
             n_heads: c.n_heads,
@@ -548,7 +674,7 @@ impl<B: Backend> Qwen35<B> {
                 }
             }
             b.add_rms_norm(&mut x, &o, &l.ffn.post_norm, &mut h, n, d, c.rms_eps)?;
-            b.gated_ffn(&h, &l.ffn.gate, &l.ffn.up, &l.ffn.down, Activation::Silu, &mut o, &mut gate, &mut up, n, c.ffn)?;
+            self.run_ffn(b, &l.ffn.kind, &h, &mut o, n)?;
             match self.layers.get(li + 1) {
                 Some(next) => b.add_rms_norm(&mut x, &o, &next.attn_norm, &mut h, n, d, c.rms_eps)?,
                 None => b.add(&mut x, &o, n * d)?,
@@ -596,6 +722,39 @@ impl<B: Backend> Qwen35<B> {
 }
 
 impl<B: Backend> Qwen35<B> {
+    /// `out = MLP(h)` over `n` rows (dense, or routed experts plus the gated shared expert).
+    fn run_ffn(&self, b: &B, f: &FfnKind<B>, h: &B::Buffer, out: &mut B::Buffer, n: usize) -> Result<()> {
+        let c = &self.cfg;
+        let d = c.hidden;
+        match f {
+            FfnKind::Dense { gate, up, down } => {
+                let (mut g, mut u) = (b.alloc(n * c.ffn)?, b.alloc(n * c.ffn)?);
+                b.gated_ffn(h, gate, up, down, Activation::Silu, out, &mut g, &mut u, n, c.ffn)?;
+            }
+            FfnKind::Moe { router, gate, up, down, shared } => {
+                let m = c.moe.expect("MoE layers only in MoE models");
+                let mut logits = b.alloc(n * m.n_expert)?;
+                let mut sg = b.alloc(n)?;
+                match shared {
+                    Some(s) => b.matmul_many(h, &[router, &s.gate_inp], &mut [&mut logits, &mut sg], n)?,
+                    None => b.matmul(h, router, &mut logits, n)?,
+                }
+                let moe = MoeFfn { gate, up, down, n_expert: m.n_expert, n_used: m.n_used, n_ff: m.n_ff, norm_topk: true, scale: m.scale };
+                let so = match shared {
+                    Some(s) => {
+                        let f = m.n_ff_shared;
+                        let (mut g, mut u, mut so) = (b.alloc(n * f)?, b.alloc(n * f)?, b.alloc(n * d)?);
+                        b.gated_ffn(h, &s.gate, &s.up, &s.down, Activation::Silu, &mut so, &mut g, &mut u, n, f)?;
+                        Some(so)
+                    }
+                    None => None,
+                };
+                b.moe_ffn(h, &logits, &moe, so.as_ref().map(|so| (so, &sg)), out, n)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn has_mtp(&self) -> bool {
         self.mtp.is_some()
     }
@@ -731,8 +890,7 @@ impl<B: Backend> Qwen35<B> {
         b.matmul(&att, wo, &mut o, n)?;
         let ffn = &mtp.layer.ffn;
         b.add_rms_norm(&mut xm, &o, &ffn.post_norm, &mut h, n, d, c.rms_eps)?;
-        let (mut gate, mut up) = (b.alloc(n * c.ffn)?, b.alloc(n * c.ffn)?);
-        b.gated_ffn(&h, &ffn.gate, &ffn.up, &ffn.down, Activation::Silu, &mut o, &mut gate, &mut up, n, c.ffn)?;
+        self.run_ffn(b, &ffn.kind, &h, &mut o, n)?;
         b.add(&mut xm, &o, n * d)?;
         let mut hh = b.alloc(n * d)?;
         b.rms_norm(&xm, &mtp.head_norm, &mut hh, n, c.rms_eps)?;
@@ -812,8 +970,13 @@ impl<B: Backend> Model<B> for Qwen35<B> {
 
     fn summary(&self) -> String {
         let c = &self.cfg;
+        let experts = match c.moe {
+            Some(m) => format!(", {} experts (top {}) of {}{}", m.n_expert, m.n_used, m.n_ff, if m.n_ff_shared > 0 { " + shared" } else { "" }),
+            None => String::new(),
+        };
         format!(
-            "qwen35: {} layers ({} Gated DeltaNet, {} attention), hidden {}, {} heads / {} kv",
+            "{}: {} layers ({} Gated DeltaNet, {} attention), hidden {}, {} heads / {} kv{experts}",
+            c.arch,
             c.n_layers,
             c.n_recurrent_layers(),
             c.n_attn_layers(),
@@ -845,6 +1008,8 @@ mod tests {
             conv_kernel: 4,
             gdn: GdnShape { n_k_heads: 1, n_v_heads: 2, head_dim: 4 },
             mtp: false,
+            moe: None,
+            arch: "qwen35".into(),
         }
     }
 

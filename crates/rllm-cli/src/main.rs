@@ -88,6 +88,19 @@ enum Cmd {
         /// Qwen3.5 files that carry one) for speculative decoding.
         #[arg(long)]
         no_mtp: bool,
+        /// Make each request's output independent of what it is batched with:
+        /// every step is either up to 8 decode tokens (whose per-token results
+        /// don't depend on the rest of the step) or a single request's prompt
+        /// chunk, so concurrent requests produce exactly what they would alone
+        /// (and greedy output with and without speculation matches under
+        /// load). Costs throughput under concurrent load; caps --parallel at 8
+        /// and turns the prefix cache off. On by default for Qwen3.5 hybrids
+        /// (which have no prefix cache anyway).
+        #[arg(long, conflicts_with = "no_batch_invariant")]
+        batch_invariant: bool,
+        /// Turn batch-invariant scheduling off where it is on by default.
+        #[arg(long)]
+        no_batch_invariant: bool,
         /// Keep evicted prefix-cache blocks in this much pinned system memory
         /// (GiB) and copy them back on a hit instead of recomputing.
         #[arg(long, default_value_t = 0.0)]
@@ -351,7 +364,30 @@ fn check_args(cmd: &Cmd) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+fn main() {
+    let code = match real_main() {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            1
+        }
+    };
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // Skip the C runtime's exit handlers: once a HIP allocation has failed
+    // (even one rllm recovered from, such as `tune --measure` or MTP
+    // snapshots not fitting), ROCm's own teardown crashes: a segfault inside
+    // libamdhip64's atexit destructors, after rllm has freed everything.
+    // Output is flushed above; nothing else needs those handlers.
+    unsafe extern "C" {
+        fn _exit(code: i32) -> !;
+    }
+    // SAFETY: plain process exit; nothing runs after it.
+    unsafe { _exit(code) }
+}
+
+fn real_main() -> Result<()> {
     let cmd = Cli::parse().cmd;
     check_args(&cmd)?;
     match cmd {
@@ -380,6 +416,8 @@ fn main() -> Result<()> {
             draft_tokens,
             prompt_lookup,
             no_mtp,
+            batch_invariant,
+            no_batch_invariant,
             host_cache_gb,
             host_sampling,
             max_queue,
@@ -405,6 +443,7 @@ fn main() -> Result<()> {
                 draft_tokens,
                 prompt_lookup,
                 mtp: !no_mtp,
+                batch_invariant: if batch_invariant { Some(true) } else if no_batch_invariant { Some(false) } else { None },
                 host_cache_bytes: (host_cache_gb.max(0.0) * (1u64 << 30) as f64) as usize,
                 host_sampling,
                 max_queue,

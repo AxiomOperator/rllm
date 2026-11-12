@@ -94,7 +94,7 @@ fn verification_steps_match_single_steps() {
             .zip(batched.chunks_exact(vocab))
             .filter(|(a, b)| rllm_model::sampler::argmax(a) == rllm_model::sampler::argmax(b))
             .count();
-        if matches!(g.get_str("general.architecture").unwrap(), "qwen3" | "llama" | "qwen35") {
+        if matches!(g.get_str("general.architecture").unwrap(), "qwen3" | "llama" | "qwen35" | "qwen35moe") {
             assert_eq!(diff, 0, "{kv}: {diff} of {} logits differ", singles.len());
         } else {
             // (Random tokens: near-ties may flip, so only the size is checked.)

@@ -273,6 +273,11 @@ pub struct EngineConfig {
     pub prompt_lookup: bool,
     /// Speculative decoding with the model's own MTP head (when it has one).
     pub mtp: bool,
+    /// Batch-invariant scheduling: a step is either decode tokens only (at
+    /// most INVARIANT_MAX_TOKENS, where every token's logits are computed the
+    /// same as in a step of its own) or one sequence's prompt chunk, never a
+    /// mix. Each request's output then doesn't depend on concurrent load.
+    pub batch_invariant: bool,
     /// Pinned system memory for the prefix cache's host tier, in bytes (0: none).
     pub host_cache_bytes: usize,
     /// Sample every token on the host from full logits rows, instead of on
@@ -284,6 +289,10 @@ pub struct EngineConfig {
 }
 
 pub const BLOCK_SIZE: usize = 16;
+
+/// Most tokens in a decode step under `batch_invariant`: GPU steps up to 8
+/// tokens run each token through the same matvec kernels as a 1-token step.
+pub const INVARIANT_MAX_TOKENS: usize = 8;
 
 /// Most tokens in a step that verifies drafts. Up to 8 tokens a step stays
 /// on the matvec kernels and in a CUDA graph; beyond that the main model's
@@ -620,6 +629,9 @@ struct Scheduler<'a, 'm, B: Backend> {
     running: Vec<Seq>,
     admissions: u64,
     timing: StepTiming,
+    /// `batch_invariant`: the last step was a prompt chunk (the next one
+    /// decodes, if anything is decoding).
+    invariant_last_prefill: bool,
 }
 
 /// Where step time goes (`RLLM_ENGINE_TIMING=1` prints it every 256 steps).
@@ -682,6 +694,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             embeds: VecDeque::new(),
             running: Vec::new(),
             admissions: 0,
+            invariant_last_prefill: false,
             timing: StepTiming { enabled: std::env::var_os("RLLM_ENGINE_TIMING").is_some(), ..StepTiming::default() },
         }
     }
@@ -901,6 +914,37 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         if self.mtp_drafts > 0 { self.mtp_drafts } else { self.cfg.draft_tokens }
     }
 
+    /// `batch_invariant`: keep either the decode tokens (up to
+    /// INVARIANT_MAX_TOKENS, oldest sequences first) or the first prompt
+    /// chunk, alternating when both are waiting.
+    fn invariant_plan(&mut self, takes: &mut [usize], spec: &mut [usize]) {
+        let prefill = (0..takes.len()).find(|&i| takes[i] > 0 && self.running[i].todo().len() > 1);
+        let decoding = (0..takes.len()).any(|i| self.running[i].todo().len() == 1);
+        let prefill_turn = prefill.is_some() && (!decoding || !self.invariant_last_prefill);
+        if prefill_turn {
+            let p = prefill.expect("checked");
+            for (i, t) in takes.iter_mut().enumerate() {
+                if i != p {
+                    *t = 0;
+                    spec[i] = 0;
+                }
+            }
+        } else {
+            let mut left = INVARIANT_MAX_TOKENS;
+            for i in 0..takes.len() {
+                if self.running[i].todo().len() != 1 || left == 0 {
+                    takes[i] = 0;
+                    spec[i] = 0;
+                    continue;
+                }
+                spec[i] = spec[i].min(left - 1);
+                takes[i] = 1 + spec[i];
+                left -= takes[i];
+            }
+        }
+        self.invariant_last_prefill = prefill_turn;
+    }
+
     /// Plan, run and sample one batched forward pass.
     fn step(&mut self) -> Result<()> {
         let t_start = Instant::now();
@@ -929,6 +973,9 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                     }
                 })
                 .collect();
+            if self.cfg.batch_invariant {
+                self.invariant_plan(&mut takes, &mut spec);
+            }
             let need: usize = self.running.iter().zip(&takes).map(|(s, &t)| s.kv.blocks_needed(BLOCK_SIZE, t)).sum();
             if self.cache.make_room(&mut self.pool, need) {
                 break;

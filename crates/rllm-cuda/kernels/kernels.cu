@@ -766,6 +766,37 @@ __device__ void embed(const u8* __restrict__ qs, const u8* __restrict__ qh, cons
                        t.qh_row, t.sc_row);                                                                   \
     }
 
+// Prefill matmul for float weights with few rows (Gated DeltaNet's alpha /
+// beta, a shared expert's gate; cuBLAS handles them poorly): one warp per
+// (token, row), blocks of 4 tokens x one row.
+template <int F>
+__device__ void skinny_f(const u8* __restrict__ w, const float* __restrict__ x, float* __restrict__ out, int n, int k,
+                         int m, long row_bytes) {
+    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const int r = blockIdx.x, t = blockIdx.y * (blockDim.x / WARP_SIZE) + warp;
+    if (t >= m) return;
+    const u8* row = w + (long)r * row_bytes;
+    const float* xr = x + (long)t * k;
+    float acc = 0.f, y[8];
+    for (int c = lane; c < k / 8; c += WARP_SIZE) {
+        load8<F>(row, c, y);
+        const float4* xp = (const float4*)(xr + c * 8);
+        float4 a = xp[0], b = xp[1];
+        acc += y[0] * a.x + y[1] * a.y + y[2] * a.z + y[3] * a.w + y[4] * b.x + y[5] * b.y + y[6] * b.z + y[7] * b.w;
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) out[(long)t * n + r] = acc;
+}
+
+#define INSTANTIATE_SKINNY(NAME, F)                                                                           \
+    extern "C" __global__ void skinny_##NAME(const u8* w, const float* x, float* out, int n, int k, int m,     \
+                                             long row_bytes) {                                                \
+        skinny_f<F>(w, x, out, n, k, m, row_bytes);                                                           \
+    }
+INSTANTIATE_SKINNY(f32, FMT_F32)
+INSTANTIATE_SKINNY(f16, FMT_F16)
+INSTANTIATE_SKINNY(bf16, FMT_BF16)
+
 INSTANTIATE_FLOAT(f32, FMT_F32)
 INSTANTIATE_FLOAT(f16, FMT_F16)
 INSTANTIATE_FLOAT(bf16, FMT_BF16)
@@ -774,6 +805,189 @@ INSTANTIATE_QUANT(q4, FMT_Q4)
 INSTANTIATE_QUANT(q6, FMT_Q6)
 INSTANTIATE_QUANT(q5, FMT_Q5)
 INSTANTIATE_QUANT(iq4, FMT_IQ4)
+
+// ---------------------------------------------------------------------------
+// Mixture of experts (see moe_ffn in backend.rs). A (token, slot) pair p
+// uses expert ids[p]; its input is row p / in_div of the int8 activations
+// (in_div = experts per token for the expert inputs, 1 for per-pair rows).
+// Experts are stacked along the weight rows: expert e is rows e * n...
+
+// Routing, one warp per token: softmax over the ne logits, the k largest
+// (ties to the lower index), renormalized to sum 1 (sum clamped at 2^-14)
+// if norm, times scale. As rllm_core::moe_route.
+#define MOE_MAX_EXPERTS 1024
+extern "C" __global__ void moe_route(const float* __restrict__ logits, int m, int ne, int k, int norm, float scale,
+                                     int* __restrict__ ids, float* __restrict__ wts) {
+    const int t = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    if (t >= m) return;  // whole warps
+    const float* l = logits + (long)t * ne;
+    // Lane holds experts lane + 32 i (ne <= 1024), in registers: the k
+    // selection passes below never touch memory.
+    float v[MOE_MAX_EXPERTS / WARP_SIZE];
+    float mx = NEG_INF;
+#pragma unroll
+    for (int i = 0; i < MOE_MAX_EXPERTS / WARP_SIZE; i++) {
+        const int e = lane + i * WARP_SIZE;
+        v[i] = e < ne ? l[e] : NEG_INF;
+        mx = fmaxf(mx, v[i]);
+    }
+    mx = warp_max(mx);
+    float sum = 0.f;
+#pragma unroll
+    for (int i = 0; i < MOE_MAX_EXPERTS / WARP_SIZE; i++)
+        if (lane + i * WARP_SIZE < ne) sum += expf(v[i] - mx);
+    sum = warp_sum(sum);
+    u32 taken = 0;  // bit i: expert lane + 32 i already chosen
+    float total = 0.f, my_w = 0.f;
+    int my_id = 0;
+    for (int j = 0; j < k; j++) {
+        float bv = NEG_INF;
+        int be = 0x7fffffff;
+#pragma unroll
+        for (int i = 0; i < MOE_MAX_EXPERTS / WARP_SIZE; i++) {
+            const int e = lane + i * WARP_SIZE;
+            if (e < ne && !((taken >> i) & 1) && (v[i] > bv || be == 0x7fffffff)) bv = v[i], be = e;
+        }
+        for (int o = WARP_SIZE / 2; o > 0; o >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffff, bv, o);
+            int oe = __shfl_xor_sync(0xffffffff, be, o);
+            if (ov > bv || (ov == bv && oe < be)) bv = ov, be = oe;
+        }
+        if (be % WARP_SIZE == lane) taken |= 1u << (be / WARP_SIZE);
+        const float w = expf(bv - mx) / sum;
+        total += w;
+        if (lane == j) my_w = w, my_id = be;  // lane j writes slot j (k <= 32)
+    }
+    const float div = norm ? fmaxf(total, 6.103515625e-5f) : 1.f;
+    if (lane < k) {
+        ids[(long)t * k + lane] = my_id;
+        wts[(long)t * k + lane] = my_w / div * scale;
+    }
+}
+
+// Expert gate/up + SiLU for decode: block (32-row unit, pair). Writes
+// silu(x . gate_r) * (x . up_r) for the unit's rows as pair p's hidden row
+// (f32 if write_out, and int8 for the down projection).
+template <int F>
+__device__ void moe_matvec_glu(const MvTarget& g, const MvTarget& u, const int* __restrict__ ids,
+                               const i8* __restrict__ xq, const float* __restrict__ xd, int k, int n_ff, int in_div,
+                               QOut qo, float* __restrict__ out, int write_out) {
+    __shared__ float v[WARP_SIZE];
+    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const int p = blockIdx.y;
+    const long r = (long)ids[p] * n_ff + (long)blockIdx.x * WARP_SIZE + warp;
+    const long t = p / in_div;
+    const i8* xr = xq + t * k;
+    const float* dr = xd + t * (k / 32);
+    float ag[MV_MAX_M], au[MV_MAX_M];
+#pragma unroll
+    for (int j = 0; j < MV_MAX_M; j++) ag[j] = au[j] = 0.f;
+    mv_dot<F>(g.qs + r * g.qs_row, g.qh + r * g.qh_row, g.sc + r * g.sc_row, xr, dr, k, 1, lane, WARP_SIZE, ag);
+    mv_dot<F>(u.qs + r * u.qs_row, u.qh + r * u.qh_row, u.sc + r * u.sc_row, xr, dr, k, 1, lane, WARP_SIZE, au);
+    const float gs = warp_sum(ag[0]), us = warp_sum(au[0]);
+    if (lane == 0) v[warp] = gs / (1.f + __expf(-gs)) * us;
+    __syncthreads();
+    if (warp == 0) {
+        const float val = v[lane];
+        const long oi = (long)p * n_ff + (long)blockIdx.x * WARP_SIZE + lane;
+        if (write_out) out[oi] = val;
+        if (qo.on) quant_unit(val, oi / 32, qo);
+    }
+}
+
+// One expert projection for decode: block (MATVEC rows, pair); pair p's
+// output row (n wide) is x_row . W_e^T.
+template <int F>
+__device__ void moe_matvec(const MvTarget& w, const int* __restrict__ ids, const i8* __restrict__ xq,
+                           const float* __restrict__ xd, int k, int n, int in_div, float* __restrict__ out) {
+    const int p = blockIdx.y;
+    const long e = ids[p], t = p / in_div;
+    matvec_q<F, 1>(blockIdx.x, w.qs + e * n * w.qs_row, w.qh + e * n * w.qh_row, w.sc + e * n * w.sc_row,
+                   xq + t * k, xd + t * (k / 32), out + (long)p * n, n, k, 1, w.qs_row, w.qh_row, w.sc_row);
+}
+
+#define INSTANTIATE_MOE(NAME, F)                                                                              \
+    extern "C" __global__ void __launch_bounds__(1024)                                                        \
+        moe_matvec_glu_##NAME(MvTarget g, MvTarget u, const int* ids, const i8* xq, const float* xd, int k,   \
+                              int n_ff, int in_div, QOut qo, float* out, int write_out) {                     \
+        moe_matvec_glu<F>(g, u, ids, xq, xd, k, n_ff, in_div, qo, out, write_out);                            \
+    }                                                                                                         \
+    extern "C" __global__ void moe_matvec_##NAME(MvTarget w, const int* ids, const i8* xq, const float* xd,   \
+                                                 int k, int n, int in_div, float* out) {                      \
+        moe_matvec<F>(w, ids, xq, xd, k, n, in_div, out);                                                     \
+    }
+INSTANTIATE_MOE(q8, FMT_Q8)
+INSTANTIATE_MOE(q4, FMT_Q4)
+INSTANTIATE_MOE(q6, FMT_Q6)
+INSTANTIATE_MOE(q5, FMT_Q5)
+INSTANTIATE_MOE(iq4, FMT_IQ4)
+
+// Prefill grouping. counts (zeroed) += pairs per expert.
+extern "C" __global__ void moe_count(const int* __restrict__ ids, int n_pairs, int* __restrict__ counts) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < n_pairs) atomicAdd(counts + ids[p], 1);
+}
+
+// One thread: offsets[e] (exclusive scan of counts), cursor[e] = 0, and the
+// MMQ tiles of tile_rows pairs within each expert's run: tiles[0] = count,
+// then (expert, first, end) per tile.
+extern "C" __global__ void moe_scan(const int* __restrict__ counts, int ne, int tile_rows, int* __restrict__ offsets,
+                                    int* __restrict__ cursor, int* __restrict__ tiles) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    int off = 0, nt = 0;
+    for (int e = 0; e < ne; e++) {
+        const int c = counts[e];
+        offsets[e] = off;
+        cursor[e] = 0;
+        for (int q = 0; q < c; q += tile_rows) {
+            int* t = tiles + 1 + 3 * nt++;
+            t[0] = e;
+            t[1] = off + q;
+            t[2] = off + c;
+        }
+        off += c;
+    }
+    tiles[0] = nt;
+}
+
+// pos[p] = pair p's row in expert order; rowmap[row] = its input row p / k.
+// (The order within an expert depends on atomics, which only moves rows
+// around: each output row is computed the same way wherever it sits.)
+extern "C" __global__ void moe_place(const int* __restrict__ ids, int n_pairs, int k, const int* __restrict__ offsets,
+                                     int* __restrict__ cursor, int* __restrict__ pos, int* __restrict__ rowmap) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n_pairs) return;
+    const int e = ids[p];
+    const int q = offsets[e] + atomicAdd(cursor + e, 1);
+    pos[p] = q;
+    rowmap[q] = p / k;
+}
+
+// out[t, :] = sum_j wts[t, j] * y[row(t k + j), :] (row = pos[.] or the pair
+// itself), summed in slot order; then, with a shared expert (sh non-null),
+// + sigmoid(sg[t]) * sh[t, :].
+extern "C" __global__ void moe_combine(const float* __restrict__ y, const float* __restrict__ wts,
+                                       const int* __restrict__ pos, float* __restrict__ out, int m, int k, int d,
+                                       const float* __restrict__ sh, const float* __restrict__ sg) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)m * d) return;
+    const long t = i / d, c = i % d;
+    float s = 0.f;
+    for (int j = 0; j < k; j++) {
+        const long p = t * k + j, r = pos ? pos[p] : p;
+        s += wts[p] * y[r * d + c];
+    }
+    if (sh) s += sh[i] / (1.f + expf(-sg[t]));
+    out[i] = s;
+}
+
+// x[r, :] += sigmoid(g[r]) * y[r, :] (gated shared expert).
+extern "C" __global__ void add_sigmoid_scaled(float* __restrict__ x, const float* __restrict__ y,
+                                              const float* __restrict__ g, int width, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] += y[i] / (1.f + expf(-g[i / width]));
+}
 
 // ---------------------------------------------------------------------------
 // Elementwise and normalization
@@ -2546,12 +2760,17 @@ __device__ __forceinline__ float i2f_small(int i) {
     return (float)i;
 }
 
-template <int F, bool GLU, int ACT>
+// ID (mixture of experts, grouped by expert): blockIdx.x is a tile of
+// `tiles` (tiles[0] = count, then per tile: expert, first row, end row of the
+// expert-sorted activations). The weights are expert e's n rows (rows
+// e * n.. of the stacked tensor); activation row q of the tile is row
+// rowmap[q] of xq (rowmap null: row q), and the output goes to row q.
+template <int F, bool GLU, int ACT, bool ID = false>
 __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const u8* __restrict__ sc,
                     const i8* __restrict__ xq, const float* __restrict__ xd, const float* __restrict__ xs,
                     float* __restrict__ out, float* __restrict__ part, int n, int k, int m, long qs_row,
                     long qh_row, long sc_row, const u8* __restrict__ qs2, const u8* __restrict__ qh2, const u8* __restrict__ sc2, QOut qo,
-                    int write_out) {
+                    int write_out, const int* __restrict__ tiles = nullptr, const int* __restrict__ rowmap = nullptr) {
     // One buffer, so the GLU epilogue can reuse all of it. Am and Bsum are
     // Q4-only; leaving them out keeps Q8/Q6 at 32 KB (3 blocks per SM).
     constexpr int A_BYTES = MMQ_BM * MMQ_STRIDE, B_BYTES = MMQ_BN * MMQ_STRIDE;
@@ -2569,7 +2788,23 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
     const int units = k / 32;
     // Token tiles vary fastest (blockIdx.x) so the blocks sharing a weight
     // tile run together and fetch it from DRAM about once.
-    const int r0 = blockIdx.y * (GLU ? MMQ_BM / 2 : MMQ_BM), c0 = blockIdx.x * MMQ_BN;
+    const int r0 = blockIdx.y * (GLU ? MMQ_BM / 2 : MMQ_BM);
+    int c0 = blockIdx.x * MMQ_BN;
+    if (ID) {
+        if ((int)blockIdx.x >= tiles[0]) return;  // whole block: before any barrier
+        const int* t = tiles + 1 + 3 * blockIdx.x;
+        const long e = t[0];
+        c0 = t[1];
+        m = t[2];
+        qs += e * n * qs_row;
+        qh += e * n * qh_row;
+        sc += e * n * sc_row;
+        if (GLU) {
+            qs2 += e * n * qs_row;
+            qh2 += e * n * qh_row;
+            sc2 += e * n * sc_row;
+        }
+    }
     const int splits = gridDim.z;
     const int per_split = ((units + splits - 1) / splits + MMQ_CU - 1) / MMQ_CU * MMQ_CU;
     const int u_beg = blockIdx.z * per_split, u_end = min(units, u_beg + per_split);
@@ -2653,14 +2888,18 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
                 if (HAS_MIN(F)) Bsum[ul][c] = 0.f;
                 continue;
             }
-            const int4* src = (const int4*)(xq + (long)tok * k + u * 32);
+            const long row = ID && rowmap ? rowmap[tok] : tok;
+            const int4* src = (const int4*)(xq + row * k + u * 32);
             *(int4*)dst = src[0];
             *(int4*)(dst + 16) = src[1];
-            Bd[ul][c] = xd[(long)tok * units + u];
-            if (HAS_MIN(F)) Bsum[ul][c] = xs[(long)tok * units + u];
+            Bd[ul][c] = xd[row * units + u];
+            if (HAS_MIN(F)) Bsum[ul][c] = xs[row * units + u];
         }
         __syncthreads();
 
+        // ID tiles are often less than half full: a warp whose 32 tokens are
+        // all past the end skips the math (barriers stay outside).
+        if (!ID || c0 + wn * 32 < m) {
 #ifdef RLLM_HIP
         for (int ul = 0; ul < cu; ul++) {
             // WMMA fragments: lane l holds row (A) or token (B) l%16 and 16
@@ -2792,6 +3031,7 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
             }
         }
 #endif
+        }  // active
         __syncthreads();
     }
 
@@ -2914,6 +3154,20 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
         const u8* sc2, QOut qo, int write_out) {                                                               \
         mmq<F, true, 1>(qs, qh, sc, xq, xd, xs, out, nullptr, n, k, m, qs_row, qh_row, sc_row, qs2, qh2, sc2, qo,       \
                         write_out);                                                                            \
+    }                                                                                                          \
+    extern "C" __global__ void mmq_id_##NAME(const u8* qs, const u8* qh, const u8* sc, const i8* xq,           \
+                                             const float* xd, const float* xs, float* out, int n, int k,      \
+                                             long qs_row, long qh_row, long sc_row, const int* tiles,         \
+                                             const int* rowmap) {                                             \
+        mmq<F, false, 0, true>(qs, qh, sc, xq, xd, xs, out, nullptr, n, k, 0, qs_row, qh_row, sc_row, nullptr, \
+                               nullptr, nullptr, QOut{}, 0, tiles, rowmap);                                    \
+    }                                                                                                          \
+    extern "C" __global__ void mmq_id_glu_silu_##NAME(                                                         \
+        const u8* qs, const u8* qh, const u8* sc, const i8* xq, const float* xd, const float* xs, float* out,  \
+        int n, int k, long qs_row, long qh_row, long sc_row, const u8* qs2, const u8* qh2, const u8* sc2,      \
+        QOut qo, int write_out, const int* tiles, const int* rowmap) {                                         \
+        mmq<F, true, 0, true>(qs, qh, sc, xq, xd, xs, out, nullptr, n, k, 0, qs_row, qh_row, sc_row, qs2, qh2, \
+                              sc2, qo, write_out, tiles, rowmap);                                              \
     }
 INSTANTIATE_MMQ(q8, FMT_Q8)
 INSTANTIATE_MMQ(q4, FMT_Q4)
@@ -2927,6 +3181,9 @@ RLLM_STUB(mmq_glu_silu_q8) RLLM_STUB(mmq_glu_silu_q4) RLLM_STUB(mmq_glu_silu_q6)
 RLLM_STUB(mmq_glu_silu_q5) RLLM_STUB(mmq_glu_silu_iq4)
 RLLM_STUB(mmq_glu_gelu_q8) RLLM_STUB(mmq_glu_gelu_q4) RLLM_STUB(mmq_glu_gelu_q6)
 RLLM_STUB(mmq_glu_gelu_q5) RLLM_STUB(mmq_glu_gelu_iq4)
+RLLM_STUB(mmq_id_q8) RLLM_STUB(mmq_id_q4) RLLM_STUB(mmq_id_q6) RLLM_STUB(mmq_id_q5) RLLM_STUB(mmq_id_iq4)
+RLLM_STUB(mmq_id_glu_silu_q8) RLLM_STUB(mmq_id_glu_silu_q4) RLLM_STUB(mmq_id_glu_silu_q6)
+RLLM_STUB(mmq_id_glu_silu_q5) RLLM_STUB(mmq_id_glu_silu_iq4)
 #endif
 
 // out[i] = part[0][i] + part[1][i] + ... in split order (see mmq's split-K).
@@ -3204,6 +3461,7 @@ INSTANTIATE_AD(4, 256)
 INSTANTIATE_AD(6, 128)
 INSTANTIATE_AD(6, 256)
 INSTANTIATE_AD(8, 128)
+INSTANTIATE_AD(8, 256)
 INSTANTIATE_AD(4, 512)
 
 #ifndef RLLM_HIP

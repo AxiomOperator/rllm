@@ -86,6 +86,9 @@ pub struct ServeConfig {
     pub prompt_lookup: bool,
     /// Speculative decoding with the model's own MTP head, when it has one.
     pub mtp: bool,
+    /// Batch-invariant scheduling (see `EngineConfig::batch_invariant`);
+    /// `None`: on for models with recurrent layers (Qwen3.5), off otherwise.
+    pub batch_invariant: Option<bool>,
     /// Pinned system memory for the prefix cache's host tier (0: none).
     pub host_cache_bytes: usize,
     /// Sample on the host from full logits rows (see `EngineConfig::host_sampling`).
@@ -110,7 +113,12 @@ where
     let format = output::Format::detect(tok.chat_template().unwrap_or(""));
     let t0 = Instant::now();
     let vocab = Arc::new(engine::Vocab::build(&tok));
-    let parallel = cfg.parallel.max(1);
+    let batch_invariant = cfg.batch_invariant.unwrap_or_else(|| rllm_model::is_recurrent(&gguf));
+    let mut parallel = cfg.parallel.max(1);
+    if batch_invariant && parallel > engine::INVARIANT_MAX_TOKENS {
+        eprintln!("[rllm] --batch-invariant: --parallel {parallel} lowered to {}", engine::INVARIANT_MAX_TOKENS);
+        parallel = engine::INVARIANT_MAX_TOKENS;
+    }
     let kv_tokens = match cfg.kv_tokens {
         Some(n) => n,
         None => cfg.ctx.checked_mul(parallel).context("--ctx × --parallel overflows")?,
@@ -132,13 +140,14 @@ where
         prefill_chunk: cfg.prefill_chunk,
         parallel,
         kv_tokens,
-        prefix_cache: cfg.prefix_cache,
+        prefix_cache: cfg.prefix_cache && !batch_invariant,
         kv_type: cfg.kv_type,
         draft,
         draft_tokens: cfg.draft_tokens.max(1),
         prompt_lookup: cfg.prompt_lookup,
         mtp: cfg.mtp,
-        host_cache_bytes: if cfg.prefix_cache { cfg.host_cache_bytes } else { 0 },
+        batch_invariant,
+        host_cache_bytes: if cfg.prefix_cache && !batch_invariant { cfg.host_cache_bytes } else { 0 },
         host_sampling: cfg.host_sampling,
         max_queue: cfg.max_queue,
     };
@@ -157,12 +166,12 @@ where
         format!("fp_{:010x}", h.finish() & 0xff_ffff_ffff)
     };
     eprintln!(
-        "[rllm] serving {model_id} ({}) on {}: context {} tokens, {parallel} parallel, KV pool {kv_tokens} tokens ({}), prefix cache {}{}{}{}; loaded in {:.1} s",
+        "[rllm] serving {model_id} ({}) on {}: context {} tokens, {parallel} parallel, KV pool {kv_tokens} tokens ({}), prefix cache {}{}{}{}{}; loaded in {:.1} s",
         info.summary,
         info.backend,
         cfg.ctx,
         cfg.kv_type,
-        if cfg.prefix_cache && !info.recurrent { "on" } else { "off" },
+        if cfg.prefix_cache && !info.recurrent && !batch_invariant { "on" } else { "off" },
         match info.host_blocks {
             Some(n) => format!(" + host tier ({} tokens, {:.1} GiB)", n * engine::BLOCK_SIZE, cfg.host_cache_bytes as f64 / (1u64 << 30) as f64),
             None => String::new(),
@@ -172,6 +181,7 @@ where
             None => String::new(),
         },
         if cfg.prompt_lookup && !info.recurrent { ", prompt lookup".to_string() } else if info.mtp_drafts > 0 { format!(", MTP drafts (up to {} tokens)", info.mtp_drafts) } else { String::new() },
+        if batch_invariant { ", batch-invariant" } else { "" },
         t0.elapsed().as_secs_f64()
     );
     let state = Arc::new(AppState {

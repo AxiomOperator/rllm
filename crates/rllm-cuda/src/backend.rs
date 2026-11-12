@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::gpu::{self, DevicePtr, LaunchConfig, PushKernelArg};
 use rllm_core::quant::dequantize_row;
-use rllm_core::{Activation, AttnMeta, Backend, DType, Error, GdnShape, HostTensor, KvLayout, KvType, Result, RowSample, SeqRuns};
+use rllm_core::{Activation, AttnMeta, Backend, DType, Error, GdnShape, HostTensor, KvLayout, KvType, MoeFfn, Result, RowSample, SeqRuns};
 
 const KERNELS: &str = include_str!("../kernels/kernels.cu");
 /// Must match MV_MAX_M in kernels.cu.
@@ -59,8 +59,11 @@ fn wa_cfg(hd: usize) -> (usize, usize) {
 
 /// (group, head_dim) pairs with an `attn_decode_g{G}_d{HD}` kernel (INSTANTIATE_AD).
 /// Group 6 is Qwen3.5-27B (24 heads over 4); group 8 covers 64-over-8 models.
-const ATTN_DECODE_SHAPES: [(usize, usize); 13] =
-    [(1, 64), (1, 128), (1, 256), (2, 64), (2, 128), (2, 256), (4, 64), (4, 128), (4, 256), (4, 512), (6, 128), (6, 256), (8, 128)];
+const ATTN_DECODE_SHAPES: [(usize, usize); 14] =
+    [(1, 64), (1, 128), (1, 256), (2, 64), (2, 128), (2, 256), (4, 64), (4, 128), (4, 256), (4, 512), (6, 128), (6, 256), (8, 128), (8, 256)];
+
+/// Float weights up to this many rows skip cuBLAS in prefill (`skinny_*`).
+const SKINNY_MAX_ROWS: usize = 256;
 
 /// Threads per MMQ block (MMQ_THREADS in kernels.cu).
 const MMQ_THREADS: u32 = 128;
@@ -662,6 +665,7 @@ impl CudaBackend {
 
         let mut names: Vec<String> = [
             "f32_to_f16", "f32_to_bf16", "half_to_f32", "logit_adjust", "sample_rows", "rms_norm", "add_rms_norm", "rms_norm_add", "qkv_norm_rope_store", "rms_norm_rope", "rope_neox", "silu_mul", "gelu_mul", "gelu_mul_strided", "ple_gate_f32", "gelu", "mul_inplace", "scale_inplace", "softcap_inplace", "sigmoid_mul_inplace", "conv1d_silu", "copy_span", "gated_delta_net_d64", "gated_delta_net_d128",
+            "skinny_f32", "skinny_f16", "skinny_bf16", "moe_route", "moe_count", "moe_scan", "moe_place", "moe_combine", "add_sigmoid_scaled",
             "add_inplace", "gather_rows", "gather_strided", "kv_store", "kv_store_q8", "kv_copy_blocks", "kv_dequant_blocks", "kv_rotate_q", "attn_decode_combine", "paged_attention", "attn_prefill", "attn_prefill_tc", "quantize_q8", "repack_q8_0",
             "repack_q4_k", "repack_q6_k", "repack_q5_k", "repack_iq4_xs", "mmq_sum_splits",
             "matvec_glu_silu_f32", "matvec_glu_silu_f16", "matvec_glu_silu_bf16", "matvec_glu_gelu_f32", "matvec_glu_gelu_f16", "matvec_glu_gelu_bf16",
@@ -669,7 +673,10 @@ impl CudaBackend {
         .map(String::from)
         .to_vec();
         for fmt in Fmt::QUANT {
-            for k in ["mmq", "mmq_glu_silu", "mmq_glu_gelu", "matvec_glu_silu", "matvec_glu_gelu", "matvec_glu_norm_silu", "matvec_glu_norm_gelu"] {
+            for k in [
+                "mmq", "mmq_glu_silu", "mmq_glu_gelu", "matvec_glu_silu", "matvec_glu_gelu", "matvec_glu_norm_silu", "matvec_glu_norm_gelu", "moe_matvec_glu", "moe_matvec",
+                "mmq_id", "mmq_id_glu_silu",
+            ] {
                 names.push(format!("{k}_{}", fmt.suffix()));
             }
         }
@@ -1397,6 +1404,12 @@ impl CudaBackend {
         let mut x_conv = None;
         for (w, out) in ws.iter().zip(outs.iter_mut()) {
             if use_mmq(w) {
+                continue;
+            }
+            if !w.fmt.quantized() && w.rows <= SKINNY_MAX_ROWS && k % 8 == 0 {
+                let cfg = LaunchConfig { grid_dim: (w.rows as u32, m.div_ceil(4) as u32, 1), block_dim: (4 * WARP, 1, 1), shared_mem_bytes: 0 };
+                let (ni, ki, mi, rb) = (w.rows as i32, k as i32, m as i32, w.strides().0);
+                launch!(self, format!("skinny_{}", w.fmt.suffix()), cfg, [&w.qs, x, &mut **out, &ni, &ki, &mi, &rb])?;
                 continue;
             }
             self.gemm(x, w, out, m, &mut x_conv)?;
@@ -2547,6 +2560,143 @@ impl Backend for CudaBackend {
                     launch!(self, name, cfg, [qkv, alpha, beta, dt, av, state, st, sl, fr, out, &k, &v, &eps, out, sn, sa, &n])
                 }
             }
+        })
+    }
+
+    fn moe_ffn(&self, x: &CudaBuf, logits: &CudaBuf, moe: &MoeFfn<CudaWeight>, shared: Option<(&CudaBuf, &CudaBuf)>, out: &mut CudaBuf, m: usize) -> Result<()> {
+        self.in_step(|| {
+            let MoeFfn { gate, up, down, n_expert: ne, n_used: k, n_ff, norm_topk, scale } = *moe;
+            let d = gate.cols;
+            if k == 0 || k > ne.min(32) || ne > 1024 || gate.rows != ne * n_ff || up.rows != ne * n_ff || up.cols != d || down.rows != ne * d || down.cols != n_ff {
+                return Err(Error::Shape(format!(
+                    "moe_ffn: {ne} experts (top {k}) of {n_ff}: gate {}x{}, up {}x{}, down {}x{} (at most 1024 experts, 32 per token)",
+                    gate.rows, gate.cols, up.rows, up.cols, down.rows, down.cols
+                )));
+            }
+            if !n_ff.is_multiple_of(32) || !d.is_multiple_of(32) {
+                return Err(Error::Shape(format!("moe_ffn: widths {d} and {n_ff} must be multiples of 32")));
+            }
+            if ![gate, up, down].iter().all(|w| w.fmt.quantized()) {
+                return Err(Error::Unsupported(format!("moe_ffn: expert weights {:?}/{:?}/{:?} (the GPU needs quantized experts)", gate.fmt, up.fmt, down.fmt)));
+            }
+            check_len("moe_ffn x", x.len(), m * d)?;
+            check_len("moe_ffn logits", logits.len(), m * ne)?;
+            check_len("moe_ffn out", out.len(), m * d)?;
+            if let Some((y, g)) = shared {
+                check_len("moe_ffn shared", y.len(), m * d)?;
+                check_len("moe_ffn shared gate", g.len(), m)?;
+            }
+            if m == 0 {
+                return Ok(());
+            }
+            let grouped = m > MATVEC_MAX_M;
+            if grouped && !self.mmq {
+                // No int8 MMA: run decode-sized pieces.
+                for t0 in (0..m).step_by(MATVEC_MAX_M) {
+                    let n = MATVEC_MAX_M.min(m - t0);
+                    let view = |b: &CudaBuf, w: usize| CudaBuf { ptr: b.ptr + (t0 * w * 4) as u64, len: n * w, _owner: None };
+                    let mut o = view(out, d);
+                    let sv = shared.map(|(y, g)| (view(y, d), view(g, 1)));
+                    self.moe_ffn(&view(x, d), &view(logits, ne), moe, sv.as_ref().map(|(y, g)| (y, g)), &mut o, n)?;
+                }
+                return Ok(());
+            }
+            let np = m * k;
+            let (mi, nei, ki, di, nffi) = (m as i32, ne as i32, k as i32, d as i32, n_ff as i32);
+            // Routing: one warp per token.
+            let (ids, wts) = (self.alloc(np)?, self.alloc(np)?);
+            let (norm, one) = (norm_topk as i32, 1i32);
+            launch!(self, "moe_route", grid_1d(m * WARP as usize, 128)?, [logits, &mi, &nei, &ki, &norm, &scale, &ids, &wts])?;
+            // int8 inputs, the experts' int8 hidden rows (one per pair) and their outputs.
+            let (xq, xd, xs) = (self.alloc((m * d).div_ceil(4))?, self.alloc(m * d / 32)?, self.alloc(m * d / 32)?);
+            let nu = (m * d / 32) as i64;
+            launch!(self, "quantize_q8", grid_1d(m * d / 32 * 8, 256)?, [x, &xq, &xd, &xs, &nu])?;
+            let (hq, hd, hs) = (self.alloc((np * n_ff).div_ceil(4))?, self.alloc(np * n_ff / 32)?, self.alloc(np * n_ff / 32)?);
+            let qo = QOut { q: hq.ptr, d: hd.ptr, s: hs.ptr, on: 1 };
+            let y = self.alloc(np * d)?;
+            let target = |w: &CudaWeight| {
+                let (sq, sh, ss) = w.strides();
+                MvTarget {
+                    qs: w.qs.device_ptr(&self.stream).0,
+                    qh: w.qh().device_ptr(&self.stream).0,
+                    sc: w.sc().device_ptr(&self.stream).0,
+                    qs_row: sq,
+                    qh_row: sh,
+                    sc_row: ss,
+                    ..Default::default()
+                }
+            };
+            let (zero, null) = (0i32, 0u64);
+            let (sh_ptr, sg_ptr) = shared.map_or((0u64, 0u64), |(y, g)| (y.ptr, g.ptr));
+            let fused = gate.fmt == up.fmt;
+            let len = (np * n_ff) as i64;
+            if !grouped {
+                // Decode: one matvec per (token, expert) pair, reading only the chosen experts.
+                if fused {
+                    let (tg, tu) = (target(gate), target(up));
+                    let cfg = LaunchConfig { grid_dim: ((n_ff / 32) as u32, np as u32, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 };
+                    launch!(self, format!("moe_matvec_glu_{}", gate.fmt.suffix()), cfg, [&tg, &tu, &ids, &xq, &xd, &di, &nffi, &ki, &qo, &null, &zero])?;
+                } else {
+                    let (g, u) = (self.alloc(np * n_ff)?, self.alloc(np * n_ff)?);
+                    let cfg = LaunchConfig { grid_dim: (n_ff.div_ceil(MATVEC_WARPS as usize) as u32, np as u32, 1), block_dim: (MATVEC_WARPS * WARP, 1, 1), shared_mem_bytes: 0 };
+                    for (w, o) in [(gate, &g), (up, &u)] {
+                        let t = target(w);
+                        launch!(self, format!("moe_matvec_{}", w.fmt.suffix()), cfg, [&t, &ids, &xq, &xd, &di, &nffi, &ki, o])?;
+                    }
+                    launch!(self, "silu_mul", grid_1d(np * n_ff, 256)?, [&g, &u, &len, &qo, &zero])?;
+                }
+                let cfg = LaunchConfig { grid_dim: (d.div_ceil(MATVEC_WARPS as usize) as u32, np as u32, 1), block_dim: (MATVEC_WARPS * WARP, 1, 1), shared_mem_bytes: 0 };
+                let td = target(down);
+                launch!(self, format!("moe_matvec_{}", down.fmt.suffix()), cfg, [&td, &ids, &hq, &hd, &nffi, &di, &one, &y])?;
+                return launch!(self, "moe_combine", grid_1d(m * d, 256)?, [&y, &wts, &null, &*out, &mi, &ki, &di, &sh_ptr, &sg_ptr]);
+            }
+            // Prefill: sort the pairs by expert, then grouped MMQ (one tile
+            // list for all experts) over the gate/up and down projections.
+            let max_tiles = np.div_ceil(MMQ_BN) + ne;
+            let (counts, offsets, cursor) = (self.alloc(ne)?, self.alloc(ne)?, self.alloc(ne)?);
+            let (tiles, pos, rowmap) = (self.alloc(1 + 3 * max_tiles)?, self.alloc(np)?, self.alloc(np)?);
+            if !self.replaying() {
+                // SAFETY: `counts` holds `ne` 4-byte values.
+                unsafe { gpu::memset_zero_async(counts.ptr, ne * 4, &self.stream) }.map_err(err)?;
+            }
+            let (npi, bn) = (np as i32, MMQ_BN as i32);
+            launch!(self, "moe_count", grid_1d(np, 256)?, [&ids, &npi, &counts])?;
+            let single = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
+            launch!(self, "moe_scan", single, [&counts, &nei, &bn, &offsets, &cursor, &tiles])?;
+            launch!(self, "moe_place", grid_1d(np, 256)?, [&ids, &npi, &ki, &offsets, &cursor, &pos, &rowmap])?;
+            let grid = |rows: usize| LaunchConfig { grid_dim: (max_tiles as u32, rows.div_ceil(MMQ_BM) as u32, 1), block_dim: (MMQ_THREADS, 1, 1), shared_mem_bytes: 0 };
+            if fused {
+                let (sq, sh, ss) = gate.strides();
+                let cfg = LaunchConfig { grid_dim: (max_tiles as u32, n_ff.div_ceil(MMQ_BM / 2) as u32, 1), ..grid(n_ff) };
+                launch!(
+                    self,
+                    format!("mmq_id_glu_silu_{}", gate.fmt.suffix()),
+                    cfg,
+                    [&gate.qs, gate.qh(), gate.sc(), &xq, &xd, &xs, &null, &nffi, &di, &sq, &sh, &ss, &up.qs, up.qh(), up.sc(), &qo, &zero, &tiles, &rowmap]
+                )?;
+            } else {
+                let (g, u) = (self.alloc(np * n_ff)?, self.alloc(np * n_ff)?);
+                for (w, o) in [(gate, &g), (up, &u)] {
+                    let (sq, sh, ss) = w.strides();
+                    launch!(self, format!("mmq_id_{}", w.fmt.suffix()), grid(n_ff), [&w.qs, w.qh(), w.sc(), &xq, &xd, &xs, o, &nffi, &di, &sq, &sh, &ss, &tiles, &rowmap])?;
+                }
+                launch!(self, "silu_mul", grid_1d(np * n_ff, 256)?, [&g, &u, &len, &qo, &zero])?;
+            }
+            let (sq, sh, ss) = down.strides();
+            launch!(self, format!("mmq_id_{}", down.fmt.suffix()), grid(d), [&down.qs, down.qh(), down.sc(), &hq, &hd, &hs, &y, &di, &nffi, &sq, &sh, &ss, &tiles, &null])?;
+            launch!(self, "moe_combine", grid_1d(m * d, 256)?, [&y, &wts, &pos, &*out, &mi, &ki, &di, &sh_ptr, &sg_ptr])
+        })
+    }
+
+    fn add_sigmoid_scaled(&self, x: &mut CudaBuf, y: &CudaBuf, g: &CudaBuf, rows: usize, width: usize) -> Result<()> {
+        self.in_step(|| {
+            check_len("add_sigmoid_scaled", x.len().min(y.len()), rows * width)?;
+            check_len("add_sigmoid_scaled gate", g.len(), rows)?;
+            if rows * width == 0 {
+                return Ok(());
+            }
+            let (w, n) = (width as i32, (rows * width) as i64);
+            launch!(self, "add_sigmoid_scaled", grid_1d(rows * width, 256)?, [x, y, g, &w, &n])
         })
     }
 

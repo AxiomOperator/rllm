@@ -6,7 +6,7 @@
 
 use rayon::prelude::*;
 use rllm_core::quant::dequantize_row;
-use rllm_core::{AttnMeta, Backend, DType, Error, GdnShape, HostBytes, HostTensor, KvLayout, KvType, Result, SeqRuns};
+use rllm_core::{AttnMeta, Backend, DType, Error, GdnShape, HostBytes, HostTensor, KvLayout, KvType, MoeFfn, Result, SeqRuns};
 
 pub struct CpuBackend;
 
@@ -150,6 +150,47 @@ fn llamacpp_round_activations(dtype: DType, x: &mut [f32]) {
     }
 }
 
+/// `out[m, n] = x[m, k] · w[r0..r0 + n, :]ᵀ` (a row range of `w`).
+fn rows_matmul(w: &CpuWeight, r0: usize, n: usize, x: &[f32], m: usize, out: &mut [f32]) {
+    let k = w.cols;
+    if m == 0 || n == 0 || k == 0 {
+        out.fill(0.0);
+        return;
+    }
+    let rounded;
+    let x: &[f32] = if llamacpp_numerics() {
+        let mut v = x[..m * k].to_vec();
+        v.chunks_exact_mut(k).for_each(|row| llamacpp_round_activations(w.dtype, row));
+        rounded = v;
+        &rounded
+    } else {
+        x
+    };
+    // Each task dequantizes a run of weight rows once and dots them with
+    // every input row. Results land transposed ([n, m]) so tasks write
+    // disjoint memory; for decode (m = 1) that is already the final layout.
+    let mut out_t = if m == 1 { Vec::new() } else { vec![0f32; n * m] };
+    let dst: &mut [f32] = if m == 1 { &mut out[..n] } else { &mut out_t };
+    const ROWS_PER_TASK: usize = 16;
+    dst.par_chunks_mut(ROWS_PER_TASK * m).enumerate().for_each(|(chunk, dst)| {
+        let mut wrow = vec![0f32; k];
+        for (i, d) in dst.chunks_exact_mut(m).enumerate() {
+            let r = r0 + chunk * ROWS_PER_TASK + i;
+            dequantize_row(w.dtype, w.row(r), &mut wrow);
+            for (j, d) in d.iter_mut().enumerate() {
+                *d = dot(&x[j * k..(j + 1) * k], &wrow);
+            }
+        }
+    });
+    if m > 1 {
+        for r in 0..n {
+            for j in 0..m {
+                out[j * n + r] = out_t[r * m + j];
+            }
+        }
+    }
+}
+
 /// GELU, tanh approximation (`gelu_pytorch_tanh`).
 #[inline]
 fn gelu_tanh(x: f32) -> f32 {
@@ -228,42 +269,7 @@ impl Backend for CpuBackend {
         let (n, k) = (w.rows, w.cols);
         check_len("matmul x", x.len(), m * k)?;
         check_len("matmul out", out.len(), m * n)?;
-        if m == 0 || n == 0 || k == 0 {
-            out[..m * n].fill(0.0);
-            return Ok(());
-        }
-        let rounded;
-        let x: &[f32] = if llamacpp_numerics() {
-            let mut v = x[..m * k].to_vec();
-            v.chunks_exact_mut(k).for_each(|row| llamacpp_round_activations(w.dtype, row));
-            rounded = v;
-            &rounded
-        } else {
-            x
-        };
-        // Each task dequantizes a run of weight rows once and dots them with
-        // every input row. Results land transposed ([n, m]) so tasks write
-        // disjoint memory; for decode (m = 1) that is already the final layout.
-        let mut out_t = if m == 1 { Vec::new() } else { vec![0f32; n * m] };
-        let dst: &mut [f32] = if m == 1 { &mut out[..n] } else { &mut out_t };
-        const ROWS_PER_TASK: usize = 16;
-        dst.par_chunks_mut(ROWS_PER_TASK * m).enumerate().for_each(|(chunk, dst)| {
-            let mut wrow = vec![0f32; k];
-            for (i, d) in dst.chunks_exact_mut(m).enumerate() {
-                let r = chunk * ROWS_PER_TASK + i;
-                dequantize_row(w.dtype, w.row(r), &mut wrow);
-                for (j, d) in d.iter_mut().enumerate() {
-                    *d = dot(&x[j * k..(j + 1) * k], &wrow);
-                }
-            }
-        });
-        if m > 1 {
-            for r in 0..n {
-                for j in 0..m {
-                    out[j * n + r] = out_t[r * m + j];
-                }
-            }
-        }
+        rows_matmul(w, 0, n, &x[..m * k], m, &mut out[..m * n]);
         Ok(())
     }
 
@@ -371,6 +377,66 @@ impl Backend for CpuBackend {
     fn sigmoid_mul(&self, x: &mut Vec<f32>, g: &Vec<f32>, len: usize) -> Result<()> {
         check_len("sigmoid_mul", x.len().min(g.len()), len)?;
         x[..len].par_iter_mut().zip(&g[..len]).for_each(|(x, g)| *x *= 1.0 / (1.0 + (-*g).exp()));
+        Ok(())
+    }
+
+    fn moe_ffn(&self, x: &Vec<f32>, logits: &Vec<f32>, moe: &MoeFfn<CpuWeight>, shared: Option<(&Vec<f32>, &Vec<f32>)>, out: &mut Vec<f32>, m: usize) -> Result<()> {
+        let MoeFfn { gate, up, down, n_expert: ne, n_used: k, n_ff, norm_topk, scale } = *moe;
+        let d = gate.cols;
+        if k == 0 || k > ne || gate.rows != ne * n_ff || up.rows != ne * n_ff || up.cols != d || down.rows != ne * d || down.cols != n_ff {
+            return Err(Error::Shape(format!(
+                "moe_ffn: {ne} experts (top {k}) of {n_ff}: gate {}x{}, up {}x{}, down {}x{}",
+                gate.rows, gate.cols, up.rows, up.cols, down.rows, down.cols
+            )));
+        }
+        check_len("moe_ffn x", x.len(), m * d)?;
+        check_len("moe_ffn logits", logits.len(), m * ne)?;
+        check_len("moe_ffn out", out.len(), m * d)?;
+        let (mut ids, mut wts) = (vec![0u32; m * k], vec![0f32; m * k]);
+        for t in 0..m {
+            rllm_core::moe_route(&logits[t * ne..(t + 1) * ne], k, norm_topk, scale, &mut ids[t * k..(t + 1) * k], &mut wts[t * k..(t + 1) * k]);
+        }
+        // Per expert, its (token, slot) pairs in order; each pair's output row.
+        let mut pairs: Vec<Vec<usize>> = vec![Vec::new(); ne];
+        for (p, &e) in ids.iter().enumerate() {
+            pairs[e as usize].push(p);
+        }
+        let mut y = vec![0f32; m * k * d];
+        for (e, ps) in pairs.iter().enumerate().filter(|(_, ps)| !ps.is_empty()) {
+            let c = ps.len();
+            let xg: Vec<f32> = ps.iter().flat_map(|&p| x[p / k * d..(p / k + 1) * d].iter().copied()).collect();
+            let (mut g, mut u) = (vec![0f32; c * n_ff], vec![0f32; c * n_ff]);
+            rows_matmul(gate, e * n_ff, n_ff, &xg, c, &mut g);
+            rows_matmul(up, e * n_ff, n_ff, &xg, c, &mut u);
+            for (g, u) in g.iter_mut().zip(&u) {
+                *g = *g / (1.0 + (-*g).exp()) * u;
+            }
+            let mut o = vec![0f32; c * d];
+            rows_matmul(down, e * d, d, &g, c, &mut o);
+            for (i, &p) in ps.iter().enumerate() {
+                y[p * d..(p + 1) * d].copy_from_slice(&o[i * d..(i + 1) * d]);
+            }
+        }
+        out[..m * d].par_chunks_mut(d).enumerate().for_each(|(t, o)| {
+            o.fill(0.0);
+            for j in 0..k {
+                let (w, row) = (wts[t * k + j], &y[(t * k + j) * d..(t * k + j + 1) * d]);
+                o.iter_mut().zip(row).for_each(|(o, v)| *o += w * v);
+            }
+        });
+        if let Some((y, g)) = shared {
+            self.add_sigmoid_scaled(out, y, g, m, d)?;
+        }
+        Ok(())
+    }
+
+    fn add_sigmoid_scaled(&self, x: &mut Vec<f32>, y: &Vec<f32>, g: &Vec<f32>, rows: usize, width: usize) -> Result<()> {
+        check_len("add_sigmoid_scaled", x.len().min(y.len()), rows * width)?;
+        check_len("add_sigmoid_scaled gate", g.len(), rows)?;
+        x[..rows * width].par_chunks_mut(width.max(1)).zip(y[..rows * width].par_chunks(width.max(1))).enumerate().for_each(|(r, (x, y))| {
+            let s = 1.0 / (1.0 + (-g[r]).exp());
+            x.iter_mut().zip(y).for_each(|(x, y)| *x += s * y);
+        });
         Ok(())
     }
 

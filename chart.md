@@ -10,7 +10,7 @@ above 1.00× means rllm is faster. Each bar is 10 blocks per 1.00×, and the
 | | |
 |---|---|
 | GPUs | NVIDIA (CUDA, sm_86+), AMD RDNA3 (HIP/ROCm, tested on gfx1151); one binary, `-d gpu` picks either |
-| Models | Qwen3 dense · Qwen3.5/3.6/3.8 dense hybrids (Gated DeltaNet) · Llama 2/3 · Mistral · Gemma 4 |
+| Models | Qwen3 dense · Qwen3.5/3.6/3.8 hybrids (Gated DeltaNet; dense and MoE, e.g. Qwen3.6-35B-A3B) · Llama 2/3 · Mistral · Gemma 4 |
 | Weights (GGUF) | F32 · F16 · BF16 · Q8_0 · Q4_K · Q5_K · Q6_K · IQ4_XS |
 | Correctness | perplexity within noise of llama.cpp on every model and type checked; GPU kernels tested against a CPU reference on both vendors |
 | Serving | OpenAI-compatible API, continuous batching, prefix cache with a RAM tier, q8 KV cache, speculative decoding (draft model, prompt lookup, and the model's own MTP head on Qwen3.5), sampling on the GPU |

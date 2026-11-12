@@ -246,9 +246,12 @@ retrieval-embedding model.
 
 ## Qwen3.5 (hybrid models)
 
-Qwen3.5, 3.6 and 3.8 dense models (GGUF architecture `qwen35`) mix Gated
-DeltaNet layers, which keep a fixed-size recurrent state per sequence, with
-full-attention layers (one in four). For these models:
+Qwen3.5, 3.6 and 3.8 models mix Gated DeltaNet layers, which keep a
+fixed-size recurrent state per sequence, with full-attention layers (one in
+four). The dense models are GGUF architecture `qwen35`; the
+mixture-of-experts models (`qwen35moe`, e.g. Qwen3.6-35B-A3B: 256 experts,
+8 per token, plus a shared expert) work the same way, with the MoE notes
+below. For these models:
 
 - the prefix cache and its host tier are off: the state can't be rebuilt from
   cached KV blocks, so every prompt is computed in full;
@@ -273,6 +276,28 @@ identical (checked on the CPU and, with a dedicated decode-attention kernel for
 the 27B's 6-head groups, on CUDA and HIP), and sampling follows the
 speculative sampling rule.
 
+**Mixture of experts (`qwen35moe`).** Each token's router picks 8 of the 256
+experts (softmax, weights renormalized over the chosen ones) and a shared
+expert is added, scaled by a sigmoid gate. On the GPU, decode steps (up to 8
+tokens) run one matrix-vector product per (token, expert) pair, reading only
+the chosen experts' weights; prefill sorts the pairs by expert and runs one
+grouped int8 GEMM over all experts. The experts must be quantized (any of
+rllm's formats: Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS), and all of them live in GPU
+memory: there is no CPU offload, so the 35B-A3B at Q4_K_M needs about 24 GB.
+`rllm tune` counts the experts' weights and the routing buffers.
+
+Measured on the Strix Halo, Qwen3.6-35B-A3B Q4_K_M (bartowski): perplexity
+5.4872 (llama.cpp ROCm 5.4981, CPU 5.4883; wikitext-2, 32 chunks of 512),
+pp512 1378 tok/s (llama.cpp 1365), tg64 53 tok/s (llama.cpp 62: rllm's
+qwen35 decode step isn't captured as a graph yet, and at about 800 small
+kernels per token the launch gaps cost ~3 ms). With MTP, single greedy
+requests decode at 75–91 tok/s, 85% of drafts accepted, with output
+identical to decoding without MTP (also on the CPU, sequential and
+concurrent). Logits are within llama.cpp's own noise on the CPU, HIP and
+CUDA. On the RTX 6000 Ada: perplexity 5.4890 (llama.cpp CUDA 5.4967), and
+with MTP single greedy requests decode at 296–333 tok/s instead of 193, 86%
+of drafts accepted, output identical to decoding without MTP.
+
 Thinking is off by default in these models' chat template; `reasoning_effort`
 or `chat_template_kwargs: {"enable_thinking": true}` turns it on.
 
@@ -283,6 +308,26 @@ Measured on the Strix Halo (Radeon 8060S), Qwen3.8-27B Q8_0: perplexity 5.5955
 with 81% of drafted tokens accepted. Qwen3.5-0.8B Q8_0:
 perplexity 15.4846 (llama.cpp 15.4933); logits within llama.cpp's own noise
 on the laptop's CPU and CUDA backends, at any prefill chunk size.
+
+## Batch-invariant mode
+
+On a GPU, a request's logits depend slightly on what it is batched with: a
+decode token in a step with another request's prompt goes through the
+prefill kernels, and prompts prefilled together split their matrix work
+differently. So under concurrent load, greedy output can differ from the
+same request run alone, and between runs (with or without speculative
+decoding). `--batch-invariant` removes that: every step is either decode
+tokens only (at most 8, where each token's logits are bit for bit what a
+step of its own would give) or one request's prompt chunk, never a mix.
+Concurrent requests then produce exactly what they produce alone, and greedy
+output with and without speculation (draft model or MTP) matches under any
+load. It costs throughput when prompts arrive while others decode, caps
+`--parallel` at 8 and turns the prefix cache off. It is on by default for
+Qwen3.5 hybrids (`qwen35`, `qwen35moe`), which have no prefix cache anyway,
+so their MTP output matches decoding without MTP under any load;
+`--no-batch-invariant` turns it off. Checked with
+Qwen3.6-35B-A3B on CUDA and HIP: 4 concurrent and 4 sequential requests,
+with and without MTP, all identical.
 
 ## Speculative decoding
 

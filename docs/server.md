@@ -274,7 +274,11 @@ below. For these models:
 With MTP, output is the same as without it: greedy output is token for token
 identical (checked on the CPU and, with a dedicated decode-attention kernel for
 the 27B's 6-head groups, on CUDA and HIP), and sampling follows the
-speculative sampling rule.
+speculative sampling rule. On the GPU this needs each token's decode attention
+to split its context the same way whatever else is in the step: a token uses
+the split count a step of its own would (from its own context, not the
+step's longest), so a verification step that crosses a power-of-two context
+(256, 512, ... tokens) matches one-token steps bit for bit.
 
 **Mixture of experts (`qwen35moe`).** Each token's router picks 8 of the 256
 experts (softmax, weights renormalized over the chosen ones) and a shared

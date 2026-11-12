@@ -215,3 +215,49 @@ Visitors come in summer for the beaches, the seafood and the long evenings when 
 Winter belongs to the residents again. The ferry runs twice a day instead of six times, the guesthouses close, and the town council meets in the library to discuss the budget, the sea wall and the perennial question of parking. Someone always proposes a new festival to bring tourists in the dark months; someone else always points out that the last one was cancelled because of a storm. The meeting ends, as it usually does, with tea, biscuits and an agreement to revisit the matter in spring.
 
 Mathematics teachers at the local school use the harbor as a classroom. Students calculate tides from the phases of the moon, estimate the volume of the breakwater from its dimensions, and model the growth of the mussel farms with simple equations. One year a class measured the speed of waves entering the bay and discovered, to their delight, that their results matched a formula published more than a century earlier by a scientist who had never visited the town.";
+
+/// Speculative verification with recurrent-state snapshots and rollback
+/// (what the server does with MTP drafts) gives the same logits as feeding
+/// only the kept tokens one at a time: a step feeds the pending token plus
+/// drafts with snapshots, `keep_step` rolls the state back to the last kept
+/// token, and later steps continue from there. Bit for bit, over many
+/// rounds (an inexact rollback shows up as drift in later rounds).
+#[test]
+fn speculative_rollback_matches_single_steps() {
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((b, g)) = setup() else { return };
+    let model = AnyModel::load(&b, &g).unwrap();
+    if !rllm_model::Model::recurrent(&model) {
+        return;
+    }
+    let vocab = rllm_model::Model::vocab_size(&model);
+    let mut spec = KvPool::new(&b, &model, 2048, 16, KvType::F16, 2).unwrap();
+    if !spec.enable_mtp(8).unwrap() {
+        eprintln!("skipping: no MTP head");
+        return;
+    }
+    let mut plain = KvPool::new(&b, &model, 2048, 16, KvType::F16, 2).unwrap();
+    let (mut sa, mut sb) = (SeqKv::default(), SeqKv::default());
+    let prompt = tokens(200, vocab, 11);
+    spec.step(&mut [StepItem { seq: &mut sa, tokens: &prompt, want: Want::Last }], false).unwrap();
+    plain.step(&mut [StepItem { seq: &mut sb, tokens: &prompt, want: Want::Last }], false).unwrap();
+    let stream = tokens(400, vocab, 12);
+    let mut at = 0;
+    for round in 0..40 {
+        // The pending token and up to 3 drafts; keep 0..=drafts of them.
+        let drafts = 1 + round % 3;
+        let kept = (round * 7 + 3) % (drafts + 1);
+        let step: Vec<u32> = stream[at..at + 1 + drafts].to_vec();
+        let len = sa.len;
+        let out = spec.step_spec(&mut [StepItem { seq: &mut sa, tokens: &step, want: Want::All }], false, &[], &[drafts as u32]).unwrap().rows;
+        sa.truncate(&mut spec.alloc, len + 1 + kept);
+        spec.keep_step(&sa, 1 + kept).unwrap();
+        for (j, &t) in step[..1 + kept].iter().enumerate() {
+            let one = plain.step(&mut [StepItem { seq: &mut sb, tokens: &[t], want: Want::Last }], false).unwrap();
+            let row = &out[j * vocab..(j + 1) * vocab];
+            let diff = row.iter().zip(&one).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            assert_eq!(diff, 0, "round {round} (drafts {drafts}, kept {kept}), token {j}: {diff} of {vocab} logits differ");
+        }
+        at += 1 + kept;
+    }
+}

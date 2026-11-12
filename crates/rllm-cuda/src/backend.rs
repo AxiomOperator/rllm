@@ -3045,9 +3045,15 @@ impl Backend for CudaBackend {
                 // one-token steps bit for bit at any depth). Batched decode at
                 // depth gains too: 8 Qwen3-8B requests at 32k on the RTX 6000 Ada,
                 // 489 -> 568 tok/s.
+                // The grid has the most splits any token in the step needs;
+                // each token uses its own count (`ad_own_splits` in the
+                // kernel: the same rule on its own padded context), so a
+                // token's result doesn't depend on the step's other tokens.
                 let pairs = n_tok * meta.n_kv_heads;
                 let capacity = max_blocks * meta.block_size;
-                let splits = (2 * self.n_sms).div_ceil(meta.n_kv_heads).min(capacity / 256).clamp(1, 32);
+                let split_base = (2 * self.n_sms).div_ceil(meta.n_kv_heads);
+                let splits = split_base.min(capacity / 256).clamp(1, 32);
+                let sb = split_base.min(32) as i32;
                 let cfg = LaunchConfig {
                     grid_dim: (n_tok as u32, meta.n_kv_heads as u32, splits as u32),
                     block_dim: (ad_warps as u32 * WARP, 1, 1),
@@ -3066,15 +3072,15 @@ impl Backend for CudaBackend {
                 let qo_attn = if splits > 1 { QOut::default() } else { qo };
                 if q8 {
                     let name = format!("attn_decode_q8_g{group}_d{hdim}");
-                    launch!(self, name, cfg, [q, kc, vc, out, seq, pos, tab, &mb, &nh, &nkv, &bs, &meta.scale, &window, &qo_attn, ks, vs, &part_ptr])?;
+                    launch!(self, name, cfg, [q, kc, vc, out, seq, pos, tab, &mb, &nh, &nkv, &bs, &meta.scale, &window, &qo_attn, ks, vs, &part_ptr, &sb])?;
                 } else {
                     let name = format!("attn_decode_g{group}_d{hdim}");
-                    launch!(self, name, cfg, [q, kc, vc, out, seq, pos, tab, &mb, &nh, &nkv, &bs, &meta.scale, &window, &qo_attn, &part_ptr])?;
+                    launch!(self, name, cfg, [q, kc, vc, out, seq, pos, tab, &mb, &nh, &nkv, &bs, &meta.scale, &window, &qo_attn, &part_ptr, &sb])?;
                 }
                 if let Some(part) = &mut part {
                     let (si, gi) = (splits as i32, group as i32);
                     let cfg = LaunchConfig { grid_dim: (n_tok as u32, meta.n_kv_heads as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
-                    launch!(self, "attn_decode_combine", cfg, [part, out, &si, &gi, &hd, &nh, &nkv, &qo])?;
+                    launch!(self, "attn_decode_combine", cfg, [part, out, &si, &gi, &hd, &nh, &nkv, &qo, pos, &bs, &sb])?;
                 }
                 self.set_prequant(&qo, out.ptr, len);
                 return Ok(());

@@ -3225,9 +3225,21 @@ extern "C" __global__ void mmq_sum_splits(const float* __restrict__ part, float*
 // context, one block per pair leaves most SMs idle. Then `splits` > 1 blocks
 // each take a 32-aligned share of the positions and write their unnormalized
 // state to `part` ([token][kv head][split] x (acc [G][HD], m [G], l [G]));
-// attn_decode_combine merges the splits in order.
+// attn_decode_combine merges the splits in order. Each token uses its own
+// split count (ad_own_splits), at most the grid's.
 // Dynamic smem: q [G][HD] f32 | per warp: m, l [G] + acc [G][HD]
 #define AD_WARPS 8
+
+// How many splits token `t`'s attention uses: what the host picks for a step
+// holding only that token (its block table padded to a power of two, at
+// least 256 positions per split, at most `split_base`), so a token's result
+// doesn't depend on the other tokens in the step. At most the grid's splits.
+__device__ __forceinline__ int ad_own_splits(int ctx, int block_size, int split_base, int grid_splits) {
+    const int nb = (ctx + block_size - 1) / block_size;
+    int pw = 1;
+    while (pw < nb) pw <<= 1;
+    return max(1, min(min(split_base, pw * block_size / 256), min(grid_splits, 32)));
+}
 
 // Q8: the cache is int8 with per-32 scales ksc/vsc (see kv_q8_store). For V
 // each lane owns PER consecutive dims (one vector load and one scale per
@@ -3239,10 +3251,14 @@ __device__ void attn_decode(const float* __restrict__ q, const void* __restrict_
                             const u32* __restrict__ token_seq, const u32* __restrict__ positions,
                             const u32* __restrict__ block_tables, int max_blocks, int n_heads, int n_kv_heads,
                             int block_size, float scale, int window, QOut qo, const f16_bits* __restrict__ ksc,
-                            const f16_bits* __restrict__ vsc, float* __restrict__ part) {
+                            const f16_bits* __restrict__ vsc, float* __restrict__ part, int split_base) {
     constexpr int PER = HD / WARP_SIZE;
     extern __shared__ float ad_smem[];
     const int t = blockIdx.x, kvh = blockIdx.y, split = blockIdx.z, splits = gridDim.z;
+    const int ctx = positions[t] + 1;
+    // This token's own split count; the grid's other splits have nothing to do.
+    const int own = ad_own_splits(ctx, block_size, split_base, splits);
+    if (split >= own) return;
     const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE, warps = blockDim.x / WARP_SIZE;
     float* sq = ad_smem;                // [G][HD]
     float* sml = sq + G * HD;           // [warps][G][2]
@@ -3255,10 +3271,9 @@ __device__ void attn_decode(const float* __restrict__ q, const void* __restrict_
     if (Q8) fwht_smem(sq, G * HD, kv_rot_size(HD));
     __syncthreads();
 
-    const int ctx = positions[t] + 1;
     const int start = (window > 0 && ctx > window) ? ctx - window : 0;
     // This block's positions: a 32-aligned share of start..ctx.
-    const int share = ((ctx - start + splits - 1) / splits + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE;
+    const int share = ((ctx - start + own - 1) / own + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE;
     const int lo = start + split * share, hi = min(ctx, lo + share);
     const u32* table = block_tables + (long)token_seq[t] * max_blocks;
     const int kv_w = n_kv_heads * HD;
@@ -3412,15 +3427,18 @@ __device__ void attn_decode(const float* __restrict__ q, const void* __restrict_
 
 // Merge attn_decode's split states, in split order. Grid: (tokens, kv heads).
 extern "C" __global__ void attn_decode_combine(const float* __restrict__ part, float* __restrict__ out, int splits,
-                                               int group, int head_dim, int n_heads, int n_kv_heads, QOut qo) {
+                                               int group, int head_dim, int n_heads, int n_kv_heads, QOut qo,
+                                               const u32* __restrict__ positions, int block_size, int split_base) {
     const int t = blockIdx.x, kvh = blockIdx.y, gh = group * head_dim;
     const float* base = part + ((long)t * n_kv_heads + kvh) * splits * (gh + 2 * group);
+    // Only this token's own splits hold states (see attn_decode).
+    const int own = ad_own_splits((int)positions[t] + 1, block_size, split_base, splits);
     for (int i = threadIdx.x; i < gh; i += blockDim.x) {
         const int g = i / head_dim;
         float gm = NEG_INF;
-        for (int s = 0; s < splits; s++) gm = fmaxf(gm, base[s * (gh + 2 * group) + gh + g]);
+        for (int s = 0; s < own; s++) gm = fmaxf(gm, base[s * (gh + 2 * group) + gh + g]);
         float gl = 0.f, v = 0.f;
-        for (int s = 0; s < splits; s++) {
+        for (int s = 0; s < own; s++) {
             const float* ps = base + s * (gh + 2 * group);
             const float ms = ps[gh + g];
             const float f = ms == NEG_INF ? 0.f : __expf(ms - gm);
@@ -3437,17 +3455,18 @@ extern "C" __global__ void attn_decode_combine(const float* __restrict__ part, f
     extern "C" __global__ void attn_decode_g##G##_d##HD(                                                      \
         const float* q, const void* kc, const void* vc, float* out, const u32* token_seq,                    \
         const u32* positions, const u32* block_tables, int max_blocks, int n_heads, int n_kv_heads,          \
-        int block_size, float scale, int window, QOut qo, float* part) {                                      \
+        int block_size, float scale, int window, QOut qo, float* part, int split_base) {                      \
         attn_decode<G, HD, false>(q, kc, vc, out, token_seq, positions, block_tables, max_blocks, n_heads,    \
-                                  n_kv_heads, block_size, scale, window, qo, nullptr, nullptr, part);         \
+                                  n_kv_heads, block_size, scale, window, qo, nullptr, nullptr, part,          \
+                                  split_base);                                                                \
     }                                                                                                         \
     extern "C" __global__ void attn_decode_q8_g##G##_d##HD(                                                   \
         const float* q, const void* kc, const void* vc, float* out, const u32* token_seq,                    \
         const u32* positions, const u32* block_tables, int max_blocks, int n_heads, int n_kv_heads,          \
         int block_size, float scale, int window, QOut qo, const f16_bits* ksc, const f16_bits* vsc,           \
-        float* part) {                                                                                        \
+        float* part, int split_base) {                                                                        \
         attn_decode<G, HD, true>(q, kc, vc, out, token_seq, positions, block_tables, max_blocks, n_heads,     \
-                                 n_kv_heads, block_size, scale, window, qo, ksc, vsc, part);                  \
+                                 n_kv_heads, block_size, scale, window, qo, ksc, vsc, part, split_base);      \
     }
 INSTANTIATE_AD(1, 64)
 INSTANTIATE_AD(1, 128)

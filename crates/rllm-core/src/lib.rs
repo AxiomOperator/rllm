@@ -295,6 +295,13 @@ pub trait Backend: Send + Sync {
     fn name(&self) -> String;
 
     fn upload(&self, t: &HostTensor) -> Result<Self::Weight>;
+
+    /// Whether uploaded weights still read the host bytes they came from
+    /// (the CPU backend views the model file's mapping); otherwise the
+    /// loader gives the file's pages back after each upload.
+    fn keeps_host_weights(&self) -> bool {
+        false
+    }
     fn alloc(&self, len: usize) -> Result<Self::Buffer>;
     fn alloc_kv(&self, layout: KvLayout) -> Result<Self::KvCache>;
     fn to_host(&self, buf: &Self::Buffer, out: &mut [f32]) -> Result<()>;

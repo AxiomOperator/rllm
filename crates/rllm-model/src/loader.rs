@@ -79,9 +79,19 @@ pub fn host_tensor(g: &Gguf, name: &str) -> Result<HostTensor> {
     })
 }
 
+/// After uploading tensor `name`: free the file pages it was read from
+/// (unless the backend keeps reading them; see `Gguf::release`).
+fn uploaded<B: Backend, W>(backend: &B, g: &Gguf, name: &str, w: W) -> W {
+    if !backend.keeps_host_weights() {
+        g.release(name);
+    }
+    w
+}
+
 pub fn load_weight<B: Backend>(backend: &B, g: &Gguf, name: &str) -> Result<B::Weight> {
     let t = host_tensor(g, name)?;
-    backend.upload(&t).with_context(|| format!("uploading {name}"))
+    let w = backend.upload(&t).with_context(|| format!("uploading {name}"))?;
+    Ok(uploaded(backend, g, name, w))
 }
 
 /// Load a Q or K projection stored for ggml's "normal" RoPE (rotating
@@ -108,7 +118,8 @@ pub fn load_weight_rope_neox<B: Backend>(backend: &B, g: &Gguf, name: &str, head
     let len = out.len();
     let owner: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(out);
     let t = HostTensor { bytes: HostBytes::new(owner, 0..len), ..t };
-    backend.upload(&t).with_context(|| format!("uploading {name}"))
+    let w = backend.upload(&t).with_context(|| format!("uploading {name}"))?;
+    Ok(uploaded(backend, g, name, w))
 }
 
 /// Load rows `rows` of tensor `name` (viewed as 2-D: every axis but the
@@ -129,7 +140,8 @@ pub fn load_weight_rows<B: Backend>(backend: &B, g: &Gguf, name: &str, rows: &[u
     let len = out.len();
     let owner: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(out);
     let t = HostTensor { shape: vec![rows.len(), cols], bytes: HostBytes::new(owner, 0..len), ..t };
-    backend.upload(&t).with_context(|| format!("uploading {name}"))
+    let w = backend.upload(&t).with_context(|| format!("uploading {name}"))?;
+    Ok(uploaded(backend, g, name, w))
 }
 
 /// A 1-D tensor's values as f32.
@@ -159,5 +171,6 @@ pub fn load_weight_cols<B: Backend>(backend: &B, g: &Gguf, name: &str, start: us
     let total = out.len();
     let owner: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(out);
     let t = HostTensor { shape: vec![rows, n], bytes: HostBytes::new(owner, 0..total), ..t };
-    backend.upload(&t).with_context(|| format!("uploading {name}"))
+    let w = backend.upload(&t).with_context(|| format!("uploading {name}"))?;
+    Ok(uploaded(backend, g, name, w))
 }

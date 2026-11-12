@@ -208,6 +208,10 @@ impl Backend for CpuBackend {
         format!("cpu ({} threads)", rayon::current_num_threads())
     }
 
+    fn keeps_host_weights(&self) -> bool {
+        true
+    }
+
     fn upload(&self, t: &HostTensor) -> Result<CpuWeight> {
         let (rows, cols) = t.as_2d();
         if cols % t.dtype.block_size() != 0 {

@@ -325,6 +325,15 @@ impl<B: Backend> AnyModel<B> {
             "qwen35" | "qwen35moe" => Self::Qwen35(Qwen35::load(backend, g)?),
             other => bail!("unsupported architecture {other:?} (supported: qwen3, llama, gemma4, qwen35, qwen35moe)"),
         };
+        if !backend.keeps_host_weights() {
+            // Every tensor is on the device now: release the file's pages
+            // (again; uploads release theirs, but pages the driver still
+            // had pinned for a copy at that point stay cached).
+            backend.synchronize()?;
+            for t in &g.tensors {
+                g.release(&t.name);
+            }
+        }
         Ok(model)
     }
 }

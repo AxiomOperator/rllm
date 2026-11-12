@@ -1563,7 +1563,10 @@ impl Backend for CudaBackend {
             None
         };
         if !fmt.quantized() {
-            let qs = self.stream.clone_htod(t.bytes.as_slice()).map_err(err)?;
+            // Through a private copy, like the chunks below: the driver may
+            // pin the source pages for the copy, and pinned file pages can't
+            // be released from the page cache (`Gguf::release`).
+            let qs = self.stream.clone_htod(&t.bytes.as_slice().to_vec()).map_err(err)?;
             const F16_COPY_MAX: usize = 16 << 20;
             let f16_copy = if fmt == Fmt::F32 && t.shape.len() == 2 && rows * cols <= F16_COPY_MAX {
                 let mut h = self.stream.alloc_zeros::<u16>(rows * cols).map_err(err)?;
@@ -1598,11 +1601,22 @@ impl Backend for CudaBackend {
         let raw_row = t.dtype.row_bytes(cols);
         let chunk_rows = (UPLOAD_CHUNK_BYTES / raw_row).clamp(1, rows);
         let mut staging = alloc(chunk_rows * raw_row)?;
+        // Chunks are copied into this host buffer first: HIP pins a pageable
+        // source's pages for the transfer (and keeps them pinned), which
+        // would keep the model file's pages in RAM after `Gguf::release`;
+        // on a unified-memory GPU that doubles the memory a load needs.
+        let mut host = Vec::with_capacity(chunk_rows * raw_row);
         let k = cols as i32;
         for row0 in (0..rows).step_by(chunk_rows) {
             let n = chunk_rows.min(rows - row0);
             let bytes = &raw[row0 * raw_row..(row0 + n) * raw_row];
-            self.stream.memcpy_htod(bytes, &mut staging.slice_mut(0..bytes.len())).map_err(err)?;
+            // The previous chunk's copy must be done reading `host`.
+            if row0 > 0 {
+                self.stream.synchronize().map_err(err)?;
+            }
+            host.clear();
+            host.extend_from_slice(bytes);
+            self.stream.memcpy_htod(&host, &mut staging.slice_mut(0..bytes.len())).map_err(err)?;
             let (r0, ni) = (row0 as i32, n as i32);
             let cfg = grid_1d(n * cols / 32, 128)?;
             match fmt {

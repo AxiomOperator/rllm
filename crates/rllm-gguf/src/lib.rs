@@ -155,6 +155,8 @@ pub struct Gguf {
     meta_index: HashMap<String, usize>,
     tensor_index: HashMap<String, usize>,
     mmap: Arc<Mmap>,
+    /// Kept to drop the file's page cache (see [`Self::release`]).
+    file: Option<File>,
 }
 
 impl Gguf {
@@ -163,7 +165,9 @@ impl Gguf {
         // SAFETY: the file is opened read-only. Modifying it while mapped is
         // undefined behaviour, same as for every other mmap-based model loader.
         let mmap = unsafe { Mmap::map(&file)? };
-        Self::parse(Arc::new(mmap))
+        let mut g = Self::parse(Arc::new(mmap))?;
+        g.file = Some(file);
+        Ok(g)
     }
 
     fn parse(mmap: Arc<Mmap>) -> Result<Self> {
@@ -258,7 +262,7 @@ impl Gguf {
             return Err(Error::Malformed(format!("tensors {:?} and {:?} overlap", w[0].name, w[1].name)));
         }
 
-        Ok(Self { version, metadata, tensors, meta_index, tensor_index, mmap })
+        Ok(Self { version, metadata, tensors, meta_index, tensor_index, mmap, file: None })
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
@@ -301,6 +305,38 @@ impl Gguf {
     /// Shared handle to the underlying mapping, for zero-copy weight views.
     pub fn mmap(&self) -> &Arc<Mmap> {
         &self.mmap
+    }
+
+    /// Give back the memory holding tensor `name`'s bytes: its pages leave
+    /// this process's mapping and the page cache. For backends that copied
+    /// the tensor to their own memory (GPUs); on a unified-memory GPU the
+    /// cached file and the uploaded weights would otherwise both occupy
+    /// system RAM while loading. Safe at any time: the mapping is a
+    /// read-only view of the file, so anything touched again is re-read
+    /// (pages at the range's edges, shared with neighbours, included).
+    pub fn release(&self, name: &str) {
+        let Some(info) = self.tensor(name) else { return };
+        #[cfg(unix)]
+        {
+            // SAFETY: sysconf has no preconditions.
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+            let start = info.offset / page * page;
+            let end = (info.offset + info.size).div_ceil(page).saturating_mul(page).min(self.mmap.len());
+            if end <= start {
+                return;
+            }
+            // SAFETY: [start, end) lies within the mapping, which is
+            // read-only and file-backed, so MADV_DONTNEED only drops page
+            // table entries (later reads fault the data back in from the
+            // file); posix_fadvise only advises the kernel's page cache.
+            unsafe {
+                libc::madvise(self.mmap.as_ptr().add(start) as *mut libc::c_void, end - start, libc::MADV_DONTNEED);
+                if let Some(f) = &self.file {
+                    use std::os::fd::AsRawFd;
+                    libc::posix_fadvise(f.as_raw_fd(), start as libc::off_t, (end - start) as libc::off_t, libc::POSIX_FADV_DONTNEED);
+                }
+            }
+        }
     }
 }
 

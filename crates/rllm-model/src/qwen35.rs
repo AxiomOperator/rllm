@@ -417,6 +417,35 @@ struct Mtp<B: Backend> {
     layer: Layer<B>,
     embed: Option<B::Weight>,
     head: Option<B::Weight>,
+    /// The output head's rows for a subset of the vocabulary (`ids`):
+    /// drafting scores only these tokens, reading a fraction of the full
+    /// head. Drafts only affect speed (verification uses the full head), and
+    /// a draft distribution with no mass outside the subset is still exact
+    /// for speculative sampling. None: draft over the whole vocabulary.
+    draft_head: Option<DraftHead<B>>,
+}
+
+struct DraftHead<B: Backend> {
+    w: B::Weight,
+    ids: Vec<u32>,
+}
+
+/// Default draft vocabulary: the first this many token ids (BPE merge
+/// order, a proxy for frequency) plus every control/user-defined token.
+/// Qwen3.6-35B-A3B on Strix Halo, long greedy generations: 131072 of the
+/// 248320 tokens keep the acceptance rate (71.7% vs 72.3% with the full
+/// head) and are 7% faster end to end; 32768 lose too many drafts (62.5%).
+const DRAFT_VOCAB: usize = 131072;
+
+/// The draft vocabulary: ids below `n`, then the special tokens above it.
+fn draft_vocab(g: &Gguf, vocab: usize, n: usize) -> Vec<u32> {
+    let types: Vec<i64> = g
+        .get("tokenizer.ggml.token_type")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|t| t.as_f64().unwrap_or(1.0) as i64).collect())
+        .unwrap_or_default();
+    // GGUF token types: 1 normal, 2 unknown, 3 control, 4 user-defined, 5 unused, 6 byte.
+    (0..vocab).filter(|&i| i < n || matches!(types.get(i), Some(3 | 4))).map(|i| i as u32).collect()
 }
 
 /// Per sequence slot, what MTP drafting carries between steps, and the
@@ -574,6 +603,20 @@ impl<B: Backend> Qwen35<B> {
                 layer: Layer { attn_norm: w(&p("attn_norm.weight"))?, mixer: attn(&p, n_attn)?, ffn: ffn(&p)? },
                 embed: opt(p("nextn.embed_tokens.weight"))?,
                 head: opt(p("nextn.shared_head_head.weight"))?,
+                draft_head: {
+                    let n = std::env::var("RLLM_MTP_VOCAB").ok().and_then(|v| v.parse().ok()).unwrap_or(DRAFT_VOCAB);
+                    let ids = draft_vocab(g, cfg.vocab, n);
+                    if n == 0 || ids.len() >= cfg.vocab {
+                        None
+                    } else {
+                        let src = [p("nextn.shared_head_head.weight"), "output.weight".into(), "token_embd.weight".into()]
+                            .into_iter()
+                            .find(|t| g.tensor(t).is_some())
+                            .context("no output head")?;
+                        let rows: Vec<usize> = ids.iter().map(|&i| i as usize).collect();
+                        Some(DraftHead { w: load_weight_rows(backend, g, &src, &rows)?, ids })
+                    }
+                },
             })
         } else {
             None
@@ -933,6 +976,21 @@ impl<B: Backend> Qwen35<B> {
         let mut next = b.alloc(n_slots * d)?;
         b.gather_rows(&cat, &keep, d, &mut next)?;
         b.copy_span(&next, 0, &mut st.chain, 0, n_slots * d)?;
+        if let Some(dh) = &mtp.draft_head {
+            // Score the draft vocabulary; every other token gets -inf.
+            let k = dh.ids.len();
+            let mut logits = b.alloc(n * k)?;
+            b.matmul(&hh, &dh.w, &mut logits, n)?;
+            let mut sub = vec![0f32; n * k];
+            b.to_host(&logits, &mut sub)?;
+            let mut host = vec![f32::NEG_INFINITY; n * c.vocab];
+            for (row, s) in host.chunks_exact_mut(c.vocab).zip(sub.chunks_exact(k)) {
+                for (&id, &v) in dh.ids.iter().zip(s) {
+                    row[id as usize] = v;
+                }
+            }
+            return Ok(host);
+        }
         let mut logits = b.alloc(n * c.vocab)?;
         b.matmul(&hh, mtp.head.as_ref().or(self.output.as_ref()).unwrap_or(&self.embed), &mut logits, n)?;
         let mut host = vec![0f32; n * c.vocab];

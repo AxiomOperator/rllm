@@ -47,7 +47,8 @@ r = client.chat.completions.create(model="my-model", messages=[{"role": "user", 
 | `-q`, `--quiet` | off | Don't log a line per finished generation. |
 
 Environment: `RLLM_API_KEY` (as `--api-key`), `RLLM_ENGINE_TIMING=1` (print
-where engine step time goes every 256 steps, draft model included), `RLLM_NO_PIN=1` (see
+where engine step time goes every 256 steps, draft model included), `RLLM_MTP_VOCAB=n`
+(MTP draft vocabulary size, below), `RLLM_NO_PIN=1` (see
 [Performance](#performance)).
 
 ## Choosing settings: `rllm tune`
@@ -269,6 +270,12 @@ below. For these models:
   verifies at most 6 drafts in all: 3 for each of up to 2 sequences, fewer
   as more decode together), about 0.9 GiB on the 27B. If they don't fit,
   the server starts without MTP and says so. `--no-mtp` turns it off;
+- the head drafts over the first 131072 token ids plus the special tokens
+  (`RLLM_MTP_VOCAB=n` sets the size; 0: the whole vocabulary), reading about
+  half of the 248k-row output matrix per draft token. Drafts only decide
+  speed: verification scores the whole vocabulary. On Qwen3.6-35B-A3B
+  (Strix Halo) this keeps the acceptance rate (71.7% vs 72.3%) and makes
+  long greedy generations 7% faster;
 - `--draft` and `--prompt-lookup` are ignored with a notice.
 
 With MTP, output is the same as without it: greedy output is token for token

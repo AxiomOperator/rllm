@@ -12,6 +12,22 @@ use rllm_core::{Activation, AttnMeta, Backend, DType, Error, GdnShape, HostTenso
 const KERNELS: &str = include_str!("../kernels/kernels.cu");
 /// Must match MV_MAX_M in kernels.cu.
 const MATVEC_MAX_M: usize = 8;
+/// Per sequence: how many snapshots it writes and its first entry (zeros
+/// without snapshots); every sequence's entries must fit in `entries`.
+fn snap_index(runs: &SeqRuns, entries: usize) -> Result<(Vec<u32>, Vec<u32>)> {
+    let n = runs.n_seqs();
+    if runs.snap.is_empty() || entries == 0 {
+        return Ok((vec![0; n], vec![0; n]));
+    }
+    for s in 0..n {
+        let (k, at) = (runs.snap[s] as usize, runs.snap_at[s] as usize);
+        if k > 0 && at + k > entries {
+            return Err(Error::Shape(format!("snapshots {at}..{} of {entries}", at + k)));
+        }
+    }
+    Ok((runs.snap.to_vec(), runs.snap_at.to_vec()))
+}
+
 /// Mirrors GDN_MAX_KERNEL in kernels.cu (longest conv1d_silu kernel).
 const GDN_MAX_KERNEL: usize = 16;
 const MATVEC_WARPS: u32 = 4;
@@ -2459,21 +2475,22 @@ impl Backend for CudaBackend {
             self.sync_index(&mut cache, "gdn_starts", runs.starts)?;
             self.sync_index(&mut cache, "gdn_slots", runs.slots)?;
             self.sync_index(&mut cache, "gdn_fresh", runs.fresh)?;
-            let n_slots = state.len() / (channels * (kernel - 1));
-            let snap_counts: Vec<u32> = if runs.snap.is_empty() { vec![0; runs.n_seqs()] } else { runs.snap.to_vec() };
-            self.sync_index(&mut cache, "gdn_snap", &snap_counts)?;
-            let (st, sl, fr, sn) = (&cache["gdn_starts"].dev, &cache["gdn_slots"].dev, &cache["gdn_fresh"].dev, &cache["gdn_snap"].dev);
+            let (counts, at) = snap_index(runs, snaps.as_ref().map_or(0, |s| s.1))?;
+            self.sync_index(&mut cache, "gdn_snap", &counts)?;
+            self.sync_index(&mut cache, "gdn_snap_at", &at)?;
+            let (st, sl, fr, sn, sa) =
+                (&cache["gdn_starts"].dev, &cache["gdn_slots"].dev, &cache["gdn_fresh"].dev, &cache["gdn_snap"].dev, &cache["gdn_snap_at"].dev);
             let cfg = LaunchConfig { grid_dim: (channels.div_ceil(128) as u32, runs.n_seqs() as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
             let (c, k) = (channels as i32, kernel as i32);
             match snaps {
                 Some((buf, n)) => {
-                    check_len("conv1d_silu snapshots", buf.len(), n_slots * n * channels * (kernel - 1))?;
+                    check_len("conv1d_silu snapshots", buf.len(), n * channels * (kernel - 1))?;
                     let n = n as i32;
-                    launch!(self, "conv1d_silu", cfg, [x, wd, state, st, sl, fr, out, &c, &k, buf, sn, &n])
+                    launch!(self, "conv1d_silu", cfg, [x, wd, state, st, sl, fr, out, &c, &k, buf, sn, sa, &n])
                 }
                 None => {
                     let n = 0i32;
-                    launch!(self, "conv1d_silu", cfg, [x, wd, state, st, sl, fr, out, &c, &k, out, sn, &n])
+                    launch!(self, "conv1d_silu", cfg, [x, wd, state, st, sl, fr, out, &c, &k, out, sn, sa, &n])
                 }
             }
         })
@@ -2511,22 +2528,23 @@ impl Backend for CudaBackend {
             self.sync_index(&mut cache, "gdn_starts", runs.starts)?;
             self.sync_index(&mut cache, "gdn_slots", runs.slots)?;
             self.sync_index(&mut cache, "gdn_fresh", runs.fresh)?;
-            let n_slots = state.len() / shape.state_len();
-            let snap_counts: Vec<u32> = if runs.snap.is_empty() { vec![0; runs.n_seqs()] } else { runs.snap.to_vec() };
-            self.sync_index(&mut cache, "gdn_snap", &snap_counts)?;
-            let (st, sl, fr, sn) = (&cache["gdn_starts"].dev, &cache["gdn_slots"].dev, &cache["gdn_fresh"].dev, &cache["gdn_snap"].dev);
+            let (counts, at) = snap_index(runs, snaps.as_ref().map_or(0, |s| s.1))?;
+            self.sync_index(&mut cache, "gdn_snap", &counts)?;
+            self.sync_index(&mut cache, "gdn_snap_at", &at)?;
+            let (st, sl, fr, sn, sa) =
+                (&cache["gdn_starts"].dev, &cache["gdn_slots"].dev, &cache["gdn_fresh"].dev, &cache["gdn_snap"].dev, &cache["gdn_snap_at"].dev);
             let cfg = LaunchConfig { grid_dim: (hv as u32, runs.n_seqs() as u32, 1), block_dim: (d as u32, 1, 1), shared_mem_bytes: 0 };
             let (k, v) = (hk as i32, hv as i32);
             let name = if d == 64 { "gated_delta_net_d64" } else { "gated_delta_net_d128" };
             match snaps {
                 Some((buf, n)) => {
-                    check_len("gated_delta_net snapshots", buf.len(), n_slots * n * shape.state_len())?;
+                    check_len("gated_delta_net snapshots", buf.len(), n * shape.state_len())?;
                     let n = n as i32;
-                    launch!(self, name, cfg, [qkv, alpha, beta, dt, av, state, st, sl, fr, out, &k, &v, &eps, buf, sn, &n])
+                    launch!(self, name, cfg, [qkv, alpha, beta, dt, av, state, st, sl, fr, out, &k, &v, &eps, buf, sn, sa, &n])
                 }
                 None => {
                     let n = 0i32;
-                    launch!(self, name, cfg, [qkv, alpha, beta, dt, av, state, st, sl, fr, out, &k, &v, &eps, out, sn, &n])
+                    launch!(self, name, cfg, [qkv, alpha, beta, dt, av, state, st, sl, fr, out, &k, &v, &eps, out, sn, sa, &n])
                 }
             }
         })

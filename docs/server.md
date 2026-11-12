@@ -262,7 +262,10 @@ full-attention layers (one in four). For these models:
   model), chaining from the main model's last hidden state. Every step also
   runs the head's K/V over its tokens, and verification steps snapshot the
   recurrent state after each token so rejected drafts roll back exactly.
-  Snapshots take 3 more state copies per slot. `--no-mtp` turns it off;
+  The snapshots are 6 state copies shared by every request (one step
+  verifies at most 6 drafts in all: 3 for each of up to 2 sequences, fewer
+  as more decode together), about 0.9 GiB on the 27B. If they don't fit,
+  the server starts without MTP and says so. `--no-mtp` turns it off;
 - `--draft` and `--prompt-lookup` are ignored with a notice.
 
 With MTP, output is the same as without it: greedy output is token for token

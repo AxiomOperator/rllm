@@ -88,11 +88,12 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
         self.model.recurrent()
     }
 
-    /// Turn on MTP drafting (up to `max_drafts` tokens per step): from now on
-    /// every step also feeds the model's MTP block. Ok(false) if the model
-    /// has no MTP head. Call before any sequence is fed.
-    pub fn enable_mtp(&mut self, max_drafts: usize) -> Result<bool> {
-        self.mtp = self.model.enable_mtp(self.backend, &mut self.kv, max_drafts)?;
+    /// Turn on MTP drafting, with room for `max_snapshots` draft tokens
+    /// verified per step (all sequences together): from now on every step
+    /// also feeds the model's MTP block. Ok(false) if the model has no MTP
+    /// head. Call before any sequence is fed.
+    pub fn enable_mtp(&mut self, max_snapshots: usize) -> Result<bool> {
+        self.mtp = self.model.enable_mtp(self.backend, &mut self.kv, max_snapshots)?;
         Ok(self.mtp)
     }
 

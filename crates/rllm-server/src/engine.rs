@@ -397,7 +397,22 @@ where
                 // the running batch, an embedding job and a spare.
                 let mut pool = KvPool::new(&backend, &model, kv_tokens, BLOCK_SIZE, cfg.kv_type, cfg.parallel.max(1) + 2)?;
                 let mtp_drafts = cfg.draft_tokens.clamp(1, MTP_MAX_DRAFTS);
-                let mtp_drafts = if cfg.mtp && pool.enable_mtp(mtp_drafts).context("enabling MTP drafting")? { mtp_drafts } else { 0 };
+                // Snapshots for the drafts one step verifies: at most
+                // `decoding` sequences with spec_len's share each.
+                let snapshots = (1..=SPEC_STEP_TOKENS).map(|d| d * mtp_drafts.min((SPEC_STEP_TOKENS / d).saturating_sub(1))).max().unwrap_or(0);
+                let mtp_drafts = match cfg.mtp && model.has_mtp() {
+                    false => 0,
+                    // Speculation only saves time: without room for its
+                    // snapshots, serve without it.
+                    true => match pool.enable_mtp(snapshots) {
+                        Ok(true) => mtp_drafts,
+                        Ok(false) => 0,
+                        Err(e) => {
+                            eprintln!("[rllm] MTP drafting disabled: {e:#} (its state snapshots don't fit; a smaller --kv-tokens or --parallel leaves room)");
+                            0
+                        }
+                    },
+                };
                 if cfg.host_cache_bytes > 0 {
                     pool.add_host_tier(cfg.host_cache_bytes, cfg.kv_type).context("allocating the host cache")?;
                 }
@@ -410,7 +425,14 @@ where
             let (pool, draft, mtp_drafts) = match pools {
                 Ok(p) => p,
                 Err(e) => {
-                    let _ = ready_tx.send(Err(format!("{e:#}")));
+                    // Free the device memory before reporting: the caller
+                    // exits on the error, and tearing down the GPU runtime
+                    // while this thread still frees weights crashed (HIP).
+                    let msg = format!("{e:#}");
+                    drop(draft_model);
+                    drop(model);
+                    drop(backend);
+                    let _ = ready_tx.send(Err(msg));
                     return;
                 }
             };

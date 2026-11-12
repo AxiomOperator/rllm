@@ -143,11 +143,11 @@ pub trait Model<B: Backend> {
         false
     }
 
-    /// Prepare `cache` for MTP drafting of up to `max_drafts` tokens per
-    /// step (snapshots for rolling back recurrent state). Ok(false) when the
-    /// model has no MTP head.
-    fn enable_mtp(&self, b: &B, cache: &mut Self::Cache, max_drafts: usize) -> Result<bool> {
-        let _ = (b, cache, max_drafts);
+    /// Prepare `cache` for MTP drafting, with room for `max_snapshots`
+    /// recurrent-state snapshots per step (one per draft token being
+    /// verified, over all sequences). Ok(false) when the model has no MTP head.
+    fn enable_mtp(&self, b: &B, cache: &mut Self::Cache, max_snapshots: usize) -> Result<bool> {
+        let _ = (b, cache, max_snapshots);
         Ok(false)
     }
 
@@ -359,9 +359,9 @@ impl<B: Backend> Model<B> for AnyModel<B> {
         matches!(self, Self::Qwen35(m) if m.has_mtp())
     }
 
-    fn enable_mtp(&self, b: &B, cache: &mut AnyCache<B>, max_drafts: usize) -> Result<bool> {
+    fn enable_mtp(&self, b: &B, cache: &mut AnyCache<B>, max_snapshots: usize) -> Result<bool> {
         match (self, cache) {
-            (Self::Qwen35(m), AnyCache::Qwen35(c)) => m.enable_mtp(b, c, max_drafts),
+            (Self::Qwen35(m), AnyCache::Qwen35(c)) => m.enable_mtp(b, c, max_snapshots),
             _ => Ok(false),
         }
     }

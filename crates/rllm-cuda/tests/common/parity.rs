@@ -742,7 +742,7 @@ fn gated_delta_net_ops_match() {
         let (mut ssc, mut ssg) = (upload_any(&cpu, &rng.vec(ssm_len)), upload_any(&gpu, &rng.vec(ssm_len)));
         // Step 1: both sequences start (5 and 3 tokens); step 2: 1 and 4 more.
         for (starts, fresh) in [(vec![0u32, 5, 8], vec![1u32, 1]), (vec![0u32, 1, 5], vec![0u32, 0])] {
-            let runs = rllm_core::SeqRuns { starts: &starts, slots: &[2, 0], fresh: &fresh, snap: &[] };
+            let runs = rllm_core::SeqRuns { starts: &starts, slots: &[2, 0], fresh: &fresh, snap: &[], snap_at: &[] };
             let t = *starts.last().unwrap() as usize;
             let xin = rng.vec(t * ch);
             let (xic, xig) = (upload_any(&cpu, &xin), upload_any(&gpu, &xin));
@@ -773,7 +773,8 @@ fn gated_delta_net_snapshots_roll_back() {
     let cpu = CpuBackend::new();
     let mut rng = Rng(36);
     let shape = rllm_core::GdnShape { n_k_heads: 2, n_v_heads: 4, head_dim: 128 };
-    let (ch, kernel, slots, n_snap) = (shape.qkv_width(), 4usize, 2usize, 3usize);
+    // Snapshot entries are shared by the step: 3 for each of the 2 sequences.
+    let (ch, kernel, slots, n_snap) = (shape.qkv_width(), 4usize, 2usize, 6usize);
     let (conv_len, ssm_len) = (ch * (kernel - 1), shape.state_len());
     let hv = shape.n_v_heads;
     let conv_w = f32_tensor("conv", &rng.vec(ch * kernel).iter().map(|v| v * 0.5).collect::<Vec<_>>());
@@ -783,15 +784,16 @@ fn gated_delta_net_snapshots_roll_back() {
     let (dtc, dtg, ac, ag) = (cpu.upload(&dt).unwrap(), gpu.upload(&dt).unwrap(), cpu.upload(&a).unwrap(), gpu.upload(&a).unwrap());
     let (mut csc, mut csg) = (upload_any(&cpu, &vec![0.0; slots * conv_len]), upload_any(&gpu, &vec![0.0; slots * conv_len]));
     let (mut ssc, mut ssg) = (upload_any(&cpu, &vec![0.0; slots * ssm_len]), upload_any(&gpu, &vec![0.0; slots * ssm_len]));
-    let (mut cnc, mut cng) = (upload_any(&cpu, &vec![0.0; slots * n_snap * conv_len]), upload_any(&gpu, &vec![0.0; slots * n_snap * conv_len]));
-    let (mut snc, mut sng) = (upload_any(&cpu, &vec![0.0; slots * n_snap * ssm_len]), upload_any(&gpu, &vec![0.0; slots * n_snap * ssm_len]));
+    let (mut cnc, mut cng) = (upload_any(&cpu, &vec![0.0; n_snap * conv_len]), upload_any(&gpu, &vec![0.0; n_snap * conv_len]));
+    let (mut snc, mut sng) = (upload_any(&cpu, &vec![0.0; n_snap * ssm_len]), upload_any(&gpu, &vec![0.0; n_snap * ssm_len]));
     // Prompt (5 and 6 tokens), a verification step of 4 tokens each with
     // snapshots, then keep 2 (sequence in slot 0) and 1 (slot 1) of them,
     // then one more token each.
     let steps: [(Vec<u32>, Vec<u32>, Vec<u32>); 3] =
         [(vec![0, 5, 11], vec![1, 1], vec![]), (vec![0, 4, 8], vec![0, 0], vec![3, 3]), (vec![0, 1, 2], vec![0, 0], vec![])];
     for (step, (starts, fresh, snap)) in steps.iter().enumerate() {
-        let runs = rllm_core::SeqRuns { starts, slots: &[0, 1], fresh, snap };
+        let snap_at: &[u32] = if snap.is_empty() { &[] } else { &[0, 3] };
+        let runs = rllm_core::SeqRuns { starts, slots: &[0, 1], fresh, snap, snap_at };
         let t = *starts.last().unwrap() as usize;
         let xin = rng.vec(t * ch);
         let (xic, xig) = (upload_any(&cpu, &xin), upload_any(&gpu, &xin));
@@ -809,12 +811,13 @@ fn gated_delta_net_snapshots_roll_back() {
         gpu.gated_delta_net(&qg, &alg, &beg, &dtg, &ag, &mut ssg, &runs, &mut yg, shape, 1e-6, snaps.then_some((&mut sng, n_snap))).unwrap();
         assert_close(&format!("gdn step {step}"), &download(&cpu, &yc, t * hv * 128), &download(&gpu, &yg, t * hv * 128), 1e-4);
         if snaps {
-            // Roll back: slot 0 keeps 2 tokens (snapshot 1), slot 1 keeps 1 (snapshot 0).
-            for (slot, j) in [(0usize, 1usize), (1, 0)] {
-                cpu.copy_span(&cnc, (slot * n_snap + j) * conv_len, &mut csc, slot * conv_len, conv_len).unwrap();
-                gpu.copy_span(&cng, (slot * n_snap + j) * conv_len, &mut csg, slot * conv_len, conv_len).unwrap();
-                cpu.copy_span(&snc, (slot * n_snap + j) * ssm_len, &mut ssc, slot * ssm_len, ssm_len).unwrap();
-                gpu.copy_span(&sng, (slot * n_snap + j) * ssm_len, &mut ssg, slot * ssm_len, ssm_len).unwrap();
+            // Roll back: slot 0 keeps 2 tokens (its entry 0 + 1), slot 1
+            // keeps 1 (its entry 3 + 0).
+            for (slot, e) in [(0usize, 1usize), (1, 3)] {
+                cpu.copy_span(&cnc, e * conv_len, &mut csc, slot * conv_len, conv_len).unwrap();
+                gpu.copy_span(&cng, e * conv_len, &mut csg, slot * conv_len, conv_len).unwrap();
+                cpu.copy_span(&snc, e * ssm_len, &mut ssc, slot * ssm_len, ssm_len).unwrap();
+                gpu.copy_span(&sng, e * ssm_len, &mut ssg, slot * ssm_len, ssm_len).unwrap();
             }
         }
     }

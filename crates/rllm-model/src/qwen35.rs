@@ -321,13 +321,15 @@ pub struct MtpState<B: Backend> {
     pending: B::Buffer,
     /// `[slots, hidden]`: the previous MTP step's hidden state (draft chains).
     chain: B::Buffer,
-    /// Per recurrent layer: state after each of the step's first `n_snap` tokens.
+    /// Per recurrent layer: `n_snap` state snapshots shared by the step's
+    /// sequences (each verifying sequence takes as many entries as drafts).
     conv_snap: Vec<B::Buffer>,
     ssm_snap: Vec<B::Buffer>,
     n_snap: usize,
-    /// The last step's normalized hidden states, and per state slot its rows there.
+    /// The last step's normalized hidden states, and per sequence (state
+    /// slot, first row, rows, first snapshot entry).
     step_h: Option<B::Buffer>,
-    step_rows: Vec<(u32, usize, usize)>,
+    step_rows: Vec<(u32, usize, usize, usize)>,
 }
 
 pub struct Qwen35<B: Backend> {
@@ -469,9 +471,15 @@ impl<B: Backend> Qwen35<B> {
         let fresh: Vec<u32> = starts.iter().map(|&t| (batch.positions[t as usize] == 0) as u32).collect();
         starts.push(n as u32);
         let mtp_on = batch.mtp && self.mtp.is_some() && cache.mtp.is_some();
-        // Snapshots only exist with MTP enabled (they serve its verification steps).
+        // Snapshots only exist with MTP enabled (they serve its verification
+        // steps); sequences take consecutive entries of the shared buffers.
         let snap: &[u32] = if cache.mtp.is_some() { batch.snap } else { &[] };
-        let runs = SeqRuns { starts: &starts, slots: batch.state_slots, fresh: &fresh, snap };
+        let snap_at: Vec<u32> = snap.iter().scan(0u32, |acc, &k| { let at = *acc; *acc += k; Some(at) }).collect();
+        if let Some(st) = &cache.mtp {
+            let total: u32 = snap.iter().sum();
+            ensure!(total as usize <= st.n_snap, "step needs {total} recurrent-state snapshots, {} allocated", st.n_snap);
+        }
+        let runs = SeqRuns { starts: &starts, slots: batch.state_slots, fresh: &fresh, snap, snap_at: &snap_at };
         runs.check(n, cache.n_slots)?;
         let snapping = snap.iter().any(|&k| k > 0);
 
@@ -556,7 +564,9 @@ impl<B: Backend> Qwen35<B> {
             let mut rows = b.alloc(m * d)?;
             b.gather_rows(&hn, batch.logit_rows, d, &mut rows)?;
             let st = cache.mtp.as_mut().expect("mtp_on");
-            st.step_rows = (0..n_seqs).map(|s| (batch.state_slots[s], starts[s] as usize, (starts[s + 1] - starts[s]) as usize)).collect();
+            st.step_rows = (0..n_seqs)
+                .map(|s| (batch.state_slots[s], starts[s] as usize, (starts[s + 1] - starts[s]) as usize, snap_at.get(s).map_or(0, |&a| a as usize)))
+                .collect();
             st.step_h = Some(hn);
             rows
         } else {
@@ -636,11 +646,11 @@ impl<B: Backend> Qwen35<B> {
         Ok(())
     }
 
-    pub fn enable_mtp(&self, b: &B, cache: &mut Cache<B>, max_drafts: usize) -> Result<bool> {
+    pub fn enable_mtp(&self, b: &B, cache: &mut Cache<B>, max_snapshots: usize) -> Result<bool> {
         if self.mtp.is_none() {
             return Ok(false);
         }
-        let (slots, d, n_snap) = (cache.n_slots, self.cfg.hidden, max_drafts.max(1));
+        let (slots, d, n_snap) = (cache.n_slots, self.cfg.hidden, max_snapshots.max(1));
         let (conv, ssm) = self.cfg.state_floats();
         let n_rec = self.cfg.n_recurrent_layers();
         let mut pending = b.alloc((slots + 1) * d)?;
@@ -650,8 +660,8 @@ impl<B: Backend> Qwen35<B> {
         cache.mtp = Some(MtpState {
             pending,
             chain: b.alloc(slots * d)?,
-            conv_snap: (0..n_rec).map(|_| b.alloc(slots * n_snap * conv)).collect::<std::result::Result<_, _>>()?,
-            ssm_snap: (0..n_rec).map(|_| b.alloc(slots * n_snap * ssm)).collect::<std::result::Result<_, _>>()?,
+            conv_snap: (0..n_rec).map(|_| b.alloc(n_snap * conv)).collect::<std::result::Result<_, _>>()?,
+            ssm_snap: (0..n_rec).map(|_| b.alloc(n_snap * ssm)).collect::<std::result::Result<_, _>>()?,
             n_snap,
             step_h: None,
             step_rows: Vec::new(),
@@ -664,18 +674,18 @@ impl<B: Backend> Qwen35<B> {
         let (conv, ssm) = self.cfg.state_floats();
         let Cache { conv: conv_state, ssm: ssm_state, mtp, .. } = cache;
         let st = mtp.as_mut().context("keep_step without MTP state")?;
-        let &(_, row0, n_rows) = st.step_rows.iter().find(|r| r.0 == slot).context("keep_step: sequence not in the last step")?;
+        let &(_, row0, n_rows, at) = st.step_rows.iter().find(|r| r.0 == slot).context("keep_step: sequence not in the last step")?;
         if kept >= n_rows {
             return Ok(());
         }
-        ensure!(kept >= 1 && kept <= st.n_snap, "keep_step: keeping {kept} of {n_rows} tokens ({} snapshots)", st.n_snap);
-        let (j, s) = (kept - 1, slot as usize);
+        ensure!(kept >= 1 && at + kept <= st.n_snap, "keep_step: keeping {kept} of {n_rows} tokens (snapshot entries from {at} of {})", st.n_snap);
+        let (e, s) = (at + kept - 1, slot as usize);
         for l in 0..conv_state.len() {
-            b.copy_span(&st.conv_snap[l], (s * st.n_snap + j) * conv, &mut conv_state[l], s * conv, conv)?;
-            b.copy_span(&st.ssm_snap[l], (s * st.n_snap + j) * ssm, &mut ssm_state[l], s * ssm, ssm)?;
+            b.copy_span(&st.conv_snap[l], e * conv, &mut conv_state[l], s * conv, conv)?;
+            b.copy_span(&st.ssm_snap[l], e * ssm, &mut ssm_state[l], s * ssm, ssm)?;
         }
         let h = st.step_h.as_ref().context("keep_step: no hidden states")?;
-        b.copy_span(h, (row0 + j) * d, &mut st.pending, s * d, d)?;
+        b.copy_span(h, (row0 + kept - 1) * d, &mut st.pending, s * d, d)?;
         Ok(())
     }
 
@@ -762,8 +772,8 @@ impl<B: Backend> Model<B> for Qwen35<B> {
         self.mtp.is_some()
     }
 
-    fn enable_mtp(&self, b: &B, cache: &mut Cache<B>, max_drafts: usize) -> Result<bool> {
-        Qwen35::enable_mtp(self, b, cache, max_drafts)
+    fn enable_mtp(&self, b: &B, cache: &mut Cache<B>, max_snapshots: usize) -> Result<bool> {
+        Qwen35::enable_mtp(self, b, cache, max_snapshots)
     }
 
     fn keep_step(&self, b: &B, cache: &mut Cache<B>, slot: u32, kept: usize) -> Result<()> {

@@ -165,13 +165,15 @@ pub struct AttnMeta<'a> {
 /// keeps its state in slot `slots[s]`, and starts from a zero state when
 /// `fresh[s]` is nonzero (its first token is at position 0). With
 /// snapshots (speculative verification), the state after each of its first
-/// `snap[s]` tokens is also kept, so the step can be rolled back to any of
-/// them (`snap` empty: none).
+/// `snap[s]` tokens is also kept, in snapshot entries `snap_at[s]..` of the
+/// step's snapshot buffer, so the step can be rolled back to any of them
+/// (`snap` empty: none).
 pub struct SeqRuns<'a> {
     pub starts: &'a [u32],
     pub slots: &'a [u32],
     pub fresh: &'a [u32],
     pub snap: &'a [u32],
+    pub snap_at: &'a [u32],
 }
 
 impl SeqRuns<'_> {
@@ -188,7 +190,7 @@ impl SeqRuns<'_> {
             && self.starts.last().map(|&e| e as usize) == Some(n_tokens)
             && self.starts.windows(2).all(|w| w[0] < w[1])
             && self.slots.iter().all(|&s| (s as usize) < n_slots)
-            && (self.snap.is_empty() || self.snap.len() == n);
+            && (self.snap.is_empty() || (self.snap.len() == n && self.snap_at.len() == n));
         if ok { Ok(()) } else { Err(Error::Shape(format!("bad sequence runs for {n_tokens} tokens and {n_slots} state slots"))) }
     }
 }
@@ -366,9 +368,9 @@ pub trait Backend: Send + Sync {
     /// inputs before the step's first token come from `state`: per slot,
     /// the sequence's last `kernel - 1` inputs, `[slots, channels, kernel - 1]`
     /// (zeros for a fresh sequence). `state` is updated to end with this
-    /// step's inputs. `snaps` (with `runs.snap`) receives the state after each
-    /// of a sequence's first `snap[s]` tokens: `[slots, n_snap, channels,
-    /// kernel - 1]`.
+    /// step's inputs. `snaps` (buffer, entries) receives the state after each
+    /// of a sequence's first `snap[s]` tokens, at entries `snap_at[s]..`:
+    /// `[entries, channels, kernel - 1]`.
     #[allow(clippy::too_many_arguments)]
     fn conv1d_silu(
         &self,
@@ -393,9 +395,10 @@ pub trait Backend: Send + Sync {
     /// `state`: `[slots, n_v_heads * head_dim²]` floats, laid out per head
     /// as the backend likes (only that backend reads it); zero for fresh
     /// sequences.
-    /// `out` is `[tokens, n_v_heads * head_dim]`. `snaps` (with `runs.snap`)
-    /// receives the state after each of a sequence's first `snap[s]` tokens,
-    /// `[slots, n_snap, state]` in the same per-head layout as `state`.
+    /// `out` is `[tokens, n_v_heads * head_dim]`. `snaps` (buffer, entries)
+    /// receives the state after each of a sequence's first `snap[s]` tokens
+    /// at entries `snap_at[s]..`, `[entries, state]` in the same per-head
+    /// layout as `state`.
     #[allow(clippy::too_many_arguments)]
     fn gated_delta_net(
         &self,

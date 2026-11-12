@@ -615,8 +615,24 @@ impl<B: Backend> Qwen35<B> {
         let qw = c.n_heads * hd;
         let kvw = c.n_kv_heads * hd;
         let (conv_w, inner, hv) = (c.gdn.qkv_width(), c.gdn.n_v_heads * c.gdn.head_dim, c.gdn.n_v_heads);
-        // No graph capture yet: the recurrent ops' index data isn't graph-safe.
-        b.begin_step(None)?;
+        // Decode-sized steps replay a recorded graph. What varies between
+        // steps with one key (tokens, positions, KV and state slots, fresh
+        // flags, snapshot counts, MTP row choices) is index data the replay
+        // refreshes; whether MTP runs and snapshots are taken changes the
+        // launches themselves, so they are part of the key.
+        let key = batch.graph_key(self as *const Self as usize).map(|k| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (k, mtp_on, snapping).hash(&mut h);
+            h.finish()
+        });
+        // The previous step's hidden states (kept for `keep_step`, which has
+        // run by now) are freed here: freeing an eagerly allocated buffer
+        // inside a graph capture would break the capture.
+        if let Some(st) = cache.mtp.as_mut() {
+            st.step_h = None;
+        }
+        b.begin_step(key)?;
 
         let mut x = b.alloc(n * d)?;
         let mut h = b.alloc(n * d)?;
@@ -784,14 +800,20 @@ impl<B: Backend> Qwen35<B> {
         let Mixer::Attn { wk, wv, k_norm, kv_layer, .. } = &mtp.layer.mixer else { unreachable!("MTP block is attention") };
         let (n, d, kvw) = (batch.tokens.len(), c.hidden, c.n_kv_heads * c.head_dim);
         let st = cache.mtp.as_mut().expect("checked");
-        let prev: Vec<u32> = (0..n as u32).map(|t| t.saturating_sub(1)).collect();
-        let mut src = b.alloc(n * d)?;
-        b.gather_rows(hn, &prev, d, &mut src)?;
-        let zero = cache.n_slots;
+        // Rows of `cat = [pending | hn]`, chosen by gathers (not copies at
+        // host-computed offsets, which a recorded graph would freeze).
+        let np = cache.n_slots + 1;
+        let mut cat = b.alloc((np + n) * d)?;
+        b.copy_span(&st.pending, 0, &mut cat, 0, np * d)?;
+        b.copy_span(hn, 0, &mut cat, np * d, n * d)?;
+        // Each token pairs with the previous token's hidden state; a
+        // sequence's first token with its saved one (zeros if fresh).
+        let mut prev: Vec<u32> = (0..n).map(|t| (np + t.saturating_sub(1)) as u32).collect();
         for s in 0..runs.n_seqs() {
-            let from = if runs.fresh[s] != 0 { zero } else { runs.slots[s] as usize };
-            b.copy_span(&st.pending, from * d, &mut src, runs.starts[s] as usize * d, d)?;
+            prev[runs.starts[s] as usize] = if runs.fresh[s] != 0 { cache.n_slots as u32 } else { runs.slots[s] };
         }
+        let mut src = b.alloc(n * d)?;
+        b.gather_rows(&cat, &prev, d, &mut src)?;
         let xm = self.mtp_input(b, mtp, batch.tokens, &src)?;
         let mut h = b.alloc(n * d)?;
         b.rms_norm(&xm, &mtp.layer.attn_norm, &mut h, n, c.rms_eps)?;
@@ -799,9 +821,14 @@ impl<B: Backend> Qwen35<B> {
         b.matmul_many(&h, &[wk, wv], &mut [&mut k, &mut v], n)?;
         b.rms_norm_rope(&k, k_norm, &mut kn, batch.positions, c.n_kv_heads, c.head_dim, c.rms_eps, c.rope_theta, Some(&self.rope_factors))?;
         b.kv_store(&mut cache.kv, *kv_layer, &kn, &v, batch.slots)?;
+        // Save each sequence's last hidden state in its pending row.
+        let mut keep: Vec<u32> = (0..np as u32).collect();
         for s in 0..runs.n_seqs() {
-            b.copy_span(hn, (runs.starts[s + 1] as usize - 1) * d, &mut st.pending, runs.slots[s] as usize * d, d)?;
+            keep[runs.slots[s] as usize] = np as u32 + runs.starts[s + 1] - 1;
         }
+        let mut next = b.alloc(np * d)?;
+        b.gather_rows(&cat, &keep, d, &mut next)?;
+        b.copy_span(&next, 0, &mut st.pending, 0, np * d)?;
         Ok(())
     }
 
@@ -856,7 +883,8 @@ impl<B: Backend> Qwen35<B> {
         ensure!(n > 0 && dr.positions.len() == n && dr.slots.len() == n && dr.block_tables.len() == n && dr.state_slots.len() == n, "bad MTP batch");
         let (d, hd) = (c.hidden, c.head_dim);
         let (qw, kvw) = (c.n_heads * hd, c.n_kv_heads * hd);
-        b.begin_step(None)?;
+        b.begin_step(dr.graph_key(self as *const Self as usize))?;
+        let n_slots = cache.n_slots;
         let Cache { kv, mtp: st, .. } = cache;
         let st = st.as_mut().context("MTP not enabled")?;
         let mut src = b.alloc(n * d)?;
@@ -894,9 +922,17 @@ impl<B: Backend> Qwen35<B> {
         b.add(&mut xm, &o, n * d)?;
         let mut hh = b.alloc(n * d)?;
         b.rms_norm(&xm, &mtp.head_norm, &mut hh, n, c.rms_eps)?;
+        // chain[slot] = hh[i], by a gather over `[chain | hh]` (graph-safe).
+        let mut cat = b.alloc((n_slots + n) * d)?;
+        b.copy_span(&st.chain, 0, &mut cat, 0, n_slots * d)?;
+        b.copy_span(&hh, 0, &mut cat, n_slots * d, n * d)?;
+        let mut keep: Vec<u32> = (0..n_slots as u32).collect();
         for (i, &s) in dr.state_slots.iter().enumerate() {
-            b.copy_span(&hh, i * d, &mut st.chain, s as usize * d, d)?;
+            keep[s as usize] = (n_slots + i) as u32;
         }
+        let mut next = b.alloc(n_slots * d)?;
+        b.gather_rows(&cat, &keep, d, &mut next)?;
+        b.copy_span(&next, 0, &mut st.chain, 0, n_slots * d)?;
         let mut logits = b.alloc(n * c.vocab)?;
         b.matmul(&hh, mtp.head.as_ref().or(self.output.as_ref()).unwrap_or(&self.embed), &mut logits, n)?;
         let mut host = vec![0f32; n * c.vocab];

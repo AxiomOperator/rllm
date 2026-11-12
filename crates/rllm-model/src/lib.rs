@@ -59,6 +59,24 @@ pub struct MtpBatch<'a> {
     /// First step of a chain: the hidden state comes from the main model's
     /// last token; later ones from the previous MTP step.
     pub first: bool,
+    /// Identifies the KV cache (as [`Batch::cache_id`]).
+    pub cache_id: u64,
+}
+
+impl MtpBatch<'_> {
+    /// Graph key for an MTP draft step (see [`Batch::graph_key`]): the
+    /// sequence count, padded block-table width, chain position and cache.
+    pub fn graph_key(&self, model_id: usize) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let n = self.tokens.len();
+        if n > 64 {
+            return None;
+        }
+        let width = self.block_tables.iter().map(Vec::len).max().unwrap_or(0).max(1).next_power_of_two();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        ("mtp_draft", model_id, self.cache_id, n, width, self.first).hash(&mut h);
+        Some(h.finish())
+    }
 }
 
 /// What a forward step returns.

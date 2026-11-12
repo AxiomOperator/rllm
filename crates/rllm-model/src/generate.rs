@@ -123,7 +123,7 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
         }
         let tables: Vec<Vec<u32>> = items.iter().map(|i| i.0.block_table.clone()).collect();
         let states: Vec<u32> = items.iter().map(|i| i.0.state.ok_or_else(|| anyhow::anyhow!("MTP needs a recurrent state slot"))).collect::<Result<_>>()?;
-        let d = MtpBatch { tokens: &tokens, positions: &positions, slots: &slots, block_tables: &tables, state_slots: &states, first };
+        let d = MtpBatch { tokens: &tokens, positions: &positions, slots: &slots, block_tables: &tables, state_slots: &states, first, cache_id: self.id };
         self.model.mtp_draft(self.backend, &mut self.kv, &d, bs)
     }
 

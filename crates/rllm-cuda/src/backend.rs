@@ -504,6 +504,9 @@ struct GraphState {
     launched: bool,
     /// Counter for `Graph::last_used`.
     tick: u64,
+    /// `gather_rows` calls so far in this step: each gets its own index
+    /// array, so a step can gather different rows more than once.
+    gathers: usize,
 }
 
 const ARENA_ALIGN: usize = 256;
@@ -511,6 +514,8 @@ const ARENA_ALIGN: usize = 256;
 /// keys include the batch shape and KV cache, so a long-running server
 /// would otherwise accumulate graphs for every shape and cache it saw.
 const MAX_GRAPHS: usize = 64;
+/// Index arrays for the `gather_rows` calls of one step, in call order.
+const GATHER_KEYS: [&str; 8] = ["gather_rows", "gather_rows1", "gather_rows2", "gather_rows3", "gather_rows4", "gather_rows5", "gather_rows6", "gather_rows7"];
 /// Measured arena sizes kept (plain numbers; cleared wholesale past this).
 const MAX_MEASURED: usize = 1024;
 
@@ -770,6 +775,7 @@ impl CudaBackend {
                 index_writes: HashMap::new(),
                 launched: false,
                 tick: 0,
+                gathers: 0,
             }),
             graphs_enabled: std::env::var_os("RLLM_NO_GRAPHS").is_none() && std::env::var_os("RLLM_PROFILE").is_none(),
             profile: Profile { enabled: std::env::var_os("RLLM_PROFILE").is_some(), ..Default::default() },
@@ -969,6 +975,7 @@ impl CudaBackend {
             let _ = gpu::end_capture(&self.stream);
         }
         g.written.clear();
+        g.gathers = 0;
         g.arena_off = 0;
         g.launched = false;
         drop(g);
@@ -1652,6 +1659,7 @@ impl Backend for CudaBackend {
             g.written.clear();
             g.arena_off = 0;
             g.launched = false;
+            g.gathers = 0;
             let Some(key) = graph_key.filter(|_| self.graphs_enabled) else {
                 g.mode = StepMode::Eager;
                 return Ok(());
@@ -2718,9 +2726,19 @@ impl Backend for CudaBackend {
             if let Some(&max) = rows.iter().max() {
                 check_len("gather_rows x", x.len(), (max as usize + 1) * width)?;
             }
+            // One index array per call in the step (they may differ).
+            let name = {
+                let mut g = self.graph.lock().unwrap();
+                let i = g.gathers;
+                g.gathers += 1;
+                if g.mode != StepMode::Eager && i >= GATHER_KEYS.len() {
+                    return Err(Error::Backend(format!("more than {} gather_rows calls in a graph step", GATHER_KEYS.len())));
+                }
+                GATHER_KEYS[i % GATHER_KEYS.len()]
+            };
             let mut cache = self.index_cache.lock().unwrap();
-            self.sync_index(&mut cache, "gather_rows", rows)?;
-            let r = &cache["gather_rows"].dev;
+            self.sync_index(&mut cache, name, rows)?;
+            let r = &cache[name].dev;
             let (nr, w) = (rows.len() as i32, width as i32);
             launch!(self, "gather_rows", grid_1d(rows.len() * width, 256)?, [x, r, out, &nr, &w])
         })

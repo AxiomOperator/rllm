@@ -292,8 +292,13 @@ experts (softmax, weights renormalized over the chosen ones) and a shared
 expert is added, scaled by a sigmoid gate. On the GPU, decode steps (up to 8
 tokens) run one matrix-vector product per (token, expert) pair, reading only
 the chosen experts' weights; prefill sorts the pairs by expert and runs one
-grouped int8 GEMM over all experts. The experts must be quantized (any of
-rllm's formats: Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS), and all of them live in GPU
+grouped int8 GEMM over all experts. Experts can be any of rllm's quantized
+formats (Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS) or float (BF16, F16, F32: run
+on f32 activations with f32 accumulation, decode and a grouped prefill GEMM
+alike), mixed freely within a layer; Unsloth's UD quants keep some expert
+layers in BF16 and the MTP layer's experts in Q3_K. Q3_K is stored on the GPU
+in the 6-bit layout (its values are Q6_K-shaped, so this is exact), about
+twice its file size. All experts live in GPU
 memory: there is no CPU offload, so the 35B-A3B at Q4_K_M needs about 24 GB.
 `rllm tune` counts the experts' weights and the routing buffers.
 

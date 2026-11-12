@@ -5,6 +5,8 @@ pub enum DType {
     F16,
     BF16,
     Q8_0,
+    /// 3-bit (2 low bits + a high-bit mask), 6-bit scale per 16, no offset.
+    Q3K,
     Q4K,
     Q5K,
     Q6K,
@@ -18,6 +20,7 @@ impl DType {
             0 => DType::F32,
             1 => DType::F16,
             8 => DType::Q8_0,
+            11 => DType::Q3K,
             12 => DType::Q4K,
             13 => DType::Q5K,
             14 => DType::Q6K,
@@ -33,6 +36,7 @@ impl DType {
             DType::F16 => "F16",
             DType::BF16 => "BF16",
             DType::Q8_0 => "Q8_0",
+            DType::Q3K => "Q3_K",
             DType::Q4K => "Q4_K",
             DType::Q5K => "Q5_K",
             DType::Q6K => "Q6_K",
@@ -45,7 +49,7 @@ impl DType {
         match self {
             DType::F32 | DType::F16 | DType::BF16 => 1,
             DType::Q8_0 => 32,
-            DType::Q4K | DType::Q5K | DType::Q6K | DType::IQ4XS => 256,
+            DType::Q3K | DType::Q4K | DType::Q5K | DType::Q6K | DType::IQ4XS => 256,
         }
     }
 
@@ -55,6 +59,7 @@ impl DType {
             DType::F32 => 4,
             DType::F16 | DType::BF16 => 2,
             DType::Q8_0 => 34,
+            DType::Q3K => 110,
             DType::Q4K => 144,
             DType::Q5K => 176,
             DType::Q6K => 210,

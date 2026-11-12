@@ -160,6 +160,10 @@ impl Fmt {
             DType::Q8_0 => Fmt::Q8,
             DType::Q4K => Fmt::Q4,
             DType::Q6K => Fmt::Q6,
+            // Q3_K's values (d * (scale - 32) * q, q in -4..3, a scale per
+            // 16) are Q6_K-shaped: stored in the 6-bit device format as
+            // q + 32, bit-identical after dequantization (repack_q3_k).
+            DType::Q3K => Fmt::Q6,
             DType::Q5K => Fmt::Q5,
             DType::IQ4XS => Fmt::IQ4,
         }
@@ -672,7 +676,7 @@ impl CudaBackend {
             "f32_to_f16", "f32_to_bf16", "half_to_f32", "logit_adjust", "sample_rows", "rms_norm", "add_rms_norm", "rms_norm_add", "qkv_norm_rope_store", "rms_norm_rope", "rope_neox", "silu_mul", "gelu_mul", "gelu_mul_strided", "ple_gate_f32", "gelu", "mul_inplace", "scale_inplace", "softcap_inplace", "sigmoid_mul_inplace", "conv1d_silu", "copy_span", "gated_delta_net_d64", "gated_delta_net_d128",
             "skinny_f32", "skinny_f16", "skinny_bf16", "moe_route", "moe_count", "moe_scan", "moe_place", "moe_combine", "add_sigmoid_scaled",
             "add_inplace", "gather_rows", "gather_strided", "kv_store", "kv_store_q8", "kv_copy_blocks", "kv_dequant_blocks", "kv_rotate_q", "attn_decode_combine", "paged_attention", "attn_prefill", "attn_prefill_tc", "quantize_q8", "repack_q8_0",
-            "repack_q4_k", "repack_q6_k", "repack_q5_k", "repack_iq4_xs", "mmq_sum_splits",
+            "repack_q4_k", "repack_q6_k", "repack_q3_k", "repack_q5_k", "repack_iq4_xs", "mmq_sum_splits",
             "matvec_glu_silu_f32", "matvec_glu_silu_f16", "matvec_glu_silu_bf16", "matvec_glu_gelu_f32", "matvec_glu_gelu_f16", "matvec_glu_gelu_bf16",
         ]
         .map(String::from)
@@ -687,6 +691,11 @@ impl CudaBackend {
         }
         for fmt in Fmt::ALL {
             for k in ["matvec", "dequant_f16", "embed"] {
+                names.push(format!("{k}_{}", fmt.suffix()));
+            }
+        }
+        for fmt in [Fmt::F32, Fmt::F16, Fmt::BF16] {
+            for k in ["moe_matvec_f", "moe_gemm_f"] {
                 names.push(format!("{k}_{}", fmt.suffix()));
             }
         }
@@ -1601,7 +1610,8 @@ impl Backend for CudaBackend {
                 Fmt::Q4 => launch!(self, "repack_q4_k", cfg, [&staging, &mut qs, &mut sc, &r0, &ni, &k])?,
                 Fmt::Q6 => {
                     let qh = qh.as_mut().unwrap();
-                    launch!(self, "repack_q6_k", cfg, [&staging, &mut qs, qh, &mut sc, &r0, &ni, &k])?
+                    let name = if t.dtype == DType::Q3K { "repack_q3_k" } else { "repack_q6_k" };
+                    launch!(self, name, cfg, [&staging, &mut qs, qh, &mut sc, &r0, &ni, &k])?
                 }
                 Fmt::Q5 => {
                     let qh = qh.as_mut().unwrap();
@@ -2584,8 +2594,11 @@ impl Backend for CudaBackend {
             if !n_ff.is_multiple_of(32) || !d.is_multiple_of(32) {
                 return Err(Error::Shape(format!("moe_ffn: widths {d} and {n_ff} must be multiples of 32")));
             }
-            if ![gate, up, down].iter().all(|w| w.fmt.quantized()) {
-                return Err(Error::Unsupported(format!("moe_ffn: expert weights {:?}/{:?}/{:?} (the GPU needs quantized experts)", gate.fmt, up.fmt, down.fmt)));
+            // Quantized experts run on int8 activations; float ones (f32, f16,
+            // bf16) on f32 activations with f32 accumulation. Rows must split
+            // into 8-value vector loads.
+            if !n_ff.is_multiple_of(8) || !d.is_multiple_of(8) {
+                return Err(Error::Shape(format!("moe_ffn: widths {d} and {n_ff} must be multiples of 8")));
             }
             check_len("moe_ffn x", x.len(), m * d)?;
             check_len("moe_ffn logits", logits.len(), m * ne)?;
@@ -2615,12 +2628,28 @@ impl Backend for CudaBackend {
             let (ids, wts) = (self.alloc(np)?, self.alloc(np)?);
             let (norm, one) = (norm_topk as i32, 1i32);
             launch!(self, "moe_route", grid_1d(m * WARP as usize, 128)?, [logits, &mi, &nei, &ki, &norm, &scale, &ids, &wts])?;
-            // int8 inputs, the experts' int8 hidden rows (one per pair) and their outputs.
-            let (xq, xd, xs) = (self.alloc((m * d).div_ceil(4))?, self.alloc(m * d / 32)?, self.alloc(m * d / 32)?);
-            let nu = (m * d / 32) as i64;
-            launch!(self, "quantize_q8", grid_1d(m * d / 32 * 8, 256)?, [x, &xq, &xd, &xs, &nu])?;
-            let (hq, hd, hs) = (self.alloc((np * n_ff).div_ceil(4))?, self.alloc(np * n_ff / 32)?, self.alloc(np * n_ff / 32)?);
-            let qo = QOut { q: hq.ptr, d: hd.ptr, s: hs.ptr, on: 1 };
+            // Each projection runs on int8 activations (quantized experts) or
+            // on f32 ones (float experts); the hidden rows feed the down
+            // projection as int8 or f32 to match it.
+            let down_q = down.fmt.quantized();
+            let int8_in = gate.fmt.quantized() || up.fmt.quantized();
+            let (xq, xd, xs) = if int8_in {
+                let (xq, xd, xs) = (self.alloc((m * d).div_ceil(4))?, self.alloc(m * d / 32)?, self.alloc(m * d / 32)?);
+                let nu = (m * d / 32) as i64;
+                launch!(self, "quantize_q8", grid_1d(m * d / 32 * 8, 256)?, [x, &xq, &xd, &xs, &nu])?;
+                (Some(xq), Some(xd), Some(xs))
+            } else {
+                (None, None, None)
+            };
+            let (hq, hd, hs) = if down_q {
+                (Some(self.alloc((np * n_ff).div_ceil(4))?), Some(self.alloc(np * n_ff / 32)?), Some(self.alloc(np * n_ff / 32)?))
+            } else {
+                (None, None, None)
+            };
+            let qo = match (&hq, &hd, &hs) {
+                (Some(q), Some(d), Some(s)) => QOut { q: q.ptr, d: d.ptr, s: s.ptr, on: 1 },
+                _ => QOut::default(),
+            };
             let y = self.alloc(np * d)?;
             let target = |w: &CudaWeight| {
                 let (sq, sh, ss) = w.strides();
@@ -2634,32 +2663,52 @@ impl Backend for CudaBackend {
                     ..Default::default()
                 }
             };
-            let (zero, null) = (0i32, 0u64);
+            let ptr = |b: &Option<CudaBuf>| b.as_ref().map_or(0u64, |b| b.ptr);
+            let (xq_p, xd_p, xs_p) = (ptr(&xq), ptr(&xd), ptr(&xs));
+            let null = 0u64;
             let (sh_ptr, sg_ptr) = shared.map_or((0u64, 0u64), |(y, g)| (y.ptr, g.ptr));
-            let fused = gate.fmt == up.fmt;
+            let fused = gate.fmt == up.fmt && gate.fmt.quantized();
             let len = (np * n_ff) as i64;
+            // f32 hidden rows (written for a float down projection).
+            let h32: Option<CudaBuf>;
+            let write_h = (!down_q) as i32;
             if !grouped {
-                // Decode: one matvec per (token, expert) pair, reading only the chosen experts.
+                // Decode: per (token, expert) pair, reading only the chosen experts.
+                let float_cfg = |n: usize| LaunchConfig { grid_dim: (n.div_ceil(8) as u32, np as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                let quant_cfg = |n: usize| LaunchConfig { grid_dim: (n.div_ceil(MATVEC_WARPS as usize) as u32, np as u32, 1), block_dim: (MATVEC_WARPS * WARP, 1, 1), shared_mem_bytes: 0 };
                 if fused {
                     let (tg, tu) = (target(gate), target(up));
+                    let h = if down_q { None } else { Some(self.alloc(np * n_ff)?) };
+                    let hp = ptr(&h);
                     let cfg = LaunchConfig { grid_dim: ((n_ff / 32) as u32, np as u32, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 };
-                    launch!(self, format!("moe_matvec_glu_{}", gate.fmt.suffix()), cfg, [&tg, &tu, &ids, &xq, &xd, &di, &nffi, &ki, &qo, &null, &zero])?;
+                    launch!(self, format!("moe_matvec_glu_{}", gate.fmt.suffix()), cfg, [&tg, &tu, &ids, &xq_p, &xd_p, &di, &nffi, &ki, &qo, &hp, &write_h])?;
+                    h32 = h;
                 } else {
                     let (g, u) = (self.alloc(np * n_ff)?, self.alloc(np * n_ff)?);
-                    let cfg = LaunchConfig { grid_dim: (n_ff.div_ceil(MATVEC_WARPS as usize) as u32, np as u32, 1), block_dim: (MATVEC_WARPS * WARP, 1, 1), shared_mem_bytes: 0 };
                     for (w, o) in [(gate, &g), (up, &u)] {
                         let t = target(w);
-                        launch!(self, format!("moe_matvec_{}", w.fmt.suffix()), cfg, [&t, &ids, &xq, &xd, &di, &nffi, &ki, o])?;
+                        if w.fmt.quantized() {
+                            launch!(self, format!("moe_matvec_{}", w.fmt.suffix()), quant_cfg(n_ff), [&t, &ids, &xq_p, &xd_p, &di, &nffi, &ki, o])?;
+                        } else {
+                            launch!(self, format!("moe_matvec_f_{}", w.fmt.suffix()), float_cfg(n_ff), [&t, &ids, x, &di, &nffi, &ki, o])?;
+                        }
                     }
-                    launch!(self, "silu_mul", grid_1d(np * n_ff, 256)?, [&g, &u, &len, &qo, &zero])?;
+                    launch!(self, "silu_mul", grid_1d(np * n_ff, 256)?, [&g, &u, &len, &qo, &write_h])?;
+                    h32 = Some(g);
                 }
-                let cfg = LaunchConfig { grid_dim: (d.div_ceil(MATVEC_WARPS as usize) as u32, np as u32, 1), block_dim: (MATVEC_WARPS * WARP, 1, 1), shared_mem_bytes: 0 };
                 let td = target(down);
-                launch!(self, format!("moe_matvec_{}", down.fmt.suffix()), cfg, [&td, &ids, &hq, &hd, &nffi, &di, &one, &y])?;
+                if down_q {
+                    let (hq_p, hd_p) = (ptr(&hq), ptr(&hd));
+                    launch!(self, format!("moe_matvec_{}", down.fmt.suffix()), quant_cfg(d), [&td, &ids, &hq_p, &hd_p, &nffi, &di, &one, &y])?;
+                } else {
+                    let h = h32.as_ref().expect("f32 hidden for a float down projection");
+                    launch!(self, format!("moe_matvec_f_{}", down.fmt.suffix()), float_cfg(d), [&td, &ids, h, &nffi, &di, &one, &y])?;
+                }
                 return launch!(self, "moe_combine", grid_1d(m * d, 256)?, [&y, &wts, &null, &*out, &mi, &ki, &di, &sh_ptr, &sg_ptr]);
             }
-            // Prefill: sort the pairs by expert, then grouped MMQ (one tile
+            // Prefill: sort the pairs by expert, then grouped GEMMs (one tile
             // list for all experts) over the gate/up and down projections.
+            const _: () = assert!(MMQ_BN == 64, "moe_gemm_f's tile height (MOE_GF_BN) is 64");
             let max_tiles = np.div_ceil(MMQ_BN) + ne;
             let (counts, offsets, cursor) = (self.alloc(ne)?, self.alloc(ne)?, self.alloc(ne)?);
             let (tiles, pos, rowmap) = (self.alloc(1 + 3 * max_tiles)?, self.alloc(np)?, self.alloc(np)?);
@@ -2673,25 +2722,40 @@ impl Backend for CudaBackend {
             launch!(self, "moe_scan", single, [&counts, &nei, &bn, &offsets, &cursor, &tiles])?;
             launch!(self, "moe_place", grid_1d(np, 256)?, [&ids, &npi, &ki, &offsets, &cursor, &pos, &rowmap])?;
             let grid = |rows: usize| LaunchConfig { grid_dim: (max_tiles as u32, rows.div_ceil(MMQ_BM) as u32, 1), block_dim: (MMQ_THREADS, 1, 1), shared_mem_bytes: 0 };
+            let float_grid = |rows: usize| LaunchConfig { grid_dim: (max_tiles as u32, rows.div_ceil(64) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
             if fused {
                 let (sq, sh, ss) = gate.strides();
+                let h = if down_q { None } else { Some(self.alloc(np * n_ff)?) };
+                let hp = ptr(&h);
                 let cfg = LaunchConfig { grid_dim: (max_tiles as u32, n_ff.div_ceil(MMQ_BM / 2) as u32, 1), ..grid(n_ff) };
                 launch!(
                     self,
                     format!("mmq_id_glu_silu_{}", gate.fmt.suffix()),
                     cfg,
-                    [&gate.qs, gate.qh(), gate.sc(), &xq, &xd, &xs, &null, &nffi, &di, &sq, &sh, &ss, &up.qs, up.qh(), up.sc(), &qo, &zero, &tiles, &rowmap]
+                    [&gate.qs, gate.qh(), gate.sc(), &xq_p, &xd_p, &xs_p, &hp, &nffi, &di, &sq, &sh, &ss, &up.qs, up.qh(), up.sc(), &qo, &write_h, &tiles, &rowmap]
                 )?;
+                h32 = h;
             } else {
                 let (g, u) = (self.alloc(np * n_ff)?, self.alloc(np * n_ff)?);
                 for (w, o) in [(gate, &g), (up, &u)] {
                     let (sq, sh, ss) = w.strides();
-                    launch!(self, format!("mmq_id_{}", w.fmt.suffix()), grid(n_ff), [&w.qs, w.qh(), w.sc(), &xq, &xd, &xs, o, &nffi, &di, &sq, &sh, &ss, &tiles, &rowmap])?;
+                    if w.fmt.quantized() {
+                        launch!(self, format!("mmq_id_{}", w.fmt.suffix()), grid(n_ff), [&w.qs, w.qh(), w.sc(), &xq_p, &xd_p, &xs_p, o, &nffi, &di, &sq, &sh, &ss, &tiles, &rowmap])?;
+                    } else {
+                        launch!(self, format!("moe_gemm_f_{}", w.fmt.suffix()), float_grid(n_ff), [&w.qs, &sq, x, &rowmap, o, &nffi, &di, &tiles])?;
+                    }
                 }
-                launch!(self, "silu_mul", grid_1d(np * n_ff, 256)?, [&g, &u, &len, &qo, &zero])?;
+                launch!(self, "silu_mul", grid_1d(np * n_ff, 256)?, [&g, &u, &len, &qo, &write_h])?;
+                h32 = Some(g);
             }
             let (sq, sh, ss) = down.strides();
-            launch!(self, format!("mmq_id_{}", down.fmt.suffix()), grid(d), [&down.qs, down.qh(), down.sc(), &hq, &hd, &hs, &y, &di, &nffi, &sq, &sh, &ss, &tiles, &null])?;
+            if down_q {
+                let (hq_p, hd_p, hs_p) = (ptr(&hq), ptr(&hd), ptr(&hs));
+                launch!(self, format!("mmq_id_{}", down.fmt.suffix()), grid(d), [&down.qs, down.qh(), down.sc(), &hq_p, &hd_p, &hs_p, &y, &di, &nffi, &sq, &sh, &ss, &tiles, &null])?;
+            } else {
+                let h = h32.as_ref().expect("f32 hidden for a float down projection");
+                launch!(self, format!("moe_gemm_f_{}", down.fmt.suffix()), float_grid(d), [&down.qs, &sq, h, &null, &y, &di, &nffi, &tiles])?;
+            }
             launch!(self, "moe_combine", grid_1d(m * d, 256)?, [&y, &wts, &pos, &*out, &mi, &ki, &di, &sh_ptr, &sg_ptr])
         })
     }

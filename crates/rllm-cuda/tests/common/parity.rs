@@ -76,6 +76,12 @@ fn random_weight(rng: &mut Rng, dtype: DType, rows: usize, cols: usize) -> HostT
                 bytes.extend(scale(rng, 0.0001, 0.001));
             }
         }
+        DType::Q3K => {
+            for _ in 0..n / 256 {
+                (0..108).for_each(|_| bytes.push(rng.byte()));
+                bytes.extend(scale(rng, 0.001, 0.01));
+            }
+        }
         DType::IQ4XS => {
             for _ in 0..n / 256 {
                 bytes.extend(scale(rng, 0.00005, 0.0005));
@@ -133,7 +139,7 @@ fn matmul_all_dtypes_both_paths() {
     let cpu = CpuBackend::new();
     let mut rng = Rng(0x1234_5678);
     let (n, k) = (96, 512);
-    for dtype in [DType::F32, DType::F16, DType::BF16, DType::Q8_0, DType::Q4K, DType::Q6K, DType::Q5K, DType::IQ4XS] {
+    for dtype in [DType::F32, DType::F16, DType::BF16, DType::Q8_0, DType::Q3K, DType::Q4K, DType::Q6K, DType::Q5K, DType::IQ4XS] {
         let w = random_weight(&mut rng, dtype, n, k);
         let (wc, wg) = (cpu.upload(&w).unwrap(), gpu.upload(&w).unwrap());
         // m <= 8 uses the matvec kernel, larger m the f16 cuBLAS path.
@@ -145,7 +151,7 @@ fn matmul_all_dtypes_both_paths() {
             gpu.matmul(&xg, &wg, &mut og, m).unwrap();
             // m <= 8 on quantized weights runs int8 activations (dp4a), like
             // llama.cpp's q8_1 path: per-32 rounding costs ~0.5% per dot product.
-            let quantized = matches!(dtype, DType::Q8_0 | DType::Q4K | DType::Q6K | DType::Q5K | DType::IQ4XS);
+            let quantized = matches!(dtype, DType::Q8_0 | DType::Q3K | DType::Q4K | DType::Q6K | DType::Q5K | DType::IQ4XS);
             let tol = match (m <= 8, quantized) {
                 (true, false) => 1e-5,
                 (true, true) => 1.5e-2,
@@ -163,7 +169,7 @@ fn embed_all_dtypes() {
     let mut rng = Rng(42);
     let (vocab, d) = (50, 256);
     let ids = [0u32, 7, 49, 7, 3];
-    for dtype in [DType::F32, DType::F16, DType::BF16, DType::Q8_0, DType::Q4K, DType::Q6K, DType::Q5K, DType::IQ4XS] {
+    for dtype in [DType::F32, DType::F16, DType::BF16, DType::Q8_0, DType::Q3K, DType::Q4K, DType::Q6K, DType::Q5K, DType::IQ4XS] {
         let t = random_weight(&mut rng, dtype, vocab, d);
         let (tc, tg) = (cpu.upload(&t).unwrap(), gpu.upload(&t).unwrap());
         let (mut oc, mut og) = (cpu.alloc(ids.len() * d).unwrap(), gpu.alloc(ids.len() * d).unwrap());
@@ -478,7 +484,7 @@ fn gated_ffn_fused_prefill_and_decode() {
     let (d, f) = (2048, 2048);
     // m = 1 and 3 take the decode form (matvec_glu, then the down matvec reads
     // its int8 output).
-    for (dtype, m) in [DType::Q8_0, DType::Q4K, DType::Q6K, DType::Q5K, DType::IQ4XS].into_iter().flat_map(|t| [(t, 70), (t, 1), (t, 3)]) {
+    for (dtype, m) in [DType::Q8_0, DType::Q3K, DType::Q4K, DType::Q6K, DType::Q5K, DType::IQ4XS].into_iter().flat_map(|t| [(t, 70), (t, 1), (t, 3)]) {
         let (gate, up, down) = (random_weight(&mut rng, dtype, f, d), random_weight(&mut rng, dtype, f, d), random_weight(&mut rng, dtype, d, f));
         let wc = [&gate, &up, &down].map(|w| cpu.upload(w).unwrap());
         let wg = [&gate, &up, &down].map(|w| gpu.upload(w).unwrap());
@@ -592,7 +598,7 @@ fn norm_add_gated_ffn_matches() {
     let mut rng = Rng(0x0a0d_d00d);
     let (d, f) = (512, 1024);
     let norm = |rng: &mut Rng, name: &str| f32_tensor(name, &rng.vec(d).iter().map(|v| 1.0 + 0.5 * v).collect::<Vec<_>>());
-    for dtype in [DType::Q8_0, DType::Q4K, DType::Q6K, DType::Q5K, DType::IQ4XS] {
+    for dtype in [DType::Q8_0, DType::Q3K, DType::Q4K, DType::Q6K, DType::Q5K, DType::IQ4XS] {
         let (gate, up, down) = (random_weight(&mut rng, dtype, f, d), random_weight(&mut rng, dtype, f, d), random_weight(&mut rng, dtype, d, f));
         let (n1, n2) = (norm(&mut rng, "n1"), norm(&mut rng, "n2"));
         let wc = [&gate, &up, &down, &n1, &n2].map(|w| cpu.upload(w).unwrap());
@@ -837,6 +843,13 @@ fn moe_ffn_matches() {
         (DType::Q8_0, DType::Q8_0, DType::Q8_0),
         (DType::Q4K, DType::Q5K, DType::Q6K),
         (DType::IQ4XS, DType::IQ4XS, DType::Q5K),
+        (DType::Q3K, DType::Q3K, DType::Q3K),
+        // Float experts (Unsloth's UD quants keep some layers in BF16), alone
+        // and mixed with quantized ones in either direction.
+        (DType::BF16, DType::BF16, DType::BF16),
+        (DType::Q8_0, DType::Q8_0, DType::BF16),
+        (DType::BF16, DType::BF16, DType::Q8_0),
+        (DType::F16, DType::Q4K, DType::F32),
     ];
     for (fg, fu, fd) in formats {
         let (gate, up, down) = (random_weight(&mut rng, fg, ne * f, d), random_weight(&mut rng, fu, ne * f, d), random_weight(&mut rng, fd, ne * d, f));

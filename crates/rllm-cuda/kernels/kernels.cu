@@ -301,6 +301,48 @@ extern "C" __global__ void repack_q6_k(const u8* __restrict__ raw, u8* qs, u8* q
     }
 }
 
+// Q3_K into FMT_Q6: q6 = q3 + 32 (q3 = 2 low bits, minus 4 unless the
+// hmask bit is set) and the int8 scale (6-bit scale - 32) per 16 elements,
+// with Q3_K's d: d * scale * (q6 - 32) is exactly Q3_K's d * (scale - 32) * q3.
+// Element h * 128 + j * 32 + l of a block: bits 2j of qs[h * 32 + l], hmask
+// bit 4h + j of byte l (see rllm_core::quant::dequant_q3_k).
+extern "C" __global__ void repack_q3_k(const u8* __restrict__ raw, u8* qs, u8* qh, u8* sc, int row0, int n, int k) {
+    int units = k / 32;
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)n * units) return;
+    int r = idx / units, u = idx % units;
+    const u8* b = raw + (long)r * (k / 256) * 110 + (u / 8) * 110;
+    const int j = u % 8, h = j / 4, jj = j % 4;
+    const u8* hm = b;
+    const u8* q3 = b + 32 + h * 32;
+    u8 q[32];
+    for (int l = 0; l < 32; l++) {
+        int v = ((q3[l] >> (2 * jj)) & 3) - ((hm[l] >> (4 * h + jj)) & 1 ? 0 : 4);
+        q[l] = (u8)(v + 32);
+    }
+    long orow = row0 + r;
+    u8* lo = qs + orow * (k / 2) + u * 16;
+    for (int i = 0; i < 16; i++) lo[i] = (q[i] & 0xF) | ((q[i + 16] & 0xF) << 4);
+    u8* hi = qh + orow * (k / 4) + u * 8;
+    for (int i = 0; i < 8; i++)
+        hi[i] = (q[i] >> 4) | ((q[i + 8] >> 4) << 2) | ((q[i + 16] >> 4) << 4) | ((q[i + 24] >> 4) << 6);
+    // The unit's two 16-element groups 2j, 2j + 1: their scales (unpacked as
+    // q3_k_scales); the first unit also copies d and clears the padding.
+    const u8* s = b + 96;
+    u8* g = sc + orow * (k / 16) * 2 + (u / 8) * 32;
+    for (int t = 0; t < 2; t++) {
+        const int gi = 2 * j + t;
+        const int lo4 = gi < 8 ? (s[gi] & 0xF) : (s[gi - 8] >> 4);
+        const int hi2 = (s[8 + gi % 4] >> (2 * (gi / 4))) & 3;
+        g[gi] = (u8)(signed char)((lo4 | (hi2 << 4)) - 32);
+    }
+    if (j == 0) {
+        g[16] = b[108];
+        g[17] = b[109];
+        for (int i = 18; i < 32; i++) g[i] = 0;
+    }
+}
+
 extern "C" __global__ void repack_q5_k(const u8* __restrict__ raw, u8* qs, u8* qh, u8* sc, int row0, int n, int k) {
     int units = k / 32;
     long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -921,6 +963,109 @@ INSTANTIATE_MOE(q4, FMT_Q4)
 INSTANTIATE_MOE(q6, FMT_Q6)
 INSTANTIATE_MOE(q5, FMT_Q5)
 INSTANTIATE_MOE(iq4, FMT_IQ4)
+
+// Float experts (f32/f16/bf16 weights, f32 activations, f32 accumulation in
+// a fixed order, so results don't depend on the batch).
+//
+// Decode: block (8 output rows, pair); warp w computes row blockIdx.x * 8 + w
+// of pair p's expert: x[p / in_div] . W_e[row]. `out` is [pairs, n].
+template <int F>
+__device__ void moe_matvec_f(const MvTarget& w, const int* __restrict__ ids, const float* __restrict__ x, int k, int n,
+                             int in_div, float* __restrict__ out) {
+    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const int p = blockIdx.y, row = blockIdx.x * (blockDim.x / WARP_SIZE) + warp;
+    if (row >= n) return;
+    const u8* wr = w.qs + ((long)ids[p] * n + row) * w.qs_row;
+    const float* xr = x + (long)(p / in_div) * k;
+    float a = 0.f;
+    for (int c = lane; c < k / 8; c += WARP_SIZE) {
+        float wv[8];
+        load8<F>(wr, c, wv);
+        const float4 x0 = *(const float4*)(xr + c * 8), x1 = *(const float4*)(xr + c * 8 + 4);
+        a += wv[0] * x0.x + wv[1] * x0.y + wv[2] * x0.z + wv[3] * x0.w + wv[4] * x1.x + wv[5] * x1.y + wv[6] * x1.z +
+             wv[7] * x1.w;
+    }
+    a = warp_sum(a);
+    if (lane == 0) out[(long)p * n + row] = a;
+}
+
+// Prefill: the grouped tiles of moe_scan (tiles[0] tiles of up to MOE_GF_BN
+// pairs of one expert, rows first..end in expert order). Block (tile, 64
+// weight rows), 256 threads, each 4 pairs x 4 rows. Row q's input is
+// x[rowmap[q]] (gate/up: the token) or x[q] (down: the hidden row, already in
+// expert order); its output goes to out[q]. `out` is [pairs, n].
+#define MOE_GF_BM 64
+#define MOE_GF_BN 64  // = MMQ_BN, the tile height moe_scan builds (checked by the host)
+template <int F>
+__device__ void moe_gemm_f(const u8* __restrict__ qs, long qs_row, const float* __restrict__ x,
+                           const int* __restrict__ rowmap, float* __restrict__ out, int n, int k,
+                           const int* __restrict__ tiles) {
+    if ((int)blockIdx.x >= tiles[0]) return;
+    const int* tl = tiles + 1 + 3 * blockIdx.x;
+    const int e = tl[0], q0 = tl[1], q_end = min(tl[2], q0 + MOE_GF_BN);
+    const int r0 = blockIdx.y * MOE_GF_BM;
+    __shared__ float xs[MOE_GF_BN][33];
+    __shared__ float ws[MOE_GF_BM][33];
+    const int tx = threadIdx.x % 16, ty = threadIdx.x / 16;
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.f;
+    for (int u = 0; u < k / 32; u++) {
+        // Inputs: MOE_GF_BN rows x 32, 4 values per thread and step.
+        for (int i = threadIdx.x; i < MOE_GF_BN * 8; i += blockDim.x) {
+            const int rq = i / 8, c = (i % 8) * 4, q = q0 + rq;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (q < q_end) v = *(const float4*)(x + (long)(rowmap ? rowmap[q] : q) * k + u * 32 + c);
+            xs[rq][c] = v.x, xs[rq][c + 1] = v.y, xs[rq][c + 2] = v.z, xs[rq][c + 3] = v.w;
+        }
+        // Weights: MOE_GF_BM rows x 32 of expert e.
+        for (int i = threadIdx.x; i < MOE_GF_BM * 8; i += blockDim.x) {
+            const int rr = i / 8, sub = i % 8, r = r0 + rr;
+            float y[4] = {0.f, 0.f, 0.f, 0.f};
+            if (r < n) dequant4<F>(qs + ((long)e * n + r) * qs_row, nullptr, nullptr, u, sub, y);
+            ws[rr][sub * 4] = y[0], ws[rr][sub * 4 + 1] = y[1], ws[rr][sub * 4 + 2] = y[2], ws[rr][sub * 4 + 3] = y[3];
+        }
+        __syncthreads();
+#pragma unroll 4
+        for (int c = 0; c < 32; c++) {
+            float xv[4], wv[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) xv[i] = xs[ty * 4 + i][c], wv[i] = ws[tx * 4 + i][c];
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+#pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] += xv[i] * wv[j];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int q = q0 + ty * 4 + i;
+        if (q >= q_end) continue;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const int r = r0 + tx * 4 + j;
+            if (r < n) out[(long)q * n + r] = acc[i][j];
+        }
+    }
+}
+
+#define INSTANTIATE_MOE_F(NAME, F)                                                                            \
+    extern "C" __global__ void moe_matvec_f_##NAME(MvTarget w, const int* ids, const float* x, int k, int n,  \
+                                                   int in_div, float* out) {                                  \
+        moe_matvec_f<F>(w, ids, x, k, n, in_div, out);                                                        \
+    }                                                                                                         \
+    extern "C" __global__ void __launch_bounds__(256) moe_gemm_f_##NAME(const u8* qs, long qs_row,            \
+                                                                        const float* x, const int* rowmap,    \
+                                                                        float* out, int n, int k,             \
+                                                                        const int* tiles) {                   \
+        moe_gemm_f<F>(qs, qs_row, x, rowmap, out, n, k, tiles);                                               \
+    }
+INSTANTIATE_MOE_F(f32, FMT_F32)
+INSTANTIATE_MOE_F(f16, FMT_F16)
+INSTANTIATE_MOE_F(bf16, FMT_BF16)
 
 // Prefill grouping. counts (zeroed) += pairs per expert.
 extern "C" __global__ void moe_count(const int* __restrict__ ids, int n_pairs, int* __restrict__ counts) {

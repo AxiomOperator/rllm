@@ -32,6 +32,11 @@ pub fn dequantize_row(dtype: DType, src: &[u8], out: &mut [f32]) {
                 dequant_q8_0(b, y);
             }
         }
+        DType::Q3K => {
+            for (y, b) in out.chunks_exact_mut(256).zip(src.chunks_exact(110)) {
+                dequant_q3_k(b, y);
+            }
+        }
         DType::Q4K => {
             for (y, b) in out.chunks_exact_mut(256).zip(src.chunks_exact(144)) {
                 dequant_q4_k(b, y);
@@ -66,6 +71,41 @@ fn dequant_q8_0(b: &[u8], y: &mut [f32]) {
     let d = f16_at(b, 0);
     for (o, &q) in y.iter_mut().zip(&b[2..34]) {
         *o = d * (q as i8) as f32;
+    }
+}
+
+/// The 16 six-bit scales of a Q3_K block (0..63; the value is scale - 32),
+/// unpacked from its 12 bytes as ggml's dequantize_row_q3_K does.
+pub fn q3_k_scales(s: &[u8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (j, o) in out.iter_mut().enumerate() {
+        // Low 4 bits: nibble j % 8 of bytes 0..8 (low nibbles first); high
+        // 2 bits: bits 2 (j / 4) .. of byte 8 + j % 4.
+        let lo = if j < 8 { s[j] & 0xF } else { s[j - 8] >> 4 };
+        let hi = (s[8 + j % 4] >> (2 * (j / 4))) & 3;
+        *o = lo | hi << 4;
+    }
+    out
+}
+
+/// block_q3_K: u8 hmask[32]; u8 qs[64]; u8 scales[12]; f16 d. Element
+/// h * 128 + j * 32 + l (h < 2, j < 4, l < 32) is bits 2j of qs[h * 32 + l]
+/// minus 4 unless bit 4h + j of hmask[l] is set, times d * (scale - 32) of
+/// its 16-element group.
+fn dequant_q3_k(b: &[u8], y: &mut [f32]) {
+    let (hm, qs) = (&b[0..32], &b[32..96]);
+    let scales = q3_k_scales(&b[96..108]);
+    let d = f16_at(b, 108);
+    for h in 0..2 {
+        for j in 0..4 {
+            for l in 0..32 {
+                let e = h * 128 + j * 32 + l;
+                let dl = d * (scales[e / 16] as i32 - 32) as f32;
+                let lo = ((qs[h * 32 + l] >> (2 * j)) & 3) as i32;
+                let q = lo - if hm[l] & (1 << (4 * h + j)) != 0 { 0 } else { 4 };
+                y[e] = dl * q as f32;
+            }
+        }
     }
 }
 
@@ -171,6 +211,65 @@ fn dequant_q6_k(b: &[u8], y: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ggml's dequantize_row_q3_K, transcribed literally (the aux/kmask
+    /// scale unpacking and pointer walk), as the reference for ours.
+    fn ggml_q3_k(b: &[u8]) -> Vec<f32> {
+        let (kmask1, kmask2) = (0x0303_0303u32, 0x0f0f_0f0fu32);
+        let mut aux = [0u32; 4];
+        for (i, a) in aux.iter_mut().take(3).enumerate() {
+            *a = u32::from_le_bytes(b[96 + 4 * i..100 + 4 * i].try_into().unwrap());
+        }
+        let tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | ((tmp & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        let scales: Vec<i8> = aux.iter().flat_map(|a| a.to_le_bytes()).map(|x| x as i8).collect();
+        let d_all = f16_at(b, 108);
+        let (hm, mut q) = (&b[0..32], 32usize);
+        let (mut y, mut is, mut m) = (Vec::new(), 0, 1u8);
+        for _n in 0..2 {
+            let mut shift = 0;
+            for _j in 0..4 {
+                let dl = d_all * (scales[is] as i32 - 32) as f32;
+                is += 1;
+                for l in 0..16 {
+                    y.push(dl * (((b[q + l] >> shift) & 3) as i8 - if hm[l] & m != 0 { 0 } else { 4 }) as f32);
+                }
+                let dl = d_all * (scales[is] as i32 - 32) as f32;
+                is += 1;
+                for l in 0..16 {
+                    y.push(dl * (((b[q + l + 16] >> shift) & 3) as i8 - if hm[l + 16] & m != 0 { 0 } else { 4 }) as f32);
+                }
+                shift += 2;
+                m <<= 1;
+            }
+            q += 32;
+        }
+        y
+    }
+
+    #[test]
+    fn q3_k_matches_ggml() {
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..50 {
+            let mut block: Vec<u8> = (0..110)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    s as u8
+                })
+                .collect();
+            // A finite f16 d.
+            block[108..110].copy_from_slice(&half::f16::from_f32(0.0123).to_le_bytes());
+            let mut ours = vec![0f32; 256];
+            dequantize_row(DType::Q3K, &block, &mut ours);
+            let want = ggml_q3_k(&block);
+            assert!(ours.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()));
+        }
+    }
 
     #[test]
     fn q8_0_roundtrip() {

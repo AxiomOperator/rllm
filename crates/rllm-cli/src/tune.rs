@@ -197,10 +197,11 @@ fn runtime_overhead(m: &ModelProfile, kv: KvType, ctx: usize) -> usize {
     128 * MIB + activations + logits + stage + arch
 }
 
-/// Device memory weights take once uploaded: the file's size, K-quants
-/// repacked about 11% larger (measured 5.19 GiB for Qwen3-8B Q4_K_M's 4.68).
+/// Device memory weights take once uploaded: the file's size plus what
+/// repacking adds (K-quants about 11%: measured 5.19 GiB for Qwen3-8B
+/// Q4_K_M's 4.68).
 fn device_weights(m: &ModelProfile) -> usize {
-    m.weight_bytes + m.kquant_bytes / 9 + 32 * MIB
+    m.weight_bytes + m.repack_bytes + 32 * MIB
 }
 
 fn plan(m: &ModelProfile, draft: Option<&Draft>, mach: &Machine, want_ctx: Option<usize>, want_parallel: Option<usize>) -> Plan {

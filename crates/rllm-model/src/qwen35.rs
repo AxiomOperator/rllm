@@ -22,16 +22,23 @@
 //! the rest after them; attention only sees q·k, so a shared order is
 //! free) and the factors set the frequencies, or ~no rotation for the rest.
 //!
-//! The MTP (next-token prediction) block some files carry is not used yet.
-//! Recurrent state can't be rewound or rebuilt from cached KV, so prefix
-//! reuse and speculative decoding are off for these models.
+//! MTP: files with `nextn_predict_layers` carry one extra block that
+//! predicts the token after next from the main model's last hidden state
+//! and the next token's embedding (pair `(h_p, x_{p+1})` at position
+//! `p + 1`). With MTP enabled every step also runs that block's K/V over
+//! the step's tokens (so its attention sees the whole sequence), and
+//! drafting chains MTP steps. Verification steps snapshot the recurrent
+//! state after each token so rejected drafts can be rolled back.
+//! Recurrent state can't be rebuilt from cached KV, so prefix reuse is off.
 
 use anyhow::{Context, Result, bail, ensure};
 use rllm_core::{Activation, AttnMeta, Backend, GdnShape, HostTensor, KvLayout, KvType, SeqRuns};
 use rllm_gguf::Gguf;
 
-use crate::loader::{MAX_CONTEXT, MAX_DIM, check_shape, check_shape_opt, load_weight, load_weight_rows, meta_f32_or, meta_usize, meta_usize_or, read_vector};
-use crate::{Batch, Model, StepOut};
+use crate::loader::{
+    MAX_CONTEXT, MAX_DIM, check_shape, check_shape_opt, load_weight, load_weight_cols, load_weight_rows, meta_f32_or, meta_usize, meta_usize_or, read_vector,
+};
+use crate::{Batch, Model, MtpBatch, StepOut};
 
 #[derive(Debug, Clone)]
 pub struct Qwen35Config {
@@ -52,6 +59,8 @@ pub struct Qwen35Config {
     pub recurrent: Vec<bool>,
     pub conv_kernel: usize,
     pub gdn: GdnShape,
+    /// The file carries an MTP block (`blk.{n_layers}`).
+    pub mtp: bool,
 }
 
 impl Qwen35Config {
@@ -109,6 +118,7 @@ impl Qwen35Config {
             recurrent,
             conv_kernel: dim("ssm.conv_kernel")?,
             gdn: GdnShape { n_k_heads: dim("ssm.group_count")?, n_v_heads, head_dim: state },
+            mtp: nextn > 0 && g.tensor(&format!("blk.{n_layers}.nextn.eh_proj.weight")).is_some(),
         };
         cfg.validate()?;
         cfg.check_tensors(g)?;
@@ -172,6 +182,30 @@ impl Qwen35Config {
                 check_shape(g, name, dims)?;
             }
         }
+        if c.mtp {
+            let p = |s: &str| format!("blk.{}.{s}", c.n_layers);
+            for (name, dims) in [
+                (p("nextn.eh_proj.weight"), vec![2 * d, d]),
+                (p("nextn.enorm.weight"), vec![d]),
+                (p("nextn.hnorm.weight"), vec![d]),
+                (p("attn_norm.weight"), vec![d]),
+                (p("post_attention_norm.weight"), vec![d]),
+                (p("attn_q.weight"), vec![d, 2 * qw]),
+                (p("attn_k.weight"), vec![d, kvw]),
+                (p("attn_v.weight"), vec![d, kvw]),
+                (p("attn_output.weight"), vec![qw, d]),
+                (p("attn_q_norm.weight"), vec![hd]),
+                (p("attn_k_norm.weight"), vec![hd]),
+                (p("ffn_gate.weight"), vec![d, c.ffn]),
+                (p("ffn_up.weight"), vec![d, c.ffn]),
+                (p("ffn_down.weight"), vec![c.ffn, d]),
+            ] {
+                check_shape(g, &name, &dims)?;
+            }
+            check_shape_opt(g, &p("nextn.shared_head_norm.weight"), &[d])?;
+            check_shape_opt(g, &p("nextn.embed_tokens.weight"), &[d, c.vocab])?;
+            check_shape_opt(g, &p("nextn.shared_head_head.weight"), &[d, c.vocab])?;
+        }
         Ok(())
     }
 
@@ -183,8 +217,10 @@ impl Qwen35Config {
         self.recurrent.iter().filter(|r| **r).count()
     }
 
+    /// KV cache: the attention layers, then the MTP block's.
     pub fn kv_layout(&self, n_blocks: usize, block_size: usize, dtype: KvType) -> KvLayout {
-        KvLayout { n_layers: self.n_attn_layers(), n_blocks, block_size, n_kv_heads: self.n_kv_heads, head_dim: self.head_dim, dtype }
+        let n_layers = self.n_attn_layers() + self.mtp as usize;
+        KvLayout { n_layers, n_blocks, block_size, n_kv_heads: self.n_kv_heads, head_dim: self.head_dim, dtype }
     }
 
     /// Floats of recurrent state per sequence and recurrent layer: conv inputs, DeltaNet state.
@@ -262,6 +298,38 @@ struct Layer<B: Backend> {
     ffn: Ffn<B>,
 }
 
+/// The MTP block: `x = eh_proj([enorm(embed(x_{p+1})) | hnorm(h_p)])`, then a
+/// gated-attention decoder block (its own KV layer), then `head_norm` and
+/// the LM head.
+struct Mtp<B: Backend> {
+    /// `eh_proj` split by input: the embedding half and the hidden half.
+    eh_e: B::Weight,
+    eh_h: B::Weight,
+    enorm: B::Weight,
+    hnorm: B::Weight,
+    head_norm: B::Weight,
+    layer: Layer<B>,
+    embed: Option<B::Weight>,
+    head: Option<B::Weight>,
+}
+
+/// Per sequence slot, what MTP drafting carries between steps, and the
+/// snapshots that roll back a verification step.
+pub struct MtpState<B: Backend> {
+    /// `[slots + 1, hidden]`: each slot's last (normalized) main hidden
+    /// state; the extra last row stays zero (fresh sequences).
+    pending: B::Buffer,
+    /// `[slots, hidden]`: the previous MTP step's hidden state (draft chains).
+    chain: B::Buffer,
+    /// Per recurrent layer: state after each of the step's first `n_snap` tokens.
+    conv_snap: Vec<B::Buffer>,
+    ssm_snap: Vec<B::Buffer>,
+    n_snap: usize,
+    /// The last step's normalized hidden states, and per state slot its rows there.
+    step_h: Option<B::Buffer>,
+    step_rows: Vec<(u32, usize, usize)>,
+}
+
 pub struct Qwen35<B: Backend> {
     pub cfg: Qwen35Config,
     embed: B::Weight,
@@ -269,6 +337,9 @@ pub struct Qwen35<B: Backend> {
     out_norm: B::Weight,
     output: Option<B::Weight>,
     rope_factors: B::Weight,
+    mtp: Option<Mtp<B>>,
+    /// `[1, hidden]` of zeros (fresh sequences' "previous hidden state").
+    zero_row: B::Weight,
 }
 
 /// KV cache of the attention layers plus each sequence slot's recurrent
@@ -278,6 +349,7 @@ pub struct Cache<B: Backend> {
     conv: Vec<B::Buffer>,
     ssm: Vec<B::Buffer>,
     n_slots: usize,
+    mtp: Option<MtpState<B>>,
 }
 
 fn upload_vec<B: Backend>(b: &B, name: &str, v: &[f32]) -> Result<B::Weight> {
@@ -303,6 +375,29 @@ impl<B: Backend> Qwen35<B> {
             let v: Vec<f32> = t.bytes.as_slice().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
             upload_vec(backend, name, &v)
         };
+        let attn = |p: &dyn Fn(&str) -> String, kv_layer: usize| -> Result<Mixer<B>> {
+            // attn_q holds per head [query (head_dim) | gate (head_dim)].
+            let q_rows = qk_rows(cfg.n_heads, 2 * hd);
+            let gate_rows: Vec<usize> = (0..cfg.n_heads).flat_map(|h| (0..hd).map(move |j| h * 2 * hd + hd + j)).collect();
+            Ok(Mixer::Attn {
+                wq: load_weight_rows(backend, g, &p("attn_q.weight"), &q_rows)?,
+                wgate: load_weight_rows(backend, g, &p("attn_q.weight"), &gate_rows)?,
+                wk: load_weight_rows(backend, g, &p("attn_k.weight"), &qk_rows(cfg.n_kv_heads, hd))?,
+                wv: w(&p("attn_v.weight"))?,
+                wo: w(&p("attn_output.weight"))?,
+                q_norm: reordered(&p("attn_q_norm.weight"))?,
+                k_norm: reordered(&p("attn_k_norm.weight"))?,
+                kv_layer,
+            })
+        };
+        let ffn = |p: &dyn Fn(&str) -> String| -> Result<Ffn<B>> {
+            Ok(Ffn {
+                post_norm: w(&p("post_attention_norm.weight"))?,
+                gate: w(&p("ffn_gate.weight"))?,
+                up: w(&p("ffn_up.weight"))?,
+                down: w(&p("ffn_down.weight"))?,
+            })
+        };
         let (mut n_attn, mut n_rec) = (0, 0);
         let layers = (0..cfg.n_layers)
             .map(|i| {
@@ -323,30 +418,9 @@ impl<B: Backend> Qwen35<B> {
                     }
                 } else {
                     n_attn += 1;
-                    // attn_q holds per head [query (head_dim) | gate (head_dim)].
-                    let q_rows = qk_rows(cfg.n_heads, 2 * hd);
-                    let gate_rows: Vec<usize> = (0..cfg.n_heads).flat_map(|h| (0..hd).map(move |j| h * 2 * hd + hd + j)).collect();
-                    Mixer::Attn {
-                        wq: load_weight_rows(backend, g, &p("attn_q.weight"), &q_rows)?,
-                        wgate: load_weight_rows(backend, g, &p("attn_q.weight"), &gate_rows)?,
-                        wk: load_weight_rows(backend, g, &p("attn_k.weight"), &qk_rows(cfg.n_kv_heads, hd))?,
-                        wv: w(&p("attn_v.weight"))?,
-                        wo: w(&p("attn_output.weight"))?,
-                        q_norm: reordered(&p("attn_q_norm.weight"))?,
-                        k_norm: reordered(&p("attn_k_norm.weight"))?,
-                        kv_layer: n_attn - 1,
-                    }
+                    attn(&p, n_attn - 1)?
                 };
-                Ok(Layer {
-                    attn_norm: w(&p("attn_norm.weight"))?,
-                    mixer,
-                    ffn: Ffn {
-                        post_norm: w(&p("post_attention_norm.weight"))?,
-                        gate: w(&p("ffn_gate.weight"))?,
-                        up: w(&p("ffn_up.weight"))?,
-                        down: w(&p("ffn_down.weight"))?,
-                    },
-                })
+                Ok(Layer { attn_norm: w(&p("attn_norm.weight"))?, mixer, ffn: ffn(&p)? })
             })
             .collect::<Result<Vec<_>>>()?;
         let output = match g.tensor("output.weight") {
@@ -354,7 +428,28 @@ impl<B: Backend> Qwen35<B> {
             None => None,
         };
         let rope_factors = upload_vec(backend, "rope_factors", &cfg.rope_factors())?;
-        Ok(Self { embed: w("token_embd.weight")?, out_norm: w("output_norm.weight")?, layers, output, rope_factors, cfg })
+        let mtp = if cfg.mtp {
+            let p = |s: &str| format!("blk.{}.{s}", cfg.n_layers);
+            let opt = |name: String| -> Result<Option<B::Weight>> { if g.tensor(&name).is_some() { Ok(Some(w(&name)?)) } else { Ok(None) } };
+            let d = cfg.hidden;
+            Some(Mtp {
+                eh_e: load_weight_cols(backend, g, &p("nextn.eh_proj.weight"), 0, d)?,
+                eh_h: load_weight_cols(backend, g, &p("nextn.eh_proj.weight"), d, d)?,
+                enorm: w(&p("nextn.enorm.weight"))?,
+                hnorm: w(&p("nextn.hnorm.weight"))?,
+                head_norm: match opt(p("nextn.shared_head_norm.weight"))? {
+                    Some(x) => x,
+                    None => w("output_norm.weight")?,
+                },
+                layer: Layer { attn_norm: w(&p("attn_norm.weight"))?, mixer: attn(&p, n_attn)?, ffn: ffn(&p)? },
+                embed: opt(p("nextn.embed_tokens.weight"))?,
+                head: opt(p("nextn.shared_head_head.weight"))?,
+            })
+        } else {
+            None
+        };
+        let zero_row = backend.upload(&HostTensor::from_f32("zero_row", vec![1, cfg.hidden], &vec![0.0; cfg.hidden]))?;
+        Ok(Self { embed: w("token_embd.weight")?, out_norm: w("output_norm.weight")?, layers, output, rope_factors, mtp, zero_row, cfg })
     }
 
     fn forward_impl(&self, b: &B, cache: &mut Cache<B>, batch: &Batch, block_size: usize) -> Result<StepOut> {
@@ -373,8 +468,12 @@ impl<B: Backend> Qwen35<B> {
         ensure!(starts.len() == n_seqs, "{} sequences in the step, {n_seqs} block tables", starts.len());
         let fresh: Vec<u32> = starts.iter().map(|&t| (batch.positions[t as usize] == 0) as u32).collect();
         starts.push(n as u32);
-        let runs = SeqRuns { starts: &starts, slots: batch.state_slots, fresh: &fresh };
+        let mtp_on = batch.mtp && self.mtp.is_some() && cache.mtp.is_some();
+        // Snapshots only exist with MTP enabled (they serve its verification steps).
+        let snap: &[u32] = if cache.mtp.is_some() { batch.snap } else { &[] };
+        let runs = SeqRuns { starts: &starts, slots: batch.state_slots, fresh: &fresh, snap };
         runs.check(n, cache.n_slots)?;
+        let snapping = snap.iter().any(|&k| k > 0);
 
         let (d, hd) = (c.hidden, c.head_dim);
         let qw = c.n_heads * hd;
@@ -427,8 +526,13 @@ impl<B: Backend> Qwen35<B> {
                     b.matmul_many(&h, &[wqkv, wz, walpha, wbeta], &mut [&mut a1, &mut a2, &mut a3, &mut a4], n)?;
                     // a5 = conv output (q|k|v), then normalized core output.
                     let mut conv_out = b.alloc(n * conv_w)?;
-                    b.conv1d_silu(&a1, conv, &mut cache.conv[*state_layer], &runs, &mut conv_out, conv_w, c.conv_kernel)?;
-                    b.gated_delta_net(&conv_out, &a3, &a4, dt_bias, a, &mut cache.ssm[*state_layer], &runs, &mut a1, c.gdn, c.rms_eps)?;
+                    let sl = *state_layer;
+                    let (conv_snap, ssm_snap) = match cache.mtp.as_mut().filter(|_| snapping) {
+                        Some(m) => (Some((&mut m.conv_snap[sl], m.n_snap)), Some((&mut m.ssm_snap[sl], m.n_snap))),
+                        None => (None, None),
+                    };
+                    b.conv1d_silu(&a1, conv, &mut cache.conv[sl], &runs, &mut conv_out, conv_w, c.conv_kernel, conv_snap)?;
+                    b.gated_delta_net(&conv_out, &a3, &a4, dt_bias, a, &mut cache.ssm[sl], &runs, &mut a1, c.gdn, c.rms_eps, ssm_snap)?;
                     b.rms_norm(&a1, norm, &mut a5, n * hv, c.rms_eps)?;
                     // z = silu(z) * norm(o)
                     b.silu_mul(&mut a2, &a5, n * inner)?;
@@ -444,18 +548,32 @@ impl<B: Backend> Qwen35<B> {
         }
 
         let m = batch.logit_rows.len();
-        let all_rows = m == n && batch.logit_rows.iter().enumerate().all(|(i, &r)| r as usize == i);
-        let gathered;
-        let last = if all_rows {
-            &x
+        let normed = if mtp_on {
+            // Every token's normalized hidden state feeds the MTP block.
+            let mut hn = b.alloc(n * d)?;
+            b.rms_norm(&x, &self.out_norm, &mut hn, n, c.rms_eps)?;
+            self.mtp_fill(b, cache, batch, &runs, &hn)?;
+            let mut rows = b.alloc(m * d)?;
+            b.gather_rows(&hn, batch.logit_rows, d, &mut rows)?;
+            let st = cache.mtp.as_mut().expect("mtp_on");
+            st.step_rows = (0..n_seqs).map(|s| (batch.state_slots[s], starts[s] as usize, (starts[s + 1] - starts[s]) as usize)).collect();
+            st.step_h = Some(hn);
+            rows
         } else {
-            let mut g = b.alloc(m * d)?;
-            b.gather_rows(&x, batch.logit_rows, d, &mut g)?;
-            gathered = g;
-            &gathered
+            let all_rows = m == n && batch.logit_rows.iter().enumerate().all(|(i, &r)| r as usize == i);
+            let gathered;
+            let last = if all_rows {
+                &x
+            } else {
+                let mut g = b.alloc(m * d)?;
+                b.gather_rows(&x, batch.logit_rows, d, &mut g)?;
+                gathered = g;
+                &gathered
+            };
+            let mut normed = b.alloc(m * d)?;
+            b.rms_norm(last, &self.out_norm, &mut normed, m, c.rms_eps)?;
+            normed
         };
-        let mut normed = b.alloc(m * d)?;
-        b.rms_norm(last, &self.out_norm, &mut normed, m, c.rms_eps)?;
         if batch.hidden {
             let mut host = vec![0f32; m * d];
             b.to_host(&normed, &mut host)?;
@@ -464,6 +582,158 @@ impl<B: Backend> Qwen35<B> {
         let mut logits = b.alloc(m * c.vocab)?;
         b.matmul(&normed, self.output.as_ref().unwrap_or(&self.embed), &mut logits, m)?;
         crate::finish_logits(b, &logits, m, c.vocab, batch)
+    }
+}
+
+impl<B: Backend> Qwen35<B> {
+    pub fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    /// `eh_proj([enorm(embed(tokens)) | hnorm(src)])`: the MTP block's input.
+    fn mtp_input(&self, b: &B, mtp: &Mtp<B>, tokens: &[u32], src: &B::Buffer) -> Result<B::Buffer> {
+        let (n, d, eps) = (tokens.len(), self.cfg.hidden, self.cfg.rms_eps);
+        let mut e = b.alloc(n * d)?;
+        b.embed(mtp.embed.as_ref().unwrap_or(&self.embed), tokens, &mut e)?;
+        let (mut en, mut hn) = (b.alloc(n * d)?, b.alloc(n * d)?);
+        b.rms_norm(&e, &mtp.enorm, &mut en, n, eps)?;
+        b.rms_norm(src, &mtp.hnorm, &mut hn, n, eps)?;
+        let (mut xm, mut t) = (b.alloc(n * d)?, b.alloc(n * d)?);
+        b.matmul(&en, &mtp.eh_e, &mut xm, n)?;
+        b.matmul(&hn, &mtp.eh_h, &mut t, n)?;
+        b.add(&mut xm, &t, n * d)?;
+        Ok(xm)
+    }
+
+    /// The MTP part of a main step: each token, paired with the previous
+    /// token's hidden state (`hn`; a sequence's first token uses the one
+    /// saved from its previous step), writes the MTP block's K/V at its
+    /// position. Then each sequence's last hidden state is saved.
+    fn mtp_fill(&self, b: &B, cache: &mut Cache<B>, batch: &Batch, runs: &SeqRuns, hn: &B::Buffer) -> Result<()> {
+        let c = &self.cfg;
+        let mtp = self.mtp.as_ref().expect("checked");
+        let Mixer::Attn { wk, wv, k_norm, kv_layer, .. } = &mtp.layer.mixer else { unreachable!("MTP block is attention") };
+        let (n, d, kvw) = (batch.tokens.len(), c.hidden, c.n_kv_heads * c.head_dim);
+        let st = cache.mtp.as_mut().expect("checked");
+        let prev: Vec<u32> = (0..n as u32).map(|t| t.saturating_sub(1)).collect();
+        let mut src = b.alloc(n * d)?;
+        b.gather_rows(hn, &prev, d, &mut src)?;
+        let zero = cache.n_slots;
+        for s in 0..runs.n_seqs() {
+            let from = if runs.fresh[s] != 0 { zero } else { runs.slots[s] as usize };
+            b.copy_span(&st.pending, from * d, &mut src, runs.starts[s] as usize * d, d)?;
+        }
+        let xm = self.mtp_input(b, mtp, batch.tokens, &src)?;
+        let mut h = b.alloc(n * d)?;
+        b.rms_norm(&xm, &mtp.layer.attn_norm, &mut h, n, c.rms_eps)?;
+        let (mut k, mut v, mut kn) = (b.alloc(n * kvw)?, b.alloc(n * kvw)?, b.alloc(n * kvw)?);
+        b.matmul_many(&h, &[wk, wv], &mut [&mut k, &mut v], n)?;
+        b.rms_norm_rope(&k, k_norm, &mut kn, batch.positions, c.n_kv_heads, c.head_dim, c.rms_eps, c.rope_theta, Some(&self.rope_factors))?;
+        b.kv_store(&mut cache.kv, *kv_layer, &kn, &v, batch.slots)?;
+        for s in 0..runs.n_seqs() {
+            b.copy_span(hn, (runs.starts[s + 1] as usize - 1) * d, &mut st.pending, runs.slots[s] as usize * d, d)?;
+        }
+        Ok(())
+    }
+
+    pub fn enable_mtp(&self, b: &B, cache: &mut Cache<B>, max_drafts: usize) -> Result<bool> {
+        if self.mtp.is_none() {
+            return Ok(false);
+        }
+        let (slots, d, n_snap) = (cache.n_slots, self.cfg.hidden, max_drafts.max(1));
+        let (conv, ssm) = self.cfg.state_floats();
+        let n_rec = self.cfg.n_recurrent_layers();
+        let mut pending = b.alloc((slots + 1) * d)?;
+        let mut zero = b.alloc(d)?;
+        b.embed(&self.zero_row, &[0], &mut zero)?;
+        b.copy_span(&zero, 0, &mut pending, slots * d, d)?;
+        cache.mtp = Some(MtpState {
+            pending,
+            chain: b.alloc(slots * d)?,
+            conv_snap: (0..n_rec).map(|_| b.alloc(slots * n_snap * conv)).collect::<std::result::Result<_, _>>()?,
+            ssm_snap: (0..n_rec).map(|_| b.alloc(slots * n_snap * ssm)).collect::<std::result::Result<_, _>>()?,
+            n_snap,
+            step_h: None,
+            step_rows: Vec::new(),
+        });
+        Ok(true)
+    }
+
+    pub fn keep_step(&self, b: &B, cache: &mut Cache<B>, slot: u32, kept: usize) -> Result<()> {
+        let d = self.cfg.hidden;
+        let (conv, ssm) = self.cfg.state_floats();
+        let Cache { conv: conv_state, ssm: ssm_state, mtp, .. } = cache;
+        let st = mtp.as_mut().context("keep_step without MTP state")?;
+        let &(_, row0, n_rows) = st.step_rows.iter().find(|r| r.0 == slot).context("keep_step: sequence not in the last step")?;
+        if kept >= n_rows {
+            return Ok(());
+        }
+        ensure!(kept >= 1 && kept <= st.n_snap, "keep_step: keeping {kept} of {n_rows} tokens ({} snapshots)", st.n_snap);
+        let (j, s) = (kept - 1, slot as usize);
+        for l in 0..conv_state.len() {
+            b.copy_span(&st.conv_snap[l], (s * st.n_snap + j) * conv, &mut conv_state[l], s * conv, conv)?;
+            b.copy_span(&st.ssm_snap[l], (s * st.n_snap + j) * ssm, &mut ssm_state[l], s * ssm, ssm)?;
+        }
+        let h = st.step_h.as_ref().context("keep_step: no hidden states")?;
+        b.copy_span(h, (row0 + j) * d, &mut st.pending, s * d, d)?;
+        Ok(())
+    }
+
+    pub fn mtp_draft(&self, b: &B, cache: &mut Cache<B>, dr: &MtpBatch, block_size: usize) -> Result<Vec<f32>> {
+        let c = &self.cfg;
+        let mtp = self.mtp.as_ref().context("this model has no MTP head")?;
+        let Mixer::Attn { wq, wgate, wk, wv, wo, q_norm, k_norm, kv_layer } = &mtp.layer.mixer else { unreachable!("MTP block is attention") };
+        let n = dr.tokens.len();
+        ensure!(n > 0 && dr.positions.len() == n && dr.slots.len() == n && dr.block_tables.len() == n && dr.state_slots.len() == n, "bad MTP batch");
+        let (d, hd) = (c.hidden, c.head_dim);
+        let (qw, kvw) = (c.n_heads * hd, c.n_kv_heads * hd);
+        b.begin_step(None)?;
+        let Cache { kv, mtp: st, .. } = cache;
+        let st = st.as_mut().context("MTP not enabled")?;
+        let mut src = b.alloc(n * d)?;
+        b.gather_rows(if dr.first { &st.pending } else { &st.chain }, dr.state_slots, d, &mut src)?;
+        let mut xm = self.mtp_input(b, mtp, dr.tokens, &src)?;
+        let mut h = b.alloc(n * d)?;
+        b.rms_norm(&xm, &mtp.layer.attn_norm, &mut h, n, c.rms_eps)?;
+        let (mut q, mut g, mut k, mut v) = (b.alloc(n * qw)?, b.alloc(n * qw)?, b.alloc(n * kvw)?, b.alloc(n * kvw)?);
+        b.matmul_many(&h, &[wq, wgate, wk, wv], &mut [&mut q, &mut g, &mut k, &mut v], n)?;
+        let mut qn = b.alloc(n * qw)?;
+        b.qkv_norm_rope_store(
+            &q, &k, &v, Some((q_norm, k_norm)), None, &mut qn, kv, *kv_layer, dr.positions, dr.slots, c.n_heads, c.n_kv_heads, hd, c.rms_eps,
+            c.rope_theta, Some(&self.rope_factors),
+        )?;
+        let token_seq: Vec<u32> = (0..n as u32).collect();
+        let meta = AttnMeta {
+            n_heads: c.n_heads,
+            n_kv_heads: c.n_kv_heads,
+            head_dim: hd,
+            scale: 1.0 / (hd as f32).sqrt(),
+            window: 0,
+            token_seq: &token_seq,
+            positions: dr.positions,
+            block_tables: dr.block_tables,
+            block_size,
+        };
+        let mut att = b.alloc(n * qw)?;
+        b.attention(&qn, kv, *kv_layer, &meta, &mut att)?;
+        b.sigmoid_mul(&mut att, &g, n * qw)?;
+        let mut o = b.alloc(n * d)?;
+        b.matmul(&att, wo, &mut o, n)?;
+        let ffn = &mtp.layer.ffn;
+        b.add_rms_norm(&mut xm, &o, &ffn.post_norm, &mut h, n, d, c.rms_eps)?;
+        let (mut gate, mut up) = (b.alloc(n * c.ffn)?, b.alloc(n * c.ffn)?);
+        b.gated_ffn(&h, &ffn.gate, &ffn.up, &ffn.down, Activation::Silu, &mut o, &mut gate, &mut up, n, c.ffn)?;
+        b.add(&mut xm, &o, n * d)?;
+        let mut hh = b.alloc(n * d)?;
+        b.rms_norm(&xm, &mtp.head_norm, &mut hh, n, c.rms_eps)?;
+        for (i, &s) in dr.state_slots.iter().enumerate() {
+            b.copy_span(&hh, i * d, &mut st.chain, s as usize * d, d)?;
+        }
+        let mut logits = b.alloc(n * c.vocab)?;
+        b.matmul(&hh, mtp.head.as_ref().or(self.output.as_ref()).unwrap_or(&self.embed), &mut logits, n)?;
+        let mut host = vec![0f32; n * c.vocab];
+        b.to_host(&logits, &mut host)?;
+        Ok(host)
     }
 }
 
@@ -480,11 +750,28 @@ impl<B: Backend> Model<B> for Qwen35<B> {
             conv: (0..n_rec).map(|_| b.alloc(max_seqs * conv)).collect::<std::result::Result<_, _>>()?,
             ssm: (0..n_rec).map(|_| b.alloc(max_seqs * ssm)).collect::<std::result::Result<_, _>>()?,
             n_slots: max_seqs,
+            mtp: None,
         })
     }
 
     fn recurrent(&self) -> bool {
         true
+    }
+
+    fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    fn enable_mtp(&self, b: &B, cache: &mut Cache<B>, max_drafts: usize) -> Result<bool> {
+        Qwen35::enable_mtp(self, b, cache, max_drafts)
+    }
+
+    fn keep_step(&self, b: &B, cache: &mut Cache<B>, slot: u32, kept: usize) -> Result<()> {
+        Qwen35::keep_step(self, b, cache, slot, kept)
+    }
+
+    fn mtp_draft(&self, b: &B, cache: &mut Cache<B>, d: &MtpBatch, block_size: usize) -> Result<Vec<f32>> {
+        Qwen35::mtp_draft(self, b, cache, d, block_size)
     }
 
     type HostCache = B::HostKv;
@@ -547,6 +834,7 @@ mod tests {
             recurrent: vec![true, true, true, false],
             conv_kernel: 4,
             gdn: GdnShape { n_k_heads: 1, n_v_heads: 2, head_dim: 4 },
+            mtp: false,
         }
     }
 

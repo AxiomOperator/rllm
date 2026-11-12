@@ -1586,9 +1586,12 @@ extern "C" __global__ void sigmoid_mul_inplace(float* x, const float* __restrict
 // Causal depthwise conv + SiLU. One thread per (channel, sequence); the
 // window slides over the sequence's tokens. w: [channels, kernel] f32;
 // state: [slots, channels, kernel - 1], the last inputs (updated).
+// snaps (n_snap > 0): state after each of the first snap_n[s] tokens,
+// [slots, n_snap, channels, kernel - 1].
 extern "C" __global__ void conv1d_silu(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ state,
                                        const u32* __restrict__ starts, const u32* __restrict__ slots, const u32* __restrict__ fresh,
-                                       float* __restrict__ out, int channels, int kernel) {
+                                       float* __restrict__ out, int channels, int kernel, float* __restrict__ snaps,
+                                       const u32* __restrict__ snap_n, int n_snap) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     int s = blockIdx.y;
     if (c >= channels) return;
@@ -1615,6 +1618,13 @@ extern "C" __global__ void conv1d_silu(const float* __restrict__ x, const float*
             if (j < kernel) acc += win[j] * wc[j];
         }
         out[(long)t * channels + c] = acc / (1.f + expf(-acc));
+        int j = (int)(t - starts[s]);
+        if (n_snap > 0 && j < (int)min(snap_n[s], (u32)n_snap)) {
+            float* dst = snaps + (((long)slots[s] * n_snap + j) * channels + c) * keep;
+#pragma unroll
+            for (int i = 1; i < GDN_MAX_KERNEL; i++)
+                if (i < kernel) dst[i - 1] = win[i];
+        }
     }
 #pragma unroll
     for (int j = 1; j < GDN_MAX_KERNEL; j++)
@@ -1629,7 +1639,8 @@ template <int D>
 __device__ void gated_delta_net_impl(const float* __restrict__ qkv, const float* __restrict__ alpha, const float* __restrict__ beta,
                                      const float* __restrict__ dt_bias, const float* __restrict__ a, float* __restrict__ state,
                                      const u32* __restrict__ starts, const u32* __restrict__ slots, const u32* __restrict__ fresh,
-                                     float* __restrict__ out, int n_k_heads, int n_v_heads, float eps) {
+                                     float* __restrict__ out, int n_k_heads, int n_v_heads, float eps, float* __restrict__ snaps,
+                                     const u32* __restrict__ snap_n, int n_snap) {
     __shared__ float qs[D], ks[D], red[32];
     const int h = blockIdx.x, s = blockIdx.y, j = threadIdx.x;
     const int kh = h % n_k_heads;
@@ -1668,6 +1679,12 @@ __device__ void gated_delta_net_impl(const float* __restrict__ qkv, const float*
             o += col[i] * qs[i];
         }
         out[(long)t * n_v_heads * D + (long)h * D + j] = o * scale;
+        int k_t = (int)(t - starts[s]);
+        if (n_snap > 0 && k_t < (int)min(snap_n[s], (u32)n_snap)) {
+            float* dst = snaps + (((long)slots[s] * n_snap + k_t) * n_v_heads + h) * D * D;
+#pragma unroll
+            for (int i = 0; i < D; i++) dst[(long)i * D + j] = col[i];
+        }
     }
 #pragma unroll
     for (int i = 0; i < D; i++) st[(long)i * D + j] = col[i];
@@ -1678,11 +1695,18 @@ __device__ void gated_delta_net_impl(const float* __restrict__ qkv, const float*
         const float* __restrict__ qkv, const float* __restrict__ alpha, const float* __restrict__ beta,                        \
         const float* __restrict__ dt_bias, const float* __restrict__ a, float* __restrict__ state, const u32* __restrict__ starts, \
         const u32* __restrict__ slots, const u32* __restrict__ fresh, float* __restrict__ out, int n_k_heads, int n_v_heads,  \
-        float eps) {                                                                                                          \
-        gated_delta_net_impl<D>(qkv, alpha, beta, dt_bias, a, state, starts, slots, fresh, out, n_k_heads, n_v_heads, eps);   \
+        float eps, float* __restrict__ snaps, const u32* __restrict__ snap_n, int n_snap) {                                   \
+        gated_delta_net_impl<D>(qkv, alpha, beta, dt_bias, a, state, starts, slots, fresh, out, n_k_heads, n_v_heads, eps,   \
+                                snaps, snap_n, n_snap);                                                                       \
     }
 INSTANTIATE_GDN(64)
 INSTANTIATE_GDN(128)
+
+// dst[dst_off + i] = src[src_off + i] (restoring recurrent-state snapshots).
+extern "C" __global__ void copy_span(const float* __restrict__ src, long src_off, float* __restrict__ dst, long dst_off, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[dst_off + i] = src[src_off + i];
+}
 
 extern "C" __global__ void scale_inplace(float* x, float s, long n) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -3177,6 +3201,9 @@ INSTANTIATE_AD(2, 256)
 INSTANTIATE_AD(4, 64)
 INSTANTIATE_AD(4, 128)
 INSTANTIATE_AD(4, 256)
+INSTANTIATE_AD(6, 128)
+INSTANTIATE_AD(6, 256)
+INSTANTIATE_AD(8, 128)
 INSTANTIATE_AD(4, 512)
 
 #ifndef RLLM_HIP

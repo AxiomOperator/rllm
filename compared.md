@@ -91,7 +91,7 @@ Ordered roughly by how much each one limits what rllm can serve.
 
 | Gap | llama.cpp | vLLM | Notes |
 |---|---|---|---|
-| Four architecture families (Qwen3 dense, Qwen3.5 dense hybrids, Llama/Mistral, Gemma 4) | ✓ 100+ | ✓ 200+ | Llama 2/3 and Mistral load as GGUF `llama`; Qwen3.5 as `qwen35` (no MTP, prefix cache or speculation there yet); no Phi, DeepSeek, Qwen2 (attention biases), Qwen3-MoE or Qwen3.5-MoE yet. |
+| Four architecture families (Qwen3 dense, Qwen3.5 dense hybrids, Llama/Mistral, Gemma 4) | ✓ 100+ | ✓ 200+ | Llama 2/3 and Mistral load as GGUF `llama`; Qwen3.5 as `qwen35` (MTP speculation; no prefix cache, draft model or prompt lookup there); no Phi, DeepSeek, Qwen2 (attention biases), Qwen3-MoE or Qwen3.5-MoE yet. |
 | MoE models | ✓ | ✓ | Planned for Phase 4 (`docs/plan.md`). |
 | Eight weight types | ✓ every GGUF type (Q2_K–Q6_K, Q4_0/Q5_0, IQ*, MXFP4, …) | ✓ FP8, AWQ, GPTQ, NVFP4, … | Q4_K_M, Q5_K_M, Q6_K, IQ4_XS and Q8_0 files work; Q2_K/Q3_K, Q4_0/Q5_0 and the other IQ types don't load. |
 | safetensors / Hugging Face checkpoints | ✗ | ✓ | GGUF only. |

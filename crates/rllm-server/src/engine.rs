@@ -116,6 +116,8 @@ pub struct EngineInfo {
     pub host_blocks: Option<usize>,
     /// The model keeps recurrent state (no prefix cache or speculation).
     pub recurrent: bool,
+    /// Most tokens the model's MTP head drafts per step (0: MTP off).
+    pub mtp_drafts: usize,
 }
 
 #[derive(Clone)]
@@ -269,6 +271,8 @@ pub struct EngineConfig {
     /// Prompt lookup: propose drafts by finding the latest tokens earlier in
     /// the sequence (no draft model needed; with one, lookup goes first).
     pub prompt_lookup: bool,
+    /// Speculative decoding with the model's own MTP head (when it has one).
+    pub mtp: bool,
     /// Pinned system memory for the prefix cache's host tier, in bytes (0: none).
     pub host_cache_bytes: usize,
     /// Sample every token on the host from full logits rows, instead of on
@@ -296,6 +300,9 @@ const SPEC_PAUSE_STEPS: u32 = 8;
 /// on the RTX 6000 Ada decoded +30% at 900 tokens, +22% at 4k, -2% at 8k
 /// and -24% at 17k. Prompt lookup has no such cost and keeps going.
 pub const DRAFT_MAX_CONTEXT: usize = 6144;
+/// Most tokens an MTP head drafts per step: its guesses get worse the
+/// further they reach (it was trained to predict one token ahead).
+const MTP_MAX_DRAFTS: usize = 3;
 
 /// Size of the draft model's KV pool for a main pool of `kv_tokens`: enough
 /// for every sequence that can draft at once (at most 4 decode together
@@ -389,6 +396,8 @@ where
                 // Recurrent models keep a state per sequence holding blocks:
                 // the running batch, an embedding job and a spare.
                 let mut pool = KvPool::new(&backend, &model, kv_tokens, BLOCK_SIZE, cfg.kv_type, cfg.parallel.max(1) + 2)?;
+                let mtp_drafts = cfg.draft_tokens.clamp(1, MTP_MAX_DRAFTS);
+                let mtp_drafts = if cfg.mtp && pool.enable_mtp(mtp_drafts).context("enabling MTP drafting")? { mtp_drafts } else { 0 };
                 if cfg.host_cache_bytes > 0 {
                     pool.add_host_tier(cfg.host_cache_bytes, cfg.kv_type).context("allocating the host cache")?;
                 }
@@ -396,9 +405,9 @@ where
                     Some(d) => Some(KvPool::new(&backend, d, draft_pool_tokens(kv_tokens), BLOCK_SIZE, cfg.kv_type, cfg.parallel.max(1)).context("draft model KV cache")?),
                     None => None,
                 };
-                Ok((pool, draft))
+                Ok((pool, draft, mtp_drafts))
             })();
-            let (pool, draft) = match pools {
+            let (pool, draft, mtp_drafts) = match pools {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = ready_tx.send(Err(format!("{e:#}")));
@@ -412,9 +421,10 @@ where
                 draft: draft_model.as_ref().map(|d| d.summary()),
                 host_blocks: pool.host_blocks().map(|(n, _)| n),
                 recurrent: pool.recurrent(),
+                mtp_drafts,
             };
             let _ = ready_tx.send(Ok(info));
-            Scheduler::new(pool, draft, &tok, &vocab, &cfg, &metrics, queued_engine).run(jobs_rx);
+            Scheduler::new(pool, draft, mtp_drafts, &tok, &vocab, &cfg, &metrics, queued_engine).run(jobs_rx);
         })
         .context("spawn engine thread")?;
     let info = ready_rx.recv().context("engine thread exited")?.map_err(|e| anyhow::anyhow!(e))?;
@@ -576,6 +586,8 @@ struct Scheduler<'a, 'm, B: Backend> {
     pool: KvPool<'m, B, AnyModel<B>>,
     /// The draft model's pool (speculative decoding).
     draft: Option<KvPool<'m, B, AnyModel<B>>>,
+    /// Drafts per step from the model's MTP head (0: MTP off).
+    mtp_drafts: usize,
     cache: PrefixCache,
     tok: &'a Tokenizer,
     vocab: &'a Vocab,
@@ -622,9 +634,11 @@ impl StepTiming {
 }
 
 impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         pool: KvPool<'m, B, AnyModel<B>>,
         draft: Option<KvPool<'m, B, AnyModel<B>>>,
+        mtp_drafts: usize,
         tok: &'a Tokenizer,
         vocab: &'a Vocab,
         cfg: &'a EngineConfig,
@@ -636,6 +650,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             queued,
             pool,
             draft,
+            mtp_drafts,
             cache: PrefixCache::default(),
             tok,
             vocab,
@@ -723,7 +738,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                     admitted: 0,
                     draft_kv: SeqKv::default(),
                     draft_sampler,
-                    spec_k: self.cfg.draft_tokens,
+                    spec_k: self.spec_max(),
                     spec_pause: 0,
                     spec_misses: 0,
                     params,
@@ -851,12 +866,17 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
     /// remaining budget, and so that a step of `decoding` sequences stays
     /// within SPEC_STEP_TOKENS.
     fn spec_len(&self, s: &Seq, decoding: usize) -> usize {
-        let any = self.draft.is_some() || self.cfg.prompt_lookup;
+        let any = self.draft.is_some() || self.cfg.prompt_lookup || self.mtp_drafts > 0;
         if !any || s.todo().len() != 1 || s.json.is_some() || s.spec_pause > 0 {
             return 0;
         }
         let fit = (SPEC_STEP_TOKENS / decoding.max(1)).saturating_sub(1);
         s.spec_k.min(fit).min((s.budget - s.generated).saturating_sub(1))
+    }
+
+    /// Most drafts per sequence and step.
+    fn spec_max(&self) -> usize {
+        if self.mtp_drafts > 0 { self.mtp_drafts } else { self.cfg.draft_tokens }
     }
 
     /// Plan, run and sample one batched forward pass.
@@ -921,7 +941,21 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         // for the rest. If the draft can't run (its pool is full), this step
         // goes without: drafts only ever save work.
         let mut proposals: Vec<Proposal> = (0..self.running.len()).map(|_| Proposal::default()).collect();
-        if spec.iter().any(|&k| k > 0) {
+        if self.mtp_drafts > 0 && spec.iter().any(|&k| k > 0) {
+            let t = Instant::now();
+            // An MTP pass that fails only costs this step its drafts.
+            match self.propose_mtp(&spec) {
+                Ok(p) => proposals = p,
+                Err(e) => eprintln!("[rllm] MTP drafting failed: {e:#}"),
+            }
+            for (i, p) in proposals.iter().enumerate() {
+                if spec[i] > 0 {
+                    takes[i] = 1 + p.tokens.len();
+                    Metrics::add(&self.metrics.draft_tokens, p.tokens.len());
+                }
+            }
+            self.timing.draft += t.elapsed();
+        } else if spec.iter().any(|&k| k > 0) {
             let t = Instant::now();
             let mut model_spec = spec.clone();
             if self.cfg.prompt_lookup {
@@ -994,6 +1028,9 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                 .map(|(s, p)| if p.tokens.is_empty() { Vec::new() } else { [s.todo(), &p.tokens].concat() })
                 .collect();
             let mut items: Vec<StepItem> = Vec::with_capacity(active.len());
+            // Snapshots of recurrent state after each verified token but the
+            // last, so rejected drafts can be rolled back (MTP).
+            let mut snaps: Vec<u32> = Vec::with_capacity(active.len());
             let mut n_tok = 0;
             for (i, s) in self.running.iter_mut().enumerate() {
                 if takes[i] == 0 {
@@ -1004,6 +1041,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                 n_tok += takes[i];
                 // `tokens` and `kv` are disjoint fields.
                 let Seq { tokens, kv, .. } = s;
+                snaps.push(if spec_tokens[i].is_empty() { 0 } else { (takes[i] - 1) as u32 });
                 if !spec_tokens[i].is_empty() {
                     rows_of.push(takes[i]);
                     sample.extend(std::iter::repeat_n(None, takes[i]));
@@ -1025,7 +1063,10 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             if sample.iter().all(Option::is_none) {
                 sample.clear();
             }
-            let out = self.pool.step_sampled(&mut items, false, &sample)?;
+            if self.mtp_drafts == 0 {
+                snaps.clear();
+            }
+            let out = self.pool.step_spec(&mut items, false, &sample, &snaps)?;
             self.timing.forward += t.elapsed();
             out
         };
@@ -1082,6 +1123,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         };
         // Finished sequences: how, or None if they failed.
         let mut done: Vec<(usize, Option<Finish>)> = Vec::new();
+        let spec_max = self.spec_max();
         let device_results = device_results.into_iter().map(|(i, n, kept)| (i, Some((n, kept))));
         for (i, r) in results.into_iter().chain(device_results) {
             let Some((next, kept)) = r else {
@@ -1095,7 +1137,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                 Metrics::add(c, kept);
                 let keep = start_of[i] + 1 + kept;
                 let s = &mut self.running[i];
-                s.spec_k = (kept + 1).min(self.cfg.draft_tokens);
+                s.spec_k = (kept + 1).min(spec_max);
                 s.spec_misses = if kept == 0 { s.spec_misses + 1 } else { 0 };
                 if s.spec_misses >= SPEC_MAX_MISSES {
                     // The draft keeps guessing wrong here: decode plainly
@@ -1106,6 +1148,10 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                 s.kv.truncate(&mut self.pool.alloc, keep);
                 if let Some(d) = &mut self.draft {
                     s.draft_kv.truncate(&mut d.alloc, keep);
+                }
+                if self.mtp_drafts > 0 {
+                    // Recurrent state back to the last kept token.
+                    self.pool.keep_step(&s.kv, 1 + kept)?;
                 }
             }
             if let Next::Done(f) = next {
@@ -1125,6 +1171,72 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             }
         }
         Ok(())
+    }
+
+    /// Draft with the model's MTP head for the sequences with `spec[i] > 0`:
+    /// a chain of MTP steps from each sequence's pending token (its first
+    /// step uses the main model's last hidden state, later ones the previous
+    /// MTP step's), batched across sequences. The draft positions' KV slots
+    /// are taken for the chain and given back after (the verification step
+    /// takes them again).
+    fn propose_mtp(&mut self, spec: &[usize]) -> Result<Vec<Proposal>> {
+        let vocab_n = self.pool.model().vocab_size();
+        let mut props: Vec<Proposal> = (0..self.running.len()).map(|_| Proposal::default()).collect();
+        // Per drafting sequence: (index, position of its pending token, the
+        // pending token). Read before the slots are taken: `todo()` slices
+        // from `kv.len`, which grows meanwhile.
+        let mut chain: Vec<(usize, usize, u32)> = Vec::new();
+        for (i, s) in self.running.iter_mut().enumerate() {
+            if spec[i] == 0 || s.todo().len() != 1 {
+                continue;
+            }
+            let (len, pending) = (s.kv.len, s.todo()[0]);
+            // Slots for the pending token and the drafts fed after it.
+            if s.kv.append(&mut self.pool.alloc, spec[i]).is_ok() {
+                chain.push((i, len, pending));
+            }
+        }
+        let result = (|| -> Result<()> {
+            let max_k = chain.iter().map(|&(i, _, _)| spec[i]).max().unwrap_or(0);
+            for round in 0..max_k {
+                let live: Vec<(usize, usize)> = chain
+                    .iter()
+                    .filter(|&&(i, _, _)| {
+                        let p = &props[i];
+                        p.tokens.len() == round && round < spec[i] && !p.tokens.last().is_some_and(|&t| self.tok.is_stop(t))
+                    })
+                    .map(|&(i, pos, _)| (i, pos + round))
+                    .collect();
+                let pending_of = |i: usize| chain.iter().find(|c| c.0 == i).expect("drafting").2;
+                if live.is_empty() {
+                    break;
+                }
+                let items: Vec<(&SeqKv, u32, usize)> = live
+                    .iter()
+                    .map(|&(i, pos)| {
+                        let s = &self.running[i];
+                        let tok = if round == 0 { pending_of(i) } else { *props[i].tokens.last().expect("round > 0") };
+                        (&s.kv, tok, pos)
+                    })
+                    .collect();
+                let mut logits = self.pool.mtp_draft(&items, round == 0)?;
+                for (row, &(i, _)) in logits.chunks_exact_mut(vocab_n).zip(&live) {
+                    let s = &mut self.running[i];
+                    let p = &mut props[i];
+                    draft_logits(s, &p.tokens, row);
+                    let q = s.draft_sampler.dist(row);
+                    let t = s.draft_sampler.draw(&q);
+                    p.tokens.push(t);
+                    p.dists.push(q);
+                }
+            }
+            Ok(())
+        })();
+        for &(i, len, _) in &chain {
+            self.running[i].kv.truncate(&mut self.pool.alloc, len);
+        }
+        result?;
+        Ok(props)
     }
 
     /// Run the draft model for the sequences with `spec[i] > 0`: catch its

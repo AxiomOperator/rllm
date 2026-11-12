@@ -94,7 +94,7 @@ fn verification_steps_match_single_steps() {
             .zip(batched.chunks_exact(vocab))
             .filter(|(a, b)| rllm_model::sampler::argmax(a) == rllm_model::sampler::argmax(b))
             .count();
-        if matches!(g.get_str("general.architecture").unwrap(), "qwen3" | "llama") {
+        if matches!(g.get_str("general.architecture").unwrap(), "qwen3" | "llama" | "qwen35") {
             assert_eq!(diff, 0, "{kv}: {diff} of {} logits differ", singles.len());
         } else {
             // (Random tokens: near-ties may flip, so only the size is checked.)
@@ -147,6 +147,10 @@ fn host_tier_round_trip() {
     let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let Some((b, g)) = setup() else { return };
     let model = AnyModel::load(&b, &g).unwrap();
+    // Recurrent models (Qwen3.5) can't continue from cached KV: no prefix cache.
+    if rllm_model::Model::recurrent(&model) {
+        return;
+    }
     let vocab = rllm_model::Model::vocab_size(&model);
     let mut q = tokens(200, vocab, 11);
     q.extend(tokens(9, vocab, 12));

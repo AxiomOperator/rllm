@@ -383,6 +383,7 @@ impl Backend for CpuBackend {
         out: &mut Vec<f32>,
         channels: usize,
         kernel: usize,
+        snaps: Option<(&mut Vec<f32>, usize)>,
     ) -> Result<()> {
         let wf = w.dense.as_deref().filter(|v| kernel >= 2 && channels > 0 && v.len() == channels * kernel).ok_or_else(|| {
             Error::Shape(format!("conv1d_silu: weight must be 1-D with {channels} x {kernel} values"))
@@ -394,13 +395,21 @@ impl Backend for CpuBackend {
         check_len("conv1d_silu x", x.len(), n * channels)?;
         check_len("conv1d_silu out", out.len(), n * channels)?;
         // Per sequence, then per channel: the channel's window slides over its tokens.
-        let mut per_seq: Vec<(usize, usize, usize, bool)> = (0..runs.n_seqs())
+        let per_seq: Vec<(usize, usize, usize, bool)> = (0..runs.n_seqs())
             .map(|s| (runs.starts[s] as usize, runs.starts[s + 1] as usize, runs.slots[s] as usize, runs.fresh[s] != 0))
             .collect();
-        per_seq.sort_by_key(|r| r.2);
         let out_ptr = SyncPtr(out.as_mut_ptr());
         let state_ptr = SyncPtr(state.as_mut_ptr());
-        per_seq.par_iter().for_each(|&(t0, t1, slot, fresh)| {
+        let (snap_ptr, n_snap) = match snaps {
+            Some((buf, n)) => {
+                check_len("conv1d_silu snapshots", buf.len(), n_slots * n * channels * keep)?;
+                (Some(SyncPtr(buf.as_mut_ptr())), n)
+            }
+            None => (None, 0),
+        };
+        let snap_of = |s: usize| runs.snap.get(s).map_or(0, |&n| n as usize).min(n_snap);
+        let per_seq: Vec<(usize, usize, usize, bool, usize)> = per_seq.iter().enumerate().map(|(i, &(a, b, c, d))| (a, b, c, d, snap_of(i))).collect();
+        per_seq.par_iter().for_each(|&(t0, t1, slot, fresh, n_keep)| {
             (0..channels).into_par_iter().for_each(|c| {
                 // SAFETY: each (sequence, channel) touches only its own state
                 // entries and output column; sequences have distinct slots
@@ -418,6 +427,14 @@ impl Backend for CpuBackend {
                     win[keep] = x[t * channels + c];
                     let v: f32 = win.iter().zip(wc).map(|(a, b)| a * b).sum();
                     unsafe { *out_ptr.get().add(t * channels + c) = v / (1.0 + (-v).exp()) };
+                    let j = t - t0;
+                    if let Some(p) = snap_ptr
+                        && j < n_keep
+                    {
+                        // SAFETY: (slot, snapshot, channel) entries are this job's own.
+                        let dst = unsafe { std::slice::from_raw_parts_mut(p.get().add(((slot * n_snap + j) * channels + c) * keep), keep) };
+                        dst.copy_from_slice(&win[1..]);
+                    }
                 }
                 st.copy_from_slice(&win[1..]);
             });
@@ -437,6 +454,7 @@ impl Backend for CpuBackend {
         out: &mut Vec<f32>,
         shape: GdnShape,
         eps: f32,
+        snaps: Option<(&mut Vec<f32>, usize)>,
     ) -> Result<()> {
         let GdnShape { n_k_heads: hk, n_v_heads: hv, head_dim: d } = shape;
         if hk == 0 || d == 0 || !hv.is_multiple_of(hk) {
@@ -454,6 +472,13 @@ impl Backend for CpuBackend {
         let scale = 1.0 / (d as f32).sqrt();
         let out_ptr = SyncPtr(out.as_mut_ptr());
         let state_ptr = SyncPtr(state.as_mut_ptr());
+        let (snap_ptr, n_snap) = match snaps {
+            Some((buf, n)) => {
+                check_len("gated_delta_net snapshots", buf.len(), n_slots * n * shape.state_len())?;
+                (Some(SyncPtr(buf.as_mut_ptr())), n)
+            }
+            None => (None, 0),
+        };
         let jobs: Vec<(usize, usize)> = (0..runs.n_seqs()).flat_map(|s| (0..hv).map(move |h| (s, h))).collect();
         jobs.par_iter().for_each(|&(s, h)| {
             let (t0, t1, slot) = (runs.starts[s] as usize, runs.starts[s + 1] as usize, runs.slots[s] as usize);
@@ -488,8 +513,23 @@ impl Backend for CpuBackend {
                     col.iter_mut().zip(&k).for_each(|(e, k)| *e += k * delta);
                     o[j] = dot(col, &q) * scale;
                 }
+                let k_t = t - t0;
+                if let Some(p) = snap_ptr
+                    && k_t < runs.snap.get(s).map_or(0, |&n| n as usize).min(n_snap)
+                {
+                    // SAFETY: (slot, snapshot, head) blocks are this job's own.
+                    let dst = unsafe { std::slice::from_raw_parts_mut(p.get().add(((slot * n_snap + k_t) * hv + h) * d * d), d * d) };
+                    dst.copy_from_slice(st);
+                }
             }
         });
+        Ok(())
+    }
+
+    fn copy_span(&self, src: &Vec<f32>, src_off: usize, dst: &mut Vec<f32>, dst_off: usize, len: usize) -> Result<()> {
+        check_len("copy_span src", src.len(), src_off + len)?;
+        check_len("copy_span dst", dst.len(), dst_off + len)?;
+        dst[dst_off..dst_off + len].copy_from_slice(&src[src_off..src_off + len]);
         Ok(())
     }
 

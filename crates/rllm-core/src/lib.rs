@@ -163,11 +163,15 @@ pub struct AttnMeta<'a> {
 /// sequence's tokens are contiguous and in order: sequence `s` holds tokens
 /// `starts[s]..starts[s + 1]` (`starts` has one entry more than sequences),
 /// keeps its state in slot `slots[s]`, and starts from a zero state when
-/// `fresh[s]` is nonzero (its first token is at position 0).
+/// `fresh[s]` is nonzero (its first token is at position 0). With
+/// snapshots (speculative verification), the state after each of its first
+/// `snap[s]` tokens is also kept, so the step can be rolled back to any of
+/// them (`snap` empty: none).
 pub struct SeqRuns<'a> {
     pub starts: &'a [u32],
     pub slots: &'a [u32],
     pub fresh: &'a [u32],
+    pub snap: &'a [u32],
 }
 
 impl SeqRuns<'_> {
@@ -183,7 +187,8 @@ impl SeqRuns<'_> {
             && self.starts.first() == Some(&0)
             && self.starts.last().map(|&e| e as usize) == Some(n_tokens)
             && self.starts.windows(2).all(|w| w[0] < w[1])
-            && self.slots.iter().all(|&s| (s as usize) < n_slots);
+            && self.slots.iter().all(|&s| (s as usize) < n_slots)
+            && (self.snap.is_empty() || self.snap.len() == n);
         if ok { Ok(()) } else { Err(Error::Shape(format!("bad sequence runs for {n_tokens} tokens and {n_slots} state slots"))) }
     }
 }
@@ -361,7 +366,9 @@ pub trait Backend: Send + Sync {
     /// inputs before the step's first token come from `state`: per slot,
     /// the sequence's last `kernel - 1` inputs, `[slots, channels, kernel - 1]`
     /// (zeros for a fresh sequence). `state` is updated to end with this
-    /// step's inputs.
+    /// step's inputs. `snaps` (with `runs.snap`) receives the state after each
+    /// of a sequence's first `snap[s]` tokens: `[slots, n_snap, channels,
+    /// kernel - 1]`.
     #[allow(clippy::too_many_arguments)]
     fn conv1d_silu(
         &self,
@@ -372,6 +379,7 @@ pub trait Backend: Send + Sync {
         out: &mut Self::Buffer,
         channels: usize,
         kernel: usize,
+        snaps: Option<(&mut Self::Buffer, usize)>,
     ) -> Result<()>;
 
     /// Gated DeltaNet recurrence over each sequence's tokens. `qkv` is the
@@ -385,7 +393,9 @@ pub trait Backend: Send + Sync {
     /// `state`: `[slots, n_v_heads * head_dim²]` floats, laid out per head
     /// as the backend likes (only that backend reads it); zero for fresh
     /// sequences.
-    /// `out` is `[tokens, n_v_heads * head_dim]`.
+    /// `out` is `[tokens, n_v_heads * head_dim]`. `snaps` (with `runs.snap`)
+    /// receives the state after each of a sequence's first `snap[s]` tokens,
+    /// `[slots, n_snap, state]` in the same per-head layout as `state`.
     #[allow(clippy::too_many_arguments)]
     fn gated_delta_net(
         &self,
@@ -399,7 +409,12 @@ pub trait Backend: Send + Sync {
         out: &mut Self::Buffer,
         shape: GdnShape,
         eps: f32,
+        snaps: Option<(&mut Self::Buffer, usize)>,
     ) -> Result<()>;
+
+    /// `dst[dst_off..dst_off + len] = src[src_off..src_off + len]` (device
+    /// copy; restoring recurrent-state snapshots).
+    fn copy_span(&self, src: &Self::Buffer, src_off: usize, dst: &mut Self::Buffer, dst_off: usize, len: usize) -> Result<()>;
 
     /// `out[i, :] = x[first + i * stride, :]` for `i < count`, rows of `width`.
     #[allow(clippy::too_many_arguments)]

@@ -84,6 +84,8 @@ pub struct ServeConfig {
     pub draft_tokens: usize,
     /// Speculative decoding by prompt lookup.
     pub prompt_lookup: bool,
+    /// Speculative decoding with the model's own MTP head, when it has one.
+    pub mtp: bool,
     /// Pinned system memory for the prefix cache's host tier (0: none).
     pub host_cache_bytes: usize,
     /// Sample on the host from full logits rows (see `EngineConfig::host_sampling`).
@@ -135,6 +137,7 @@ where
         draft,
         draft_tokens: cfg.draft_tokens.max(1),
         prompt_lookup: cfg.prompt_lookup,
+        mtp: cfg.mtp,
         host_cache_bytes: if cfg.prefix_cache { cfg.host_cache_bytes } else { 0 },
         host_sampling: cfg.host_sampling,
         max_queue: cfg.max_queue,
@@ -168,7 +171,7 @@ where
             Some(d) => format!(", draft model ({d}, up to {} tokens)", cfg.draft_tokens.max(1)),
             None => String::new(),
         },
-        if cfg.prompt_lookup && !info.recurrent { ", prompt lookup" } else { "" },
+        if cfg.prompt_lookup && !info.recurrent { ", prompt lookup".to_string() } else if info.mtp_drafts > 0 { format!(", MTP drafts (up to {} tokens)", info.mtp_drafts) } else { String::new() },
         t0.elapsed().as_secs_f64()
     );
     let state = Arc::new(AppState {

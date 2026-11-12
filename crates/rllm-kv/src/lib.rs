@@ -187,9 +187,8 @@ impl SeqKv {
         if len >= self.len {
             return;
         }
-        // A recurrent state can't be rewound: callers don't truncate
-        // sequences of such models (no speculative decoding there).
-        debug_assert!(self.state.is_none(), "truncating a sequence with recurrent state");
+        // A recurrent state isn't rewound here: the model restores it from a
+        // snapshot (KvPool::keep_step) when drafts are rejected.
         for b in self.block_table.drain(len.div_ceil(alloc.block_size())..) {
             alloc.release(b);
         }

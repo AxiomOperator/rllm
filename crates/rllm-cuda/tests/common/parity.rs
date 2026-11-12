@@ -310,10 +310,26 @@ enum Step {
 }
 
 fn attention_case(head_dim: usize, window: usize, step: Step, kv: KvType) {
+    attention_case_heads(head_dim, window, step, kv, 8, 2);
+}
+
+/// Query-head groups beyond 4 (Qwen3.5-27B: 6) have decode kernels too.
+#[test]
+fn paged_attention_wide_groups() {
+    for (heads, hd) in [(12, 256), (12, 128), (16, 128)] {
+        for kv in [KvType::F16, KvType::Q8] {
+            for step in [Step::Decode, Step::Mixed] {
+                attention_case_heads(hd, 0, step, kv, heads, 2);
+            }
+        }
+    }
+}
+
+fn attention_case_heads(head_dim: usize, window: usize, step: Step, kv: KvType, n_heads: usize, n_kv_heads: usize) {
     let Some(gpu) = gpu_backend() else { return };
     let cpu = CpuBackend::new();
     let mut rng = Rng(99);
-    let (n_heads, n_kv_heads, block_size) = (8, 2, 4);
+    let block_size = 4;
     let layout = KvLayout { n_layers: 1, n_blocks: 16, block_size, n_kv_heads, head_dim, dtype: kv };
     let kv_w = layout.slot_width();
     let block_tables = vec![vec![9, 2, 14, 5], vec![0, 11, 3]];
@@ -726,13 +742,13 @@ fn gated_delta_net_ops_match() {
         let (mut ssc, mut ssg) = (upload_any(&cpu, &rng.vec(ssm_len)), upload_any(&gpu, &rng.vec(ssm_len)));
         // Step 1: both sequences start (5 and 3 tokens); step 2: 1 and 4 more.
         for (starts, fresh) in [(vec![0u32, 5, 8], vec![1u32, 1]), (vec![0u32, 1, 5], vec![0u32, 0])] {
-            let runs = rllm_core::SeqRuns { starts: &starts, slots: &[2, 0], fresh: &fresh };
+            let runs = rllm_core::SeqRuns { starts: &starts, slots: &[2, 0], fresh: &fresh, snap: &[] };
             let t = *starts.last().unwrap() as usize;
             let xin = rng.vec(t * ch);
             let (xic, xig) = (upload_any(&cpu, &xin), upload_any(&gpu, &xin));
             let (mut oc, mut og) = (cpu.alloc(t * ch).unwrap(), gpu.alloc(t * ch).unwrap());
-            cpu.conv1d_silu(&xic, &wc, &mut csc, &runs, &mut oc, ch, kernel).unwrap();
-            gpu.conv1d_silu(&xig, &wg, &mut csg, &runs, &mut og, ch, kernel).unwrap();
+            cpu.conv1d_silu(&xic, &wc, &mut csc, &runs, &mut oc, ch, kernel, None).unwrap();
+            gpu.conv1d_silu(&xig, &wg, &mut csg, &runs, &mut og, ch, kernel, None).unwrap();
             let conv_out = download(&cpu, &oc, t * ch);
             assert_close(&format!("conv1d_silu d{d}"), &conv_out, &download(&gpu, &og, t * ch), 1e-5);
 
@@ -741,9 +757,65 @@ fn gated_delta_net_ops_match() {
             let (mut yc, mut yg) = (cpu.alloc(t * hv * d).unwrap(), gpu.alloc(t * hv * d).unwrap());
             // Both start from the CPU's conv output, so only the recurrence is compared.
             let qc = upload_any(&gpu, &conv_out);
-            cpu.gated_delta_net(&oc, &alc, &bec, &dtc, &ac, &mut ssc, &runs, &mut yc, shape, 1e-6).unwrap();
-            gpu.gated_delta_net(&qc, &alg, &beg, &dtg, &ag, &mut ssg, &runs, &mut yg, shape, 1e-6).unwrap();
+            cpu.gated_delta_net(&oc, &alc, &bec, &dtc, &ac, &mut ssc, &runs, &mut yc, shape, 1e-6, None).unwrap();
+            gpu.gated_delta_net(&qc, &alg, &beg, &dtg, &ag, &mut ssg, &runs, &mut yg, shape, 1e-6, None).unwrap();
             assert_close(&format!("gated_delta_net d{d}"), &download(&cpu, &yc, t * hv * d), &download(&gpu, &yg, t * hv * d), 1e-4);
+        }
+    }
+}
+
+/// Speculative verification with recurrent state: a 4-token step that
+/// snapshots after its first 3 tokens, rolled back per sequence to a
+/// snapshot (copy_span), then continued. GPU against CPU.
+#[test]
+fn gated_delta_net_snapshots_roll_back() {
+    let Some(gpu) = gpu_backend() else { return };
+    let cpu = CpuBackend::new();
+    let mut rng = Rng(36);
+    let shape = rllm_core::GdnShape { n_k_heads: 2, n_v_heads: 4, head_dim: 128 };
+    let (ch, kernel, slots, n_snap) = (shape.qkv_width(), 4usize, 2usize, 3usize);
+    let (conv_len, ssm_len) = (ch * (kernel - 1), shape.state_len());
+    let hv = shape.n_v_heads;
+    let conv_w = f32_tensor("conv", &rng.vec(ch * kernel).iter().map(|v| v * 0.5).collect::<Vec<_>>());
+    let dt = f32_tensor("dt", &rng.vec(hv));
+    let a = f32_tensor("a", &rng.vec(hv).iter().map(|v| -(v.abs() + 0.1)).collect::<Vec<_>>());
+    let (wc, wg) = (cpu.upload(&conv_w).unwrap(), gpu.upload(&conv_w).unwrap());
+    let (dtc, dtg, ac, ag) = (cpu.upload(&dt).unwrap(), gpu.upload(&dt).unwrap(), cpu.upload(&a).unwrap(), gpu.upload(&a).unwrap());
+    let (mut csc, mut csg) = (upload_any(&cpu, &vec![0.0; slots * conv_len]), upload_any(&gpu, &vec![0.0; slots * conv_len]));
+    let (mut ssc, mut ssg) = (upload_any(&cpu, &vec![0.0; slots * ssm_len]), upload_any(&gpu, &vec![0.0; slots * ssm_len]));
+    let (mut cnc, mut cng) = (upload_any(&cpu, &vec![0.0; slots * n_snap * conv_len]), upload_any(&gpu, &vec![0.0; slots * n_snap * conv_len]));
+    let (mut snc, mut sng) = (upload_any(&cpu, &vec![0.0; slots * n_snap * ssm_len]), upload_any(&gpu, &vec![0.0; slots * n_snap * ssm_len]));
+    // Prompt (5 and 6 tokens), a verification step of 4 tokens each with
+    // snapshots, then keep 2 (sequence in slot 0) and 1 (slot 1) of them,
+    // then one more token each.
+    let steps: [(Vec<u32>, Vec<u32>, Vec<u32>); 3] =
+        [(vec![0, 5, 11], vec![1, 1], vec![]), (vec![0, 4, 8], vec![0, 0], vec![3, 3]), (vec![0, 1, 2], vec![0, 0], vec![])];
+    for (step, (starts, fresh, snap)) in steps.iter().enumerate() {
+        let runs = rllm_core::SeqRuns { starts, slots: &[0, 1], fresh, snap };
+        let t = *starts.last().unwrap() as usize;
+        let xin = rng.vec(t * ch);
+        let (xic, xig) = (upload_any(&cpu, &xin), upload_any(&gpu, &xin));
+        let (mut oc, mut og) = (cpu.alloc(t * ch).unwrap(), gpu.alloc(t * ch).unwrap());
+        let snaps = !snap.is_empty();
+        cpu.conv1d_silu(&xic, &wc, &mut csc, &runs, &mut oc, ch, kernel, snaps.then_some((&mut cnc, n_snap))).unwrap();
+        gpu.conv1d_silu(&xig, &wg, &mut csg, &runs, &mut og, ch, kernel, snaps.then_some((&mut cng, n_snap))).unwrap();
+        let conv_out = download(&cpu, &oc, t * ch);
+        assert_close(&format!("conv step {step}"), &conv_out, &download(&gpu, &og, t * ch), 1e-5);
+        let (al, be) = (rng.vec(t * hv), rng.vec(t * hv));
+        let (alc, alg, bec, beg) = (upload_any(&cpu, &al), upload_any(&gpu, &al), upload_any(&cpu, &be), upload_any(&gpu, &be));
+        let (mut yc, mut yg) = (cpu.alloc(t * hv * 128).unwrap(), gpu.alloc(t * hv * 128).unwrap());
+        let qg = upload_any(&gpu, &conv_out);
+        cpu.gated_delta_net(&oc, &alc, &bec, &dtc, &ac, &mut ssc, &runs, &mut yc, shape, 1e-6, snaps.then_some((&mut snc, n_snap))).unwrap();
+        gpu.gated_delta_net(&qg, &alg, &beg, &dtg, &ag, &mut ssg, &runs, &mut yg, shape, 1e-6, snaps.then_some((&mut sng, n_snap))).unwrap();
+        assert_close(&format!("gdn step {step}"), &download(&cpu, &yc, t * hv * 128), &download(&gpu, &yg, t * hv * 128), 1e-4);
+        if snaps {
+            // Roll back: slot 0 keeps 2 tokens (snapshot 1), slot 1 keeps 1 (snapshot 0).
+            for (slot, j) in [(0usize, 1usize), (1, 0)] {
+                cpu.copy_span(&cnc, (slot * n_snap + j) * conv_len, &mut csc, slot * conv_len, conv_len).unwrap();
+                gpu.copy_span(&cng, (slot * n_snap + j) * conv_len, &mut csg, slot * conv_len, conv_len).unwrap();
+                cpu.copy_span(&snc, (slot * n_snap + j) * ssm_len, &mut ssc, slot * ssm_len, ssm_len).unwrap();
+                gpu.copy_span(&sng, (slot * n_snap + j) * ssm_len, &mut ssg, slot * ssm_len, ssm_len).unwrap();
+            }
         }
     }
 }

@@ -140,3 +140,23 @@ pub fn read_vector(g: &Gguf, name: &str) -> Result<Vec<f32>> {
     rllm_core::quant::dequantize_row(t.dtype, t.bytes.as_slice(), &mut v);
     Ok(v)
 }
+
+/// Load columns `start..start + n` of 2-D tensor `name` (each row's slice;
+/// both bounds must fall on the type's block boundaries).
+pub fn load_weight_cols<B: Backend>(backend: &B, g: &Gguf, name: &str, start: usize, n: usize) -> Result<B::Weight> {
+    let t = host_tensor(g, name)?;
+    let (rows, cols) = t.as_2d();
+    let block = t.dtype.block_size();
+    ensure!(t.shape.len() == 2 && start + n <= cols && start.is_multiple_of(block) && n.is_multiple_of(block), "{name}: columns {start}..{} of {cols}", start + n);
+    let (row_bytes, off, len) = (t.dtype.row_bytes(cols), t.dtype.row_bytes(start), t.dtype.row_bytes(n));
+    let src = t.bytes.as_slice();
+    ensure!(rows * row_bytes == src.len(), "{name}: size mismatch");
+    let mut out = Vec::with_capacity(rows * len);
+    for r in 0..rows {
+        out.extend_from_slice(&src[r * row_bytes + off..r * row_bytes + off + len]);
+    }
+    let total = out.len();
+    let owner: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(out);
+    let t = HostTensor { shape: vec![rows, n], bytes: HostBytes::new(owner, 0..total), ..t };
+    backend.upload(&t).with_context(|| format!("uploading {name}"))
+}

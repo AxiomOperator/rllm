@@ -84,6 +84,10 @@ enum Cmd {
         /// output. Helps when output copies input (code edits, quoting, RAG).
         #[arg(long)]
         prompt_lookup: bool,
+        /// Don't use the model's built-in next-token-prediction head (MTP,
+        /// Qwen3.5 files that carry one) for speculative decoding.
+        #[arg(long)]
+        no_mtp: bool,
         /// Keep evicted prefix-cache blocks in this much pinned system memory
         /// (GiB) and copy them back on a hit instead of recomputing.
         #[arg(long, default_value_t = 0.0)]
@@ -375,6 +379,7 @@ fn main() -> Result<()> {
             draft,
             draft_tokens,
             prompt_lookup,
+            no_mtp,
             host_cache_gb,
             host_sampling,
             max_queue,
@@ -399,6 +404,7 @@ fn main() -> Result<()> {
                 draft,
                 draft_tokens,
                 prompt_lookup,
+                mtp: !no_mtp,
                 host_cache_bytes: (host_cache_gb.max(0.0) * (1u64 << 30) as f64) as usize,
                 host_sampling,
                 max_queue,

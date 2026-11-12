@@ -37,6 +37,28 @@ pub struct Batch<'a> {
     /// Per sequence: its recurrent-state slot (models with recurrent layers;
     /// empty otherwise).
     pub state_slots: &'a [u32],
+    /// Also run the model's MTP block over the step's tokens (filling its
+    /// KV cache and keeping each sequence's last hidden state for drafting;
+    /// see [`Model::enable_mtp`]).
+    pub mtp: bool,
+    /// Per sequence: how many of its first tokens to snapshot recurrent
+    /// state after, so [`Model::keep_step`] can roll the step back (empty:
+    /// none; speculative verification).
+    pub snap: &'a [u32],
+}
+
+/// One MTP draft step: one token per sequence (the first step: each
+/// sequence's newly sampled token; later steps: the previous draft), at
+/// `positions` (KV slots `slots`, already allocated in `block_tables`).
+pub struct MtpBatch<'a> {
+    pub tokens: &'a [u32],
+    pub positions: &'a [u32],
+    pub slots: &'a [u32],
+    pub block_tables: &'a [Vec<u32>],
+    pub state_slots: &'a [u32],
+    /// First step of a chain: the hidden state comes from the main model's
+    /// last token; later ones from the previous MTP step.
+    pub first: bool,
 }
 
 /// What a forward step returns.
@@ -116,6 +138,33 @@ pub trait Model<B: Backend> {
         false
     }
 
+    /// Whether the model carries its own next-token-prediction (MTP) head.
+    fn has_mtp(&self) -> bool {
+        false
+    }
+
+    /// Prepare `cache` for MTP drafting of up to `max_drafts` tokens per
+    /// step (snapshots for rolling back recurrent state). Ok(false) when the
+    /// model has no MTP head.
+    fn enable_mtp(&self, b: &B, cache: &mut Self::Cache, max_drafts: usize) -> Result<bool> {
+        let _ = (b, cache, max_drafts);
+        Ok(false)
+    }
+
+    /// After a step that fed the sequence in state slot `slot` some tokens,
+    /// keep only the first `kept` of them in its recurrent state (the rest
+    /// were rejected drafts; the step must have snapshotted them).
+    fn keep_step(&self, b: &B, cache: &mut Self::Cache, slot: u32, kept: usize) -> Result<()> {
+        let _ = (b, cache, slot, kept);
+        Ok(())
+    }
+
+    /// One MTP draft step: logits `[sequences, vocab]` on the host.
+    fn mtp_draft(&self, b: &B, cache: &mut Self::Cache, d: &MtpBatch, block_size: usize) -> Result<Vec<f32>> {
+        let _ = (b, cache, d, block_size);
+        bail!("this model has no MTP head")
+    }
+
     /// Host copies of cache blocks (the prefix cache's host tier).
     type HostCache;
 
@@ -183,6 +232,9 @@ pub struct ModelProfile {
     pub kquant_bytes: usize,
     /// Recurrent state per sequence (hybrid models; 0 otherwise).
     pub state_bytes_per_seq: usize,
+    /// The file carries an MTP head (Qwen3.5; speculative decoding with it
+    /// keeps snapshots of the recurrent state too).
+    pub mtp: bool,
     kv: Vec<KvLayout>,
 }
 
@@ -195,19 +247,19 @@ impl ModelProfile {
             "qwen3" | "llama" => {
                 let c = Qwen3Config::from_gguf(g)?;
                 let kv = vec![one(c.n_layers, c.n_kv_heads, c.head_dim)];
-                Ok(Self { arch: c.arch.clone(), n_layers: c.n_layers, hidden: c.hidden, ffn: c.ffn, vocab: c.vocab, max_context: c.max_context, weight_bytes, kquant_bytes, state_bytes_per_seq: 0, kv })
+                Ok(Self { arch: c.arch.clone(), n_layers: c.n_layers, hidden: c.hidden, ffn: c.ffn, vocab: c.vocab, max_context: c.max_context, weight_bytes, kquant_bytes, state_bytes_per_seq: 0, mtp: false, kv })
             }
             "gemma4" => {
                 let c = Gemma4Config::from_gguf(g)?;
                 let (swa, global) = c.kv_layer_counts();
                 let kv = vec![one(swa.max(1), c.n_kv_heads, c.head_dim_swa), one(global.max(1), c.n_kv_heads, c.head_dim_global)];
-                Ok(Self { arch: "gemma4".into(), n_layers: c.n_layers, hidden: c.hidden, ffn: c.ffn, vocab: c.vocab, max_context: c.max_context, weight_bytes, kquant_bytes, state_bytes_per_seq: 0, kv })
+                Ok(Self { arch: "gemma4".into(), n_layers: c.n_layers, hidden: c.hidden, ffn: c.ffn, vocab: c.vocab, max_context: c.max_context, weight_bytes, kquant_bytes, state_bytes_per_seq: 0, mtp: false, kv })
             }
             "qwen35" => {
                 let c = Qwen35Config::from_gguf(g)?;
                 let kv = vec![one(c.n_attn_layers(), c.n_kv_heads, c.head_dim)];
                 let state_bytes_per_seq = c.state_bytes_per_seq();
-                Ok(Self { arch: "qwen35".into(), n_layers: c.n_layers, hidden: c.hidden, ffn: c.ffn, vocab: c.vocab, max_context: c.max_context, weight_bytes, kquant_bytes, state_bytes_per_seq, kv })
+                Ok(Self { arch: "qwen35".into(), n_layers: c.n_layers, hidden: c.hidden, ffn: c.ffn, vocab: c.vocab, max_context: c.max_context, weight_bytes, kquant_bytes, state_bytes_per_seq, mtp: c.mtp, kv })
             }
             other => bail!("unsupported architecture {other:?} (supported: qwen3, llama, gemma4, qwen35)"),
         }
@@ -217,7 +269,7 @@ impl ModelProfile {
     #[doc(hidden)]
     pub fn for_tests(n_layers: usize, n_kv_heads: usize, head_dim: usize, weight_bytes: usize, max_context: usize) -> Self {
         let kv = vec![KvLayout { n_layers, n_blocks: 1, block_size: 1, n_kv_heads, head_dim, dtype: KvType::F16 }];
-        Self { arch: "qwen3".into(), n_layers, hidden: 4096, ffn: 12288, vocab: 151936, max_context, weight_bytes, kquant_bytes: weight_bytes, state_bytes_per_seq: 0, kv }
+        Self { arch: "qwen3".into(), n_layers, hidden: 4096, ffn: 12288, vocab: 151936, max_context, weight_bytes, kquant_bytes: weight_bytes, state_bytes_per_seq: 0, mtp: false, kv }
     }
 
     /// f16 K and V bytes per token of the largest layer (q8 prefill
@@ -301,6 +353,31 @@ impl<B: Backend> Model<B> for AnyModel<B> {
 
     fn recurrent(&self) -> bool {
         matches!(self, Self::Qwen35(_))
+    }
+
+    fn has_mtp(&self) -> bool {
+        matches!(self, Self::Qwen35(m) if m.has_mtp())
+    }
+
+    fn enable_mtp(&self, b: &B, cache: &mut AnyCache<B>, max_drafts: usize) -> Result<bool> {
+        match (self, cache) {
+            (Self::Qwen35(m), AnyCache::Qwen35(c)) => m.enable_mtp(b, c, max_drafts),
+            _ => Ok(false),
+        }
+    }
+
+    fn keep_step(&self, b: &B, cache: &mut AnyCache<B>, slot: u32, kept: usize) -> Result<()> {
+        match (self, cache) {
+            (Self::Qwen35(m), AnyCache::Qwen35(c)) => m.keep_step(b, c, slot, kept),
+            _ => Ok(()),
+        }
+    }
+
+    fn mtp_draft(&self, b: &B, cache: &mut AnyCache<B>, d: &MtpBatch, block_size: usize) -> Result<Vec<f32>> {
+        match (self, cache) {
+            (Self::Qwen35(m), AnyCache::Qwen35(c)) => m.mtp_draft(b, c, d, block_size),
+            _ => bail!("this model has no MTP head"),
+        }
     }
 
     fn vocab_size(&self) -> usize {

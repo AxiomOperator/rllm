@@ -2,7 +2,7 @@ use anyhow::Result;
 use rllm_core::{Backend, KvType};
 use rllm_kv::{BlockAllocator, BlockStore, SeqKv};
 
-use crate::{Batch, Model, StepOut};
+use crate::{Batch, Model, MtpBatch, StepOut};
 use rllm_core::RowSample;
 
 /// What a [`KvPool::step`] item wants back.
@@ -36,6 +36,8 @@ pub struct KvPool<'m, B: Backend, M: Model<B>> {
     id: u64,
     /// Host tier for the prefix cache: host block storage and its allocator.
     host: Option<(M::HostCache, BlockAllocator)>,
+    /// Every step also runs the model's MTP block (see [`Self::enable_mtp`]).
+    mtp: bool,
 }
 
 static NEXT_POOL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -55,7 +57,7 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
         if model.recurrent() {
             alloc = alloc.with_state_slots(max_seqs);
         }
-        Ok(Self { backend, model, kv, alloc, block_size, id, host: None })
+        Ok(Self { backend, model, kv, alloc, block_size, id, host: None, mtp: false })
     }
 
     /// Add a host tier of `bytes` (rounded down to whole blocks) that the
@@ -86,6 +88,44 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
         self.model.recurrent()
     }
 
+    /// Turn on MTP drafting (up to `max_drafts` tokens per step): from now on
+    /// every step also feeds the model's MTP block. Ok(false) if the model
+    /// has no MTP head. Call before any sequence is fed.
+    pub fn enable_mtp(&mut self, max_drafts: usize) -> Result<bool> {
+        self.mtp = self.model.enable_mtp(self.backend, &mut self.kv, max_drafts)?;
+        Ok(self.mtp)
+    }
+
+    pub fn mtp(&self) -> bool {
+        self.mtp
+    }
+
+    /// After a step that fed `seq` some tokens with snapshots, keep only the
+    /// first `kept` of them in its recurrent state ([`Model::keep_step`]).
+    pub fn keep_step(&mut self, seq: &SeqKv, kept: usize) -> Result<()> {
+        match seq.state {
+            Some(slot) => self.model.keep_step(self.backend, &mut self.kv, slot, kept),
+            None => Ok(()),
+        }
+    }
+
+    /// One MTP draft step over `items` (sequence, token, position): the
+    /// positions' KV slots must already be allocated. Logits `[items, vocab]`.
+    pub fn mtp_draft(&mut self, items: &[(&SeqKv, u32, usize)], first: bool) -> Result<Vec<f32>> {
+        let bs = self.block_size;
+        let tokens: Vec<u32> = items.iter().map(|i| i.1).collect();
+        let positions: Vec<u32> = items.iter().map(|i| i.2 as u32).collect();
+        let mut slots = Vec::with_capacity(items.len());
+        for &(seq, _, p) in items {
+            anyhow::ensure!(p < seq.len, "MTP draft position {p} not allocated ({} tokens)", seq.len);
+            slots.push(seq.block_table[p / bs] * bs as u32 + (p % bs) as u32);
+        }
+        let tables: Vec<Vec<u32>> = items.iter().map(|i| i.0.block_table.clone()).collect();
+        let states: Vec<u32> = items.iter().map(|i| i.0.state.ok_or_else(|| anyhow::anyhow!("MTP needs a recurrent state slot"))).collect::<Result<_>>()?;
+        let d = MtpBatch { tokens: &tokens, positions: &positions, slots: &slots, block_tables: &tables, state_slots: &states, first };
+        self.model.mtp_draft(self.backend, &mut self.kv, &d, bs)
+    }
+
     /// One forward pass over all `items` (each appended to its sequence).
     /// Returns the wanted rows in item order: logits `[rows, vocab]`, or
     /// final hidden states `[rows, hidden]` if `hidden`. All-or-nothing on
@@ -98,6 +138,14 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
     /// one entry per wanted row (in order), `Some` to sample that row
     /// instead of returning its logits; empty to return every row.
     pub fn step_sampled(&mut self, items: &mut [StepItem], hidden: bool, sample: &[Option<RowSample>]) -> Result<StepOut> {
+        self.step_spec(items, hidden, sample, &[])
+    }
+
+    /// [`Self::step_sampled`] with snapshots for speculative verification:
+    /// `snap[i]` (one per item, or empty) is how many of item `i`'s first
+    /// tokens to keep recurrent state after ([`Self::keep_step`]).
+    pub fn step_spec(&mut self, items: &mut [StepItem], hidden: bool, sample: &[Option<RowSample>], snap: &[u32]) -> Result<StepOut> {
+        anyhow::ensure!(snap.is_empty() || snap.len() == items.len(), "{} snapshot counts for {} items", snap.len(), items.len());
         anyhow::ensure!(items.iter().all(|i| !i.tokens.is_empty()), "step: empty item");
         let need: usize = items.iter().map(|i| i.seq.blocks_needed(self.block_size, i.tokens.len())).sum();
         anyhow::ensure!(need <= self.alloc.n_free(), "KV cache out of blocks (need {need}, have {})", self.alloc.n_free());
@@ -150,6 +198,8 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
             cache_id: self.id,
             sample,
             state_slots: &states,
+            mtp: self.mtp,
+            snap,
         };
         let out = self.model.forward(self.backend, &mut self.kv, &batch, self.block_size)?;
         if items.iter().all(|i| i.want == Want::None) {
@@ -294,6 +344,8 @@ impl<'m, B: Backend, M: Model<B>> Generator<'m, B, M> {
             cache_id: p.id,
             sample: &[],
             state_slots: self.seq.state.as_slice(),
+            mtp: p.mtp,
+            snap: &[],
         };
         Ok(p.model.forward(p.backend, &mut p.kv, &batch, p.block_size)?.rows)
     }

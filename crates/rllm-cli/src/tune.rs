@@ -225,15 +225,18 @@ fn plan(m: &ModelProfile, draft: Option<&Draft>, mach: &Machine, want_ctx: Optio
     p.device = gpu.device();
     let free = gpu.usable_bytes(mach.ram_available);
     // Hybrid models (Qwen3.5) keep a fixed-size recurrent state per sequence
-    // (the batch, an embedding job and a spare), and can't speculate.
+    // (the batch, an embedding job and a spare); with an MTP head, also
+    // snapshots of it for up to 3 drafts. No draft model or prompt lookup.
     let recurrent = m.state_bytes_per_seq > 0;
-    let state_bytes = m.state_bytes_per_seq * (p.parallel + 2);
+    let copies = if m.mtp { 1 + 3 } else { 1 };
+    let state_bytes = m.state_bytes_per_seq * copies * (p.parallel + 2);
     if recurrent {
         p.prompt_lookup = false;
         p.reasons.push(format!(
-            "Recurrent state: {:.2} GiB for {} sequences; no draft model or prompt lookup (the state can't be rewound).",
+            "Recurrent state: {:.2} GiB for {} sequences{}; no draft model or prompt lookup.",
             state_bytes as f64 / GIB,
-            p.parallel + 2
+            p.parallel + 2,
+            if m.mtp { ", with snapshots for MTP drafting (the model's own draft head, on by default; --no-mtp turns it off)" } else { "" }
         ));
     }
 

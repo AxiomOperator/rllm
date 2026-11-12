@@ -248,22 +248,36 @@ retrieval-embedding model.
 
 Qwen3.5, 3.6 and 3.8 dense models (GGUF architecture `qwen35`) mix Gated
 DeltaNet layers, which keep a fixed-size recurrent state per sequence, with
-full-attention layers (one in four). The state can't be rebuilt from cached KV
-blocks or rewound after rejected draft tokens, so for these models:
+full-attention layers (one in four). For these models:
 
-- the prefix cache and its host tier are off (every prompt is computed in full);
-- `--draft` and `--prompt-lookup` are ignored with a notice (the MTP head some
-  files carry is not used yet);
+- the prefix cache and its host tier are off: the state can't be rebuilt from
+  cached KV blocks, so every prompt is computed in full;
 - each running request holds a state slot: `--parallel` + 2 slots are
   allocated up front (about 3 MB per DeltaNet layer per slot on the 27B model,
-  0.2 GiB for 10 slots on 0.8B). `rllm tune` counts them.
+  0.2 GiB for 10 slots on 0.8B). `rllm tune` counts them;
+- **MTP speculative decoding** is on by default when the file carries the
+  model's next-token-prediction head (`nextn_predict_layers`, e.g. unsloth's
+  `*-MTP-GGUF` files and Qwen3.8-27B): the head drafts up to 3 tokens a step
+  (fewer when `--draft-tokens` is lower, and adaptively, as with a draft
+  model), chaining from the main model's last hidden state. Every step also
+  runs the head's K/V over its tokens, and verification steps snapshot the
+  recurrent state after each token so rejected drafts roll back exactly.
+  Snapshots take 3 more state copies per slot. `--no-mtp` turns it off;
+- `--draft` and `--prompt-lookup` are ignored with a notice.
+
+With MTP, output is the same as without it: greedy output is token for token
+identical (checked on the CPU and, with a dedicated decode-attention kernel for
+the 27B's 6-head groups, on CUDA and HIP), and sampling follows the
+speculative sampling rule.
 
 Thinking is off by default in these models' chat template; `reasoning_effort`
 or `chat_template_kwargs: {"enable_thinking": true}` turns it on.
 
 Measured on the Strix Halo (Radeon 8060S), Qwen3.8-27B Q8_0: perplexity 5.5955
 (llama.cpp ROCm 5.5973; wikitext-2, 32 chunks of 512), pp512 433 tok/s
-(llama.cpp 390), tg64 7.81 tok/s (llama.cpp 7.78). Qwen3.5-0.8B Q8_0:
+(llama.cpp 390), tg64 7.81 tok/s (llama.cpp 7.78). With MTP, single requests
+(greedy, 100–150 tokens) decode at 12.0–17.2 tok/s instead of 7.7 (1.55–2.2×),
+with 81% of drafted tokens accepted. Qwen3.5-0.8B Q8_0:
 perplexity 15.4846 (llama.cpp 15.4933); logits within llama.cpp's own noise
 on the laptop's CPU and CUDA backends, at any prefill chunk size.
 

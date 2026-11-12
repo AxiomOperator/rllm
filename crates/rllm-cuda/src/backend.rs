@@ -42,8 +42,9 @@ fn wa_cfg(hd: usize) -> (usize, usize) {
 }
 
 /// (group, head_dim) pairs with an `attn_decode_g{G}_d{HD}` kernel (INSTANTIATE_AD).
-const ATTN_DECODE_SHAPES: [(usize, usize); 10] =
-    [(1, 64), (1, 128), (1, 256), (2, 64), (2, 128), (2, 256), (4, 64), (4, 128), (4, 256), (4, 512)];
+/// Group 6 is Qwen3.5-27B (24 heads over 4); group 8 covers 64-over-8 models.
+const ATTN_DECODE_SHAPES: [(usize, usize); 13] =
+    [(1, 64), (1, 128), (1, 256), (2, 64), (2, 128), (2, 256), (4, 64), (4, 128), (4, 256), (4, 512), (6, 128), (6, 256), (8, 128)];
 
 /// Threads per MMQ block (MMQ_THREADS in kernels.cu).
 const MMQ_THREADS: u32 = 128;
@@ -644,7 +645,7 @@ impl CudaBackend {
         };
 
         let mut names: Vec<String> = [
-            "f32_to_f16", "f32_to_bf16", "half_to_f32", "logit_adjust", "sample_rows", "rms_norm", "add_rms_norm", "rms_norm_add", "qkv_norm_rope_store", "rms_norm_rope", "rope_neox", "silu_mul", "gelu_mul", "gelu_mul_strided", "ple_gate_f32", "gelu", "mul_inplace", "scale_inplace", "softcap_inplace", "sigmoid_mul_inplace", "conv1d_silu", "gated_delta_net_d64", "gated_delta_net_d128",
+            "f32_to_f16", "f32_to_bf16", "half_to_f32", "logit_adjust", "sample_rows", "rms_norm", "add_rms_norm", "rms_norm_add", "qkv_norm_rope_store", "rms_norm_rope", "rope_neox", "silu_mul", "gelu_mul", "gelu_mul_strided", "ple_gate_f32", "gelu", "mul_inplace", "scale_inplace", "softcap_inplace", "sigmoid_mul_inplace", "conv1d_silu", "copy_span", "gated_delta_net_d64", "gated_delta_net_d128",
             "add_inplace", "gather_rows", "gather_strided", "kv_store", "kv_store_q8", "kv_copy_blocks", "kv_dequant_blocks", "kv_rotate_q", "attn_decode_combine", "paged_attention", "attn_prefill", "attn_prefill_tc", "quantize_q8", "repack_q8_0",
             "repack_q4_k", "repack_q6_k", "repack_q5_k", "repack_iq4_xs", "mmq_sum_splits",
             "matvec_glu_silu_f32", "matvec_glu_silu_f16", "matvec_glu_silu_bf16", "matvec_glu_gelu_f32", "matvec_glu_gelu_f16", "matvec_glu_gelu_bf16",
@@ -2433,7 +2434,17 @@ impl Backend for CudaBackend {
         })
     }
 
-    fn conv1d_silu(&self, x: &CudaBuf, w: &CudaWeight, state: &mut CudaBuf, runs: &SeqRuns, out: &mut CudaBuf, channels: usize, kernel: usize) -> Result<()> {
+    fn conv1d_silu(
+        &self,
+        x: &CudaBuf,
+        w: &CudaWeight,
+        state: &mut CudaBuf,
+        runs: &SeqRuns,
+        out: &mut CudaBuf,
+        channels: usize,
+        kernel: usize,
+        snaps: Option<(&mut CudaBuf, usize)>,
+    ) -> Result<()> {
         self.in_step(|| {
             let wd = w
                 .dense
@@ -2448,10 +2459,23 @@ impl Backend for CudaBackend {
             self.sync_index(&mut cache, "gdn_starts", runs.starts)?;
             self.sync_index(&mut cache, "gdn_slots", runs.slots)?;
             self.sync_index(&mut cache, "gdn_fresh", runs.fresh)?;
-            let (st, sl, fr) = (&cache["gdn_starts"].dev, &cache["gdn_slots"].dev, &cache["gdn_fresh"].dev);
+            let n_slots = state.len() / (channels * (kernel - 1));
+            let snap_counts: Vec<u32> = if runs.snap.is_empty() { vec![0; runs.n_seqs()] } else { runs.snap.to_vec() };
+            self.sync_index(&mut cache, "gdn_snap", &snap_counts)?;
+            let (st, sl, fr, sn) = (&cache["gdn_starts"].dev, &cache["gdn_slots"].dev, &cache["gdn_fresh"].dev, &cache["gdn_snap"].dev);
             let cfg = LaunchConfig { grid_dim: (channels.div_ceil(128) as u32, runs.n_seqs() as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
             let (c, k) = (channels as i32, kernel as i32);
-            launch!(self, "conv1d_silu", cfg, [x, wd, state, st, sl, fr, out, &c, &k])
+            match snaps {
+                Some((buf, n)) => {
+                    check_len("conv1d_silu snapshots", buf.len(), n_slots * n * channels * (kernel - 1))?;
+                    let n = n as i32;
+                    launch!(self, "conv1d_silu", cfg, [x, wd, state, st, sl, fr, out, &c, &k, buf, sn, &n])
+                }
+                None => {
+                    let n = 0i32;
+                    launch!(self, "conv1d_silu", cfg, [x, wd, state, st, sl, fr, out, &c, &k, out, sn, &n])
+                }
+            }
         })
     }
 
@@ -2467,6 +2491,7 @@ impl Backend for CudaBackend {
         out: &mut CudaBuf,
         shape: GdnShape,
         eps: f32,
+        snaps: Option<(&mut CudaBuf, usize)>,
     ) -> Result<()> {
         self.in_step(|| {
             let GdnShape { n_k_heads: hk, n_v_heads: hv, head_dim: d } = shape;
@@ -2486,11 +2511,36 @@ impl Backend for CudaBackend {
             self.sync_index(&mut cache, "gdn_starts", runs.starts)?;
             self.sync_index(&mut cache, "gdn_slots", runs.slots)?;
             self.sync_index(&mut cache, "gdn_fresh", runs.fresh)?;
-            let (st, sl, fr) = (&cache["gdn_starts"].dev, &cache["gdn_slots"].dev, &cache["gdn_fresh"].dev);
+            let n_slots = state.len() / shape.state_len();
+            let snap_counts: Vec<u32> = if runs.snap.is_empty() { vec![0; runs.n_seqs()] } else { runs.snap.to_vec() };
+            self.sync_index(&mut cache, "gdn_snap", &snap_counts)?;
+            let (st, sl, fr, sn) = (&cache["gdn_starts"].dev, &cache["gdn_slots"].dev, &cache["gdn_fresh"].dev, &cache["gdn_snap"].dev);
             let cfg = LaunchConfig { grid_dim: (hv as u32, runs.n_seqs() as u32, 1), block_dim: (d as u32, 1, 1), shared_mem_bytes: 0 };
             let (k, v) = (hk as i32, hv as i32);
             let name = if d == 64 { "gated_delta_net_d64" } else { "gated_delta_net_d128" };
-            launch!(self, name, cfg, [qkv, alpha, beta, dt, av, state, st, sl, fr, out, &k, &v, &eps])
+            match snaps {
+                Some((buf, n)) => {
+                    check_len("gated_delta_net snapshots", buf.len(), n_slots * n * shape.state_len())?;
+                    let n = n as i32;
+                    launch!(self, name, cfg, [qkv, alpha, beta, dt, av, state, st, sl, fr, out, &k, &v, &eps, buf, sn, &n])
+                }
+                None => {
+                    let n = 0i32;
+                    launch!(self, name, cfg, [qkv, alpha, beta, dt, av, state, st, sl, fr, out, &k, &v, &eps, out, sn, &n])
+                }
+            }
+        })
+    }
+
+    fn copy_span(&self, src: &CudaBuf, src_off: usize, dst: &mut CudaBuf, dst_off: usize, len: usize) -> Result<()> {
+        self.in_step(|| {
+            check_len("copy_span src", src.len(), src_off + len)?;
+            check_len("copy_span dst", dst.len(), dst_off + len)?;
+            if len == 0 {
+                return Ok(());
+            }
+            let (so, dof, n) = (src_off as i64, dst_off as i64, len as i64);
+            launch!(self, "copy_span", grid_1d(len, 256)?, [src, &so, dst, &dof, &n])
         })
     }
 

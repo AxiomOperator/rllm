@@ -67,7 +67,14 @@ fn parse(state: &AppState, body: &[u8]) -> ApiResult<ChatRequest> {
     });
     let choice = ToolChoice::parse(choice_value.as_ref(), !tools.is_empty())?;
     let json_format = JsonFormat::parse(m.get("response_format"), "response_format")?;
-    let reasoning_effort = params::opt_str(&m, "reasoning_effort")?;
+    let mut reasoning_effort = params::opt_str(&m, "reasoning_effort")?;
+    // vLLM's `chat_template_kwargs: {"enable_thinking": …}` (Qwen): the same
+    // switch as reasoning_effort, which wins when both are given.
+    if reasoning_effort.is_none()
+        && let Some(e) = m.get("chat_template_kwargs").and_then(|k| k.get("enable_thinking")).and_then(Value::as_bool)
+    {
+        reasoning_effort = Some(if e { "medium" } else { "none" });
+    }
     let prompt = prompt::build(state, messages, &tools, &choice, reasoning_effort, json_format.as_ref())?;
 
     let mut gp = params::sampling(&m, state.info.vocab)?;
@@ -112,7 +119,7 @@ fn spec(state: &AppState, req: &ChatRequest, choice: usize) -> GenSpec {
         prompt: req.prompt.ids.clone(),
         params,
         stops: req.stops.clone(),
-        parser: OutputParser::new(state.format, req.prompt.tools, req.prompt.reasoning),
+        parser: OutputParser::for_prompt(state.format, &req.prompt),
         forced: req.prompt.forced.clone(),
         suffix: req.prompt.suffix.clone(),
         skip_special: false,

@@ -6,7 +6,7 @@
 
 use rayon::prelude::*;
 use rllm_core::quant::dequantize_row;
-use rllm_core::{AttnMeta, Backend, DType, Error, HostBytes, HostTensor, KvLayout, KvType, Result};
+use rllm_core::{AttnMeta, Backend, DType, Error, GdnShape, HostBytes, HostTensor, KvLayout, KvType, Result, SeqRuns};
 
 pub struct CpuBackend;
 
@@ -69,6 +69,18 @@ fn check_len(what: &str, have: usize, need: usize) -> Result<()> {
         return Err(Error::Shape(format!("{what}: buffer has {have} elements, need {need}")));
     }
     Ok(())
+}
+
+/// A raw pointer shared across rayon jobs that write disjoint parts of one buffer.
+#[derive(Clone, Copy)]
+struct SyncPtr(*mut f32);
+unsafe impl Send for SyncPtr {}
+unsafe impl Sync for SyncPtr {}
+
+impl SyncPtr {
+    fn get(self) -> *mut f32 {
+        self.0
+    }
 }
 
 #[inline]
@@ -353,6 +365,131 @@ impl Backend for CpuBackend {
     fn softcap(&self, x: &mut Vec<f32>, cap: f32, len: usize) -> Result<()> {
         check_len("softcap", x.len(), len)?;
         x[..len].iter_mut().for_each(|v| *v = cap * (*v / cap).tanh());
+        Ok(())
+    }
+
+    fn sigmoid_mul(&self, x: &mut Vec<f32>, g: &Vec<f32>, len: usize) -> Result<()> {
+        check_len("sigmoid_mul", x.len().min(g.len()), len)?;
+        x[..len].par_iter_mut().zip(&g[..len]).for_each(|(x, g)| *x *= 1.0 / (1.0 + (-*g).exp()));
+        Ok(())
+    }
+
+    fn conv1d_silu(
+        &self,
+        x: &Vec<f32>,
+        w: &CpuWeight,
+        state: &mut Vec<f32>,
+        runs: &SeqRuns,
+        out: &mut Vec<f32>,
+        channels: usize,
+        kernel: usize,
+    ) -> Result<()> {
+        let wf = w.dense.as_deref().filter(|v| kernel >= 2 && channels > 0 && v.len() == channels * kernel).ok_or_else(|| {
+            Error::Shape(format!("conv1d_silu: weight must be 1-D with {channels} x {kernel} values"))
+        })?;
+        let n = *runs.starts.last().unwrap_or(&0) as usize;
+        let keep = kernel - 1;
+        let n_slots = state.len() / (channels * keep);
+        runs.check(n, n_slots)?;
+        check_len("conv1d_silu x", x.len(), n * channels)?;
+        check_len("conv1d_silu out", out.len(), n * channels)?;
+        // Per sequence, then per channel: the channel's window slides over its tokens.
+        let mut per_seq: Vec<(usize, usize, usize, bool)> = (0..runs.n_seqs())
+            .map(|s| (runs.starts[s] as usize, runs.starts[s + 1] as usize, runs.slots[s] as usize, runs.fresh[s] != 0))
+            .collect();
+        per_seq.sort_by_key(|r| r.2);
+        let out_ptr = SyncPtr(out.as_mut_ptr());
+        let state_ptr = SyncPtr(state.as_mut_ptr());
+        per_seq.par_iter().for_each(|&(t0, t1, slot, fresh)| {
+            (0..channels).into_par_iter().for_each(|c| {
+                // SAFETY: each (sequence, channel) touches only its own state
+                // entries and output column; sequences have distinct slots
+                // (checked by the allocator) and disjoint token ranges.
+                let st = unsafe { std::slice::from_raw_parts_mut(state_ptr.get().add((slot * channels + c) * keep), keep) };
+                // win[1..] holds the previous inputs; each token shifts it
+                // left and lands in the last place.
+                let mut win = vec![0f32; kernel];
+                if !fresh {
+                    win[1..].copy_from_slice(st);
+                }
+                let wc = &wf[c * kernel..(c + 1) * kernel];
+                for t in t0..t1 {
+                    win.copy_within(1.., 0);
+                    win[keep] = x[t * channels + c];
+                    let v: f32 = win.iter().zip(wc).map(|(a, b)| a * b).sum();
+                    unsafe { *out_ptr.get().add(t * channels + c) = v / (1.0 + (-v).exp()) };
+                }
+                st.copy_from_slice(&win[1..]);
+            });
+        });
+        Ok(())
+    }
+
+    fn gated_delta_net(
+        &self,
+        qkv: &Vec<f32>,
+        alpha: &Vec<f32>,
+        beta: &Vec<f32>,
+        dt_bias: &CpuWeight,
+        a: &CpuWeight,
+        state: &mut Vec<f32>,
+        runs: &SeqRuns,
+        out: &mut Vec<f32>,
+        shape: GdnShape,
+        eps: f32,
+    ) -> Result<()> {
+        let GdnShape { n_k_heads: hk, n_v_heads: hv, head_dim: d } = shape;
+        if hk == 0 || d == 0 || !hv.is_multiple_of(hk) {
+            return Err(Error::Shape(format!("gated_delta_net: {hk} key heads, {hv} value heads of {d}")));
+        }
+        let dt = dt_bias.dense.as_deref().filter(|v| v.len() == hv).ok_or_else(|| Error::Shape("gated_delta_net: dt_bias".into()))?;
+        let av = a.dense.as_deref().filter(|v| v.len() == hv).ok_or_else(|| Error::Shape("gated_delta_net: a".into()))?;
+        let n = *runs.starts.last().unwrap_or(&0) as usize;
+        let width = shape.qkv_width();
+        let n_slots = state.len() / shape.state_len();
+        runs.check(n, n_slots)?;
+        check_len("gated_delta_net qkv", qkv.len(), n * width)?;
+        check_len("gated_delta_net alpha", alpha.len().min(beta.len()), n * hv)?;
+        check_len("gated_delta_net out", out.len(), n * hv * d)?;
+        let scale = 1.0 / (d as f32).sqrt();
+        let out_ptr = SyncPtr(out.as_mut_ptr());
+        let state_ptr = SyncPtr(state.as_mut_ptr());
+        let jobs: Vec<(usize, usize)> = (0..runs.n_seqs()).flat_map(|s| (0..hv).map(move |h| (s, h))).collect();
+        jobs.par_iter().for_each(|&(s, h)| {
+            let (t0, t1, slot) = (runs.starts[s] as usize, runs.starts[s + 1] as usize, runs.slots[s] as usize);
+            // State layout: column j of S at st[j * d..]. SAFETY: one job per
+            // (sequence, head): disjoint state and output.
+            let st = unsafe { std::slice::from_raw_parts_mut(state_ptr.get().add((slot * hv + h) * d * d), d * d) };
+            if runs.fresh[s] != 0 {
+                st.fill(0.0);
+            }
+            let kh = h % hk;
+            let (mut q, mut k) = (vec![0f32; d], vec![0f32; d]);
+            for t in t0..t1 {
+                let row = &qkv[t * width..(t + 1) * width];
+                q.copy_from_slice(&row[kh * d..(kh + 1) * d]);
+                k.copy_from_slice(&row[(hk + kh) * d..(hk + kh + 1) * d]);
+                let v = &row[(2 * hk + h) * d..(2 * hk + h + 1) * d];
+                for x in [&mut q, &mut k] {
+                    let r = 1.0 / (dot(x, x) + eps).sqrt();
+                    x.iter_mut().for_each(|e| *e *= r);
+                }
+                let sp = {
+                    let z = alpha[t * hv + h] + dt[h];
+                    if z > 20.0 { z } else { z.exp().ln_1p() }
+                };
+                let g = (sp * av[h]).exp();
+                let b = 1.0 / (1.0 + (-beta[t * hv + h]).exp());
+                let o = unsafe { std::slice::from_raw_parts_mut(out_ptr.get().add(t * hv * d + h * d), d) };
+                for j in 0..d {
+                    let col = &mut st[j * d..(j + 1) * d];
+                    col.iter_mut().for_each(|e| *e *= g);
+                    let delta = (v[j] - dot(col, &k)) * b;
+                    col.iter_mut().zip(&k).for_each(|(e, k)| *e += k * delta);
+                    o[j] = dot(col, &q) * scale;
+                }
+            }
+        });
         Ok(())
     }
 

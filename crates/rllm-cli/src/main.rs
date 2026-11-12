@@ -822,7 +822,7 @@ fn bench<B: Backend>(
         // `batch` sequences, each with `depth` tokens (at least 32) of
         // context, decoding one token per step together.
         let pre = depth.max(32);
-        let mut pool = rllm_model::KvPool::new(backend, &model, batch * (pre + n_gen + 16), 16, kv_type)?;
+        let mut pool = rllm_model::KvPool::new(backend, &model, batch * (pre + n_gen + 16), 16, kv_type, batch)?;
         let mut rates = Vec::with_capacity(reps);
         for i in 0..=reps {
             let mut seqs: Vec<rllm_kv::SeqKv> = (0..batch).map(|_| rllm_kv::SeqKv::default()).collect();

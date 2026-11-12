@@ -318,7 +318,7 @@ impl<B: Backend> Qwen3<B> {
 impl<B: Backend> Model<B> for Qwen3<B> {
     type Cache = B::KvCache;
 
-    fn alloc_cache(&self, b: &B, n_blocks: usize, block_size: usize, kv: KvType) -> Result<B::KvCache> {
+    fn alloc_cache(&self, b: &B, n_blocks: usize, block_size: usize, kv: KvType, _max_seqs: usize) -> Result<B::KvCache> {
         Ok(b.alloc_kv(self.cfg.kv_layout(n_blocks, block_size, kv))?)
     }
 

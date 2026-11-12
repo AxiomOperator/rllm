@@ -115,7 +115,13 @@ where
     }
     .max(cfg.ctx);
     let metrics = Arc::new(Metrics::default());
+    // Models with recurrent layers can't speculate: don't open a draft.
+    let recurrent = rllm_model::is_recurrent(&gguf);
     let draft = match &cfg.draft {
+        Some(_) if recurrent => {
+            eprintln!("[rllm] --draft not supported for models with recurrent layers (Qwen3.5): ignored");
+            None
+        }
         Some(p) => Some(Arc::new(Gguf::open(p).with_context(|| format!("open {}", p.display()))?)),
         None => None,
     };
@@ -153,7 +159,7 @@ where
         info.backend,
         cfg.ctx,
         cfg.kv_type,
-        if cfg.prefix_cache { "on" } else { "off" },
+        if cfg.prefix_cache && !info.recurrent { "on" } else { "off" },
         match info.host_blocks {
             Some(n) => format!(" + host tier ({} tokens, {:.1} GiB)", n * engine::BLOCK_SIZE, cfg.host_cache_bytes as f64 / (1u64 << 30) as f64),
             None => String::new(),
@@ -162,7 +168,7 @@ where
             Some(d) => format!(", draft model ({d}, up to {} tokens)", cfg.draft_tokens.max(1)),
             None => String::new(),
         },
-        if cfg.prompt_lookup { ", prompt lookup" } else { "" },
+        if cfg.prompt_lookup && !info.recurrent { ", prompt lookup" } else { "" },
         t0.elapsed().as_secs_f64()
     );
     let state = Arc::new(AppState {

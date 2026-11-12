@@ -501,7 +501,7 @@ async fn run(state: Arc<AppState>, req: Arc<Request>, cancel: Arc<AtomicBool>, m
         prompt: req.prompt.ids.clone(),
         params: req.params.clone(),
         stops: Vec::new(),
-        parser: OutputParser::new(state.format, req.prompt.tools, req.prompt.reasoning),
+        parser: OutputParser::for_prompt(state.format, &req.prompt),
         forced: req.prompt.forced.clone(),
         suffix: req.prompt.suffix.clone(),
         skip_special: false,

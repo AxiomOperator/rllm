@@ -110,3 +110,33 @@ pub fn load_weight_rope_neox<B: Backend>(backend: &B, g: &Gguf, name: &str, head
     let t = HostTensor { bytes: HostBytes::new(owner, 0..len), ..t };
     backend.upload(&t).with_context(|| format!("uploading {name}"))
 }
+
+/// Load rows `rows` of 2-D tensor `name`, in that order (any row of a
+/// quantized matrix is whole blocks, so rows can be picked freely).
+pub fn load_weight_rows<B: Backend>(backend: &B, g: &Gguf, name: &str, rows: &[usize]) -> Result<B::Weight> {
+    let t = host_tensor(g, name)?;
+    let (n_rows, cols) = t.as_2d();
+    ensure!(t.shape.len() == 2, "{name}: expected a matrix, shape {:?}", t.shape);
+    let row_bytes = t.dtype.row_bytes(cols);
+    ensure!(n_rows * row_bytes == t.bytes.as_slice().len(), "{name}: {} bytes for {n_rows} rows", t.bytes.as_slice().len());
+    let src = t.bytes.as_slice();
+    let mut out = Vec::with_capacity(rows.len() * row_bytes);
+    for &r in rows {
+        ensure!(r < n_rows, "{name}: row {r} of {n_rows}");
+        out.extend_from_slice(&src[r * row_bytes..(r + 1) * row_bytes]);
+    }
+    let len = out.len();
+    let owner: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(out);
+    let t = HostTensor { shape: vec![rows.len(), cols], bytes: HostBytes::new(owner, 0..len), ..t };
+    backend.upload(&t).with_context(|| format!("uploading {name}"))
+}
+
+/// A 1-D tensor's values as f32.
+pub fn read_vector(g: &Gguf, name: &str) -> Result<Vec<f32>> {
+    let t = host_tensor(g, name)?;
+    ensure!(t.shape.len() == 1, "{name}: expected a vector, shape {:?}", t.shape);
+    let mut v = vec![0f32; t.shape[0]];
+    ensure!(t.dtype.row_bytes(v.len()) == t.bytes.as_slice().len(), "{name}: size mismatch");
+    rllm_core::quant::dequantize_row(t.dtype, t.bytes.as_slice(), &mut v);
+    Ok(v)
+}

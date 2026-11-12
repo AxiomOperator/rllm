@@ -224,11 +224,23 @@ fn plan(m: &ModelProfile, draft: Option<&Draft>, mach: &Machine, want_ctx: Optio
     };
     p.device = gpu.device();
     let free = gpu.usable_bytes(mach.ram_available);
+    // Hybrid models (Qwen3.5) keep a fixed-size recurrent state per sequence
+    // (the batch, an embedding job and a spare), and can't speculate.
+    let recurrent = m.state_bytes_per_seq > 0;
+    let state_bytes = m.state_bytes_per_seq * (p.parallel + 2);
+    if recurrent {
+        p.prompt_lookup = false;
+        p.reasons.push(format!(
+            "Recurrent state: {:.2} GiB for {} sequences; no draft model or prompt lookup (the state can't be rewound).",
+            state_bytes as f64 / GIB,
+            p.parallel + 2
+        ));
+    }
 
     // Draft model: only when it is much smaller than the target, and not for
     // busy servers (speculation pauses once 5 requests decode together).
     let busy = want_parallel.is_some_and(|n| n > 4);
-    let draft = draft.filter(|d| d.profile.weight_bytes * 4 <= m.weight_bytes && !busy);
+    let draft = draft.filter(|d| d.profile.weight_bytes * 4 <= m.weight_bytes && !busy && !recurrent);
     let margin = (512 * MIB).max(free * 4 / 100);
     // The draft only drafts for sequences up to DRAFT_MAX_CONTEXT tokens, so
     // its runtime buffers and (capped) KV pool don't grow with the context.
@@ -240,7 +252,7 @@ fn plan(m: &ModelProfile, draft: Option<&Draft>, mach: &Machine, want_ctx: Optio
         })
     };
     let fixed = |kv, ctx, with_draft: bool| {
-        device_weights(m) + runtime_overhead(m, kv, ctx) + margin + if with_draft { draft_bytes(kv) } else { 0 }
+        device_weights(m) + runtime_overhead(m, kv, ctx) + state_bytes + margin + if with_draft { draft_bytes(kv) } else { 0 }
     };
     let per_token = |kv| m.kv_bytes_per_token(kv);
     let tokens = |kv, ctx, with_draft| free.saturating_sub(fixed(kv, ctx, with_draft)) / per_token(kv) / 1024 * 1024;
@@ -298,7 +310,7 @@ fn plan(m: &ModelProfile, draft: Option<&Draft>, mach: &Machine, want_ctx: Optio
         free,
         device_weights(m),
         if with_draft { draft_bytes(p.kv_type) } else { 0 },
-        runtime_overhead(m, p.kv_type, p.ctx),
+        runtime_overhead(m, p.kv_type, p.ctx) + state_bytes,
         margin,
     ]);
     p.reasons.push(format!(
@@ -327,18 +339,22 @@ fn plan(m: &ModelProfile, draft: Option<&Draft>, mach: &Machine, want_ctx: Optio
             m.weight_bytes as f64 / d.profile.weight_bytes as f64
         ));
     }
-    p.reasons.push(if m.arch == "gemma4" {
+    if p.prompt_lookup {
+        p.reasons.push(if m.arch == "gemma4" {
         "--prompt-lookup: free speedup when output repeats its input (code edits, quoting). On Gemma 4, greedy output matches plain decoding as closely as batched requests do.".into()
     } else {
         "--prompt-lookup: free speedup when output repeats its input (code edits, quoting); output is unchanged.".into()
-    });
+        });
+    }
 
     // Host tier: a share of available RAM, enough to hold several pools'
     // worth of evicted prefixes, leaving plenty for the rest of the system.
     let pool_bytes = kv_tokens * m.kv_bytes_per_token(p.kv_type);
     let share = (mach.ram_available / 4).min(4 * pool_bytes).min(64 << 30);
     let gb = (share as f64 / GIB).floor() as usize;
-    if gpu.integrated {
+    if recurrent {
+        // No prefix cache for recurrent models, so nothing to keep.
+    } else if gpu.integrated {
         p.reasons.push("No --host-cache-gb: the GPU shares system RAM, so a host tier would only move KV within the same memory.".into());
     } else if gb >= 1 && mach.ram_available.saturating_sub(gb << 30) >= 8 << 30 {
         p.host_cache_gb = gb;
@@ -388,6 +404,10 @@ fn read_machine(device: Option<&str>) -> Result<Machine> {
 /// A draft model: `explicit`, or the smallest GGUF next to the model with
 /// the same tokenizer (and a supported architecture).
 fn find_draft(model: &Path, g: &Gguf, profile: &ModelProfile, explicit: Option<&Path>) -> Option<Draft> {
+    // Recurrent models can't speculate (see plan()).
+    if profile.state_bytes_per_seq > 0 {
+        return None;
+    }
     let tok = Tokenizer::from_gguf(g).ok()?;
     let same_vocab = |d: &Gguf| -> bool {
         let Ok(dt) = Tokenizer::from_gguf(d) else { return false };
@@ -502,8 +522,8 @@ fn measure<B: MemInfo>(b: &B, model_path: &Path, p: &Plan) -> Result<Measured> {
     let (free2, _) = b.mem_info()?;
     let vocab = model.vocab_size();
 
-    let mut pool = KvPool::new(b, &model, p.kv_tokens, BLOCK, p.kv_type)?;
-    let mut dpool = draft.as_ref().map(|d| KvPool::new(b, d, draft_pool_tokens(p.kv_tokens), BLOCK, p.kv_type)).transpose()?;
+    let mut pool = KvPool::new(b, &model, p.kv_tokens, BLOCK, p.kv_type, p.parallel + 2)?;
+    let mut dpool = draft.as_ref().map(|d| KvPool::new(b, d, draft_pool_tokens(p.kv_tokens), BLOCK, p.kv_type, p.parallel)).transpose()?;
     let pools = free2.saturating_sub(b.mem_info()?.0);
     let mut min_free = b.mem_info()?.0;
     let mut note = |b: &B| -> Result<()> {

@@ -17,7 +17,7 @@ Legend: ✓ supported · ◐ partial or limited · ✗ not supported.
 |---|---|---|---|
 | Language, runtime | Rust, one binary | C/C++, one binary | Python + PyTorch |
 | Typical use | GGUF serving on NVIDIA and AMD | Local inference on almost any hardware | Datacenter serving at high concurrency |
-| Model architectures | 3 families (Qwen3 dense; Llama/Mistral; Gemma 4) | 100+ | 200+ (most Hugging Face architectures) |
+| Model architectures | 4 families (Qwen3 dense; Qwen3.5 dense hybrids; Llama/Mistral; Gemma 4) | 100+ | 200+ (most Hugging Face architectures) |
 | Weight formats | GGUF: F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS | GGUF, all quant types | safetensors (FP16/BF16, FP8, AWQ, GPTQ, NVFP4, …), GGUF experimental |
 | Hardware | NVIDIA (CUDA), AMD RDNA3 (ROCm/HIP), CPU (reference speed) | CPU, CUDA, Metal, Vulkan, HIP, SYCL and more | NVIDIA, AMD, Intel, TPU, CPU and more |
 | Multi-GPU | ✗ | ✓ layer or row split | ✓ tensor, pipeline, data and expert parallel |
@@ -44,7 +44,7 @@ where a number exists.
 | Prompt lookup (n-gram) speculation | ✓ | `--prompt-lookup`: 2.6× on a code edit, unchanged on free text, output identical. |
 | Prefix cache tier in system RAM | ✓ | `--host-cache-gb`: evicted prefixes move to pinned RAM; time to first token on a 2.5k-token repeat 381 → 39 ms. vLLM: CPU offload / LMCache. llama.cpp: per-slot save/restore only. |
 | JSON mode and `json_schema` | ◐ | Structure is enforced token by token; value constraints (`pattern`, `minimum`, `minLength`, …) are not. |
-| Tool calling, including `required` and named tools | ✓ | Calls are constrained to the tools' schemas. Hermes/Qwen and Gemma 4 formats only. |
+| Tool calling, including `required` and named tools | ✓ | Calls are constrained to the tools' schemas (Hermes/Qwen JSON and Gemma 4); Qwen3.5's XML calls are parsed, with the opening forced but not constrained. |
 | Reasoning output (`reasoning_content`) | ✓ | `reasoning_effort` switches thinking on or off. |
 | Chat templates from the GGUF (Jinja) | ✓ | minijinja. |
 | Logprobs, `n`, `seed`, stop sequences, penalties, `logit_bias` | ✓ | |
@@ -91,7 +91,7 @@ Ordered roughly by how much each one limits what rllm can serve.
 
 | Gap | llama.cpp | vLLM | Notes |
 |---|---|---|---|
-| Three architecture families (Qwen3 dense, Llama/Mistral, Gemma 4) | ✓ 100+ | ✓ 200+ | Llama 2/3 and Mistral load as GGUF `llama`; no Phi, DeepSeek, Qwen2 (attention biases) or Qwen3-MoE yet. |
+| Four architecture families (Qwen3 dense, Qwen3.5 dense hybrids, Llama/Mistral, Gemma 4) | ✓ 100+ | ✓ 200+ | Llama 2/3 and Mistral load as GGUF `llama`; Qwen3.5 as `qwen35` (no MTP, prefix cache or speculation there yet); no Phi, DeepSeek, Qwen2 (attention biases), Qwen3-MoE or Qwen3.5-MoE yet. |
 | MoE models | ✓ | ✓ | Planned for Phase 4 (`docs/plan.md`). |
 | Eight weight types | ✓ every GGUF type (Q2_K–Q6_K, Q4_0/Q5_0, IQ*, MXFP4, …) | ✓ FP8, AWQ, GPTQ, NVFP4, … | Q4_K_M, Q5_K_M, Q6_K, IQ4_XS and Q8_0 files work; Q2_K/Q3_K, Q4_0/Q5_0 and the other IQ types don't load. |
 | safetensors / Hugging Face checkpoints | ✗ | ✓ | GGUF only. |
@@ -121,7 +121,7 @@ Ordered roughly by how much each one limits what rllm can serve.
 | Prefix cache for the draft model | ✓ | ✓ | rllm's draft re-reads each request's whole prompt. |
 | Speculation in the CLI | ✓ | n/a | `rllm run` has no `--draft`; only the server does. |
 | Grammars and regex (GBNF, regex, full JSON Schema) | ✓ GBNF | ✓ xgrammar, guidance | rllm enforces JSON structure only, not value constraints. |
-| Tool-call formats | ✓ many templates | ✓ many parsers | rllm parses Hermes/Qwen and Gemma 4 only. |
+| Tool-call formats | ✓ many templates | ✓ many parsers | rllm parses Hermes/Qwen JSON, Qwen3.5/Qwen3-Coder XML and Gemma 4. |
 | Sampling options | ✓ min_p, repeat penalty, typical, mirostat, DRY, … | ✓ min_p, repetition penalty, … | rllm has temperature, top_p, top_k, frequency and presence penalties and `logit_bias`. |
 | Fill-in-the-middle (`suffix`) | ✓ `/infill` | ◐ | Rejected with 400. |
 

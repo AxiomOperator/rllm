@@ -687,3 +687,63 @@ fn sample_rows_masked_and_tiny_temperature() {
         }
     }
 }
+
+/// [`upload`] for any length (padded with zeros to whole 32-wide rows).
+fn upload_any<B: Backend>(b: &B, data: &[f32]) -> B::Buffer {
+    let mut v = data.to_vec();
+    v.resize(data.len().div_ceil(32).max(1) * 32, 0.0);
+    upload(b, &v)
+}
+
+/// Gated DeltaNet ops (Qwen3.5): conv1d_silu and gated_delta_net over two
+/// steps of two sequences (state carried, slots out of order, fresh flags),
+/// and sigmoid_mul.
+#[test]
+fn gated_delta_net_ops_match() {
+    let Some(gpu) = gpu_backend() else { return };
+    let cpu = CpuBackend::new();
+    let mut rng = Rng(35);
+    let n = 37;
+    let (x, g) = (rng.vec(n), rng.vec(n));
+    let (mut xc, gc, mut xg, gg) = (upload_any(&cpu, &x), upload_any(&cpu, &g), upload_any(&gpu, &x), upload_any(&gpu, &g));
+    cpu.sigmoid_mul(&mut xc, &gc, n).unwrap();
+    gpu.sigmoid_mul(&mut xg, &gg, n).unwrap();
+    assert_close("sigmoid_mul", &download(&cpu, &xc, n), &download(&gpu, &xg, n), 1e-5);
+
+    for d in [64usize, 128] {
+        let shape = rllm_core::GdnShape { n_k_heads: 2, n_v_heads: 6, head_dim: d };
+        let (ch, kernel, slots) = (shape.qkv_width(), 4usize, 3usize);
+        let conv_w = f32_tensor("conv", &rng.vec(ch * kernel).iter().map(|v| v * 0.5).collect::<Vec<_>>());
+        let hv = shape.n_v_heads;
+        let dt = f32_tensor("dt", &rng.vec(hv));
+        let a = f32_tensor("a", &rng.vec(hv).iter().map(|v| -(v.abs() + 0.1)).collect::<Vec<_>>());
+        let (wc, wg) = (cpu.upload(&conv_w).unwrap(), gpu.upload(&conv_w).unwrap());
+        let (dtc, dtg, ac, ag) = (cpu.upload(&dt).unwrap(), gpu.upload(&dt).unwrap(), cpu.upload(&a).unwrap(), gpu.upload(&a).unwrap());
+        let conv_len = slots * ch * (kernel - 1);
+        let ssm_len = slots * shape.state_len();
+        // Stale data in the state buffers: fresh sequences must ignore it.
+        let (mut csc, mut csg) = (upload_any(&cpu, &rng.vec(conv_len)), upload_any(&gpu, &rng.vec(conv_len)));
+        let (mut ssc, mut ssg) = (upload_any(&cpu, &rng.vec(ssm_len)), upload_any(&gpu, &rng.vec(ssm_len)));
+        // Step 1: both sequences start (5 and 3 tokens); step 2: 1 and 4 more.
+        for (starts, fresh) in [(vec![0u32, 5, 8], vec![1u32, 1]), (vec![0u32, 1, 5], vec![0u32, 0])] {
+            let runs = rllm_core::SeqRuns { starts: &starts, slots: &[2, 0], fresh: &fresh };
+            let t = *starts.last().unwrap() as usize;
+            let xin = rng.vec(t * ch);
+            let (xic, xig) = (upload_any(&cpu, &xin), upload_any(&gpu, &xin));
+            let (mut oc, mut og) = (cpu.alloc(t * ch).unwrap(), gpu.alloc(t * ch).unwrap());
+            cpu.conv1d_silu(&xic, &wc, &mut csc, &runs, &mut oc, ch, kernel).unwrap();
+            gpu.conv1d_silu(&xig, &wg, &mut csg, &runs, &mut og, ch, kernel).unwrap();
+            let conv_out = download(&cpu, &oc, t * ch);
+            assert_close(&format!("conv1d_silu d{d}"), &conv_out, &download(&gpu, &og, t * ch), 1e-5);
+
+            let (al, be) = (rng.vec(t * hv), rng.vec(t * hv));
+            let (alc, alg, bec, beg) = (upload_any(&cpu, &al), upload_any(&gpu, &al), upload_any(&cpu, &be), upload_any(&gpu, &be));
+            let (mut yc, mut yg) = (cpu.alloc(t * hv * d).unwrap(), gpu.alloc(t * hv * d).unwrap());
+            // Both start from the CPU's conv output, so only the recurrence is compared.
+            let qc = upload_any(&gpu, &conv_out);
+            cpu.gated_delta_net(&oc, &alc, &bec, &dtc, &ac, &mut ssc, &runs, &mut yc, shape, 1e-6).unwrap();
+            gpu.gated_delta_net(&qc, &alg, &beg, &dtg, &ag, &mut ssg, &runs, &mut yg, shape, 1e-6).unwrap();
+            assert_close(&format!("gated_delta_net d{d}"), &download(&cpu, &yc, t * hv * d), &download(&gpu, &yg, t * hv * d), 1e-4);
+        }
+    }
+}

@@ -114,6 +114,8 @@ pub struct EngineInfo {
     pub draft: Option<String>,
     /// Prefix cache host tier size, in blocks.
     pub host_blocks: Option<usize>,
+    /// The model keeps recurrent state (no prefix cache or speculation).
+    pub recurrent: bool,
 }
 
 #[derive(Clone)]
@@ -338,10 +340,13 @@ where
         .spawn(move || {
             let _alive = AliveGuard(alive_engine);
             pin_to_performance_cores();
+            let mut cfg = cfg;
             let setup = (|| -> Result<_> {
                 let backend = make_backend()?;
                 let model = AnyModel::load(&backend, &gguf)?;
                 let draft = match &cfg.draft {
+                    // Recurrent models can't be rewound: no drafts (see below).
+                    Some(_) if model.recurrent() => None,
                     Some(g) => {
                         let d = AnyModel::load(&backend, g).context("loading the draft model")?;
                         check_draft_vocab(&tok, &model, g, &d)?;
@@ -358,14 +363,37 @@ where
                     return;
                 }
             };
+            if model.recurrent() {
+                // A recurrent state can't be rebuilt from cached KV blocks
+                // or rewound after rejected draft tokens.
+                let mut off = Vec::new();
+                if cfg.draft.is_some() {
+                    off.push("--draft");
+                }
+                if cfg.prompt_lookup {
+                    off.push("--prompt-lookup");
+                }
+                if cfg.host_cache_bytes > 0 {
+                    off.push("--host-cache-gb");
+                }
+                if !off.is_empty() {
+                    eprintln!("[rllm] {} not supported for models with recurrent layers (Qwen3.5): ignored", off.join(", "));
+                }
+                cfg.draft = None;
+                cfg.prompt_lookup = false;
+                cfg.prefix_cache = false;
+                cfg.host_cache_bytes = 0;
+            }
             let kv_tokens = cfg.kv_tokens.max(cfg.ctx);
             let pools = (|| -> Result<_> {
-                let mut pool = KvPool::new(&backend, &model, kv_tokens, BLOCK_SIZE, cfg.kv_type)?;
+                // Recurrent models keep a state per sequence holding blocks:
+                // the running batch, an embedding job and a spare.
+                let mut pool = KvPool::new(&backend, &model, kv_tokens, BLOCK_SIZE, cfg.kv_type, cfg.parallel.max(1) + 2)?;
                 if cfg.host_cache_bytes > 0 {
                     pool.add_host_tier(cfg.host_cache_bytes, cfg.kv_type).context("allocating the host cache")?;
                 }
                 let draft = match &draft_model {
-                    Some(d) => Some(KvPool::new(&backend, d, draft_pool_tokens(kv_tokens), BLOCK_SIZE, cfg.kv_type).context("draft model KV cache")?),
+                    Some(d) => Some(KvPool::new(&backend, d, draft_pool_tokens(kv_tokens), BLOCK_SIZE, cfg.kv_type, cfg.parallel.max(1)).context("draft model KV cache")?),
                     None => None,
                 };
                 Ok((pool, draft))
@@ -383,6 +411,7 @@ where
                 vocab: model.vocab_size(),
                 draft: draft_model.as_ref().map(|d| d.summary()),
                 host_blocks: pool.host_blocks().map(|(n, _)| n),
+                recurrent: pool.recurrent(),
             };
             let _ = ready_tx.send(Ok(info));
             Scheduler::new(pool, draft, &tok, &vocab, &cfg, &metrics, queued_engine).run(jobs_rx);

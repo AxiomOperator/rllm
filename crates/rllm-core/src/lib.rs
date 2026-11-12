@@ -159,6 +159,57 @@ pub struct AttnMeta<'a> {
     pub block_size: usize,
 }
 
+/// The sequences of a step with recurrent layers (Gated DeltaNet). Each
+/// sequence's tokens are contiguous and in order: sequence `s` holds tokens
+/// `starts[s]..starts[s + 1]` (`starts` has one entry more than sequences),
+/// keeps its state in slot `slots[s]`, and starts from a zero state when
+/// `fresh[s]` is nonzero (its first token is at position 0).
+pub struct SeqRuns<'a> {
+    pub starts: &'a [u32],
+    pub slots: &'a [u32],
+    pub fresh: &'a [u32],
+}
+
+impl SeqRuns<'_> {
+    pub fn n_seqs(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Check the runs are consistent with `n_tokens` tokens and `n_slots` state slots.
+    pub fn check(&self, n_tokens: usize, n_slots: usize) -> Result<()> {
+        let n = self.slots.len();
+        let ok = self.starts.len() == n + 1
+            && self.fresh.len() == n
+            && self.starts.first() == Some(&0)
+            && self.starts.last().map(|&e| e as usize) == Some(n_tokens)
+            && self.starts.windows(2).all(|w| w[0] < w[1])
+            && self.slots.iter().all(|&s| (s as usize) < n_slots);
+        if ok { Ok(()) } else { Err(Error::Shape(format!("bad sequence runs for {n_tokens} tokens and {n_slots} state slots"))) }
+    }
+}
+
+/// Shape of a Gated DeltaNet layer: `n_k_heads` query/key heads and
+/// `n_v_heads` value heads (a multiple; value head `h` reads key head
+/// `h % n_k_heads`), all of size `head_dim`.
+#[derive(Debug, Clone, Copy)]
+pub struct GdnShape {
+    pub n_k_heads: usize,
+    pub n_v_heads: usize,
+    pub head_dim: usize,
+}
+
+impl GdnShape {
+    /// Width of the convolved q|k|v row.
+    pub fn qkv_width(&self) -> usize {
+        (2 * self.n_k_heads + self.n_v_heads) * self.head_dim
+    }
+
+    /// Floats of recurrent state per sequence (one `head_dim`² matrix per value head).
+    pub fn state_len(&self) -> usize {
+        self.n_v_heads * self.head_dim * self.head_dim
+    }
+}
+
 /// Activation of a gated FFN (see [`Backend::glu_matmul`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Activation {
@@ -298,6 +349,57 @@ pub trait Backend: Send + Sync {
 
     /// `x = cap * tanh(x / cap)`, over `len` elements (Gemma's logit softcap).
     fn softcap(&self, x: &mut Self::Buffer, cap: f32, len: usize) -> Result<()>;
+
+    /// `x *= sigmoid(g)`, over `len` elements (gated attention output).
+    fn sigmoid_mul(&self, x: &mut Self::Buffer, g: &Self::Buffer, len: usize) -> Result<()>;
+
+    /// Causal depthwise convolution then SiLU, per sequence (the input
+    /// convolution of a Gated DeltaNet layer). `x` is `[tokens, channels]`,
+    /// `w` is a 1-D f32 weight of `channels * kernel` values (row `c` is
+    /// channel `c`'s taps). For token `t`,
+    /// `out[t, c] = silu(sum_j w[c, j] * in[t - (kernel - 1) + j, c])`, where
+    /// inputs before the step's first token come from `state`: per slot,
+    /// the sequence's last `kernel - 1` inputs, `[slots, channels, kernel - 1]`
+    /// (zeros for a fresh sequence). `state` is updated to end with this
+    /// step's inputs.
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_silu(
+        &self,
+        x: &Self::Buffer,
+        w: &Self::Weight,
+        state: &mut Self::Buffer,
+        runs: &SeqRuns,
+        out: &mut Self::Buffer,
+        channels: usize,
+        kernel: usize,
+    ) -> Result<()>;
+
+    /// Gated DeltaNet recurrence over each sequence's tokens. `qkv` is the
+    /// convolved `[tokens, q | k | v]` (`shape.qkv_width()` wide); `alpha` and
+    /// `beta` are `[tokens, n_v_heads]` projections. Per token and value
+    /// head `h` (key head `kh = h % n_k_heads`):
+    /// `q, k = l2norm(q[kh]), l2norm(k[kh])` (`x / sqrt(sum x² + eps)`),
+    /// `g = exp(softplus(alpha + dt_bias[h]) * a[h])`, `b = sigmoid(beta)`,
+    /// `S = g S; S += k ((v - S^T k) b)^T; out = S^T q / sqrt(head_dim)`.
+    /// `S` is the sequence's `head_dim`² state for that head, kept in
+    /// `state`: `[slots, n_v_heads * head_dim²]` floats, laid out per head
+    /// as the backend likes (only that backend reads it); zero for fresh
+    /// sequences.
+    /// `out` is `[tokens, n_v_heads * head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_net(
+        &self,
+        qkv: &Self::Buffer,
+        alpha: &Self::Buffer,
+        beta: &Self::Buffer,
+        dt_bias: &Self::Weight,
+        a: &Self::Weight,
+        state: &mut Self::Buffer,
+        runs: &SeqRuns,
+        out: &mut Self::Buffer,
+        shape: GdnShape,
+        eps: f32,
+    ) -> Result<()>;
 
     /// `out[i, :] = x[first + i * stride, :]` for `i < count`, rows of `width`.
     #[allow(clippy::too_many_arguments)]

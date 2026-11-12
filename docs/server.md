@@ -140,12 +140,12 @@ Chat Completions:
 - **Streaming:** `stream` and `stream_options.include_usage`.
 - **Tools:** `tools` (function tools), `tool_choice` (`none`, `auto`, `required`, a named function, `allowed_tools`), `parallel_tool_calls`, and the deprecated `functions` / `function_call`.
   - Tool definitions go through the model's own chat template. Function names must match `^[a-zA-Z0-9_-]{1,64}$`, as on OpenAI (400 otherwise).
-  - Tool calls are parsed from the model's native format: Qwen/Hermes `<tool_call>` JSON, or Gemma 4 `<|tool_call>call:…`.
+  - Tool calls are parsed from the model's native format: Qwen/Hermes `<tool_call>` JSON, Qwen3.5's XML (`<tool_call><function=name><parameter=p>value</parameter></function></tool_call>`; a value is JSON when it parses as an object, array, number, boolean or null, else a string), or Gemma 4 `<|tool_call>call:…`.
   - `required` and named choices are enforced by starting the model's output with the tool-call opening, then constraining the call to the tools' names and parameter schemas (in either format), so the arguments always match a tool's `parameters`.
 - **`response_format`:** `json_object` and `json_schema`.
   - Decoding is constrained token by token, and stops when the value is complete. `json_object` output is always a valid JSON object.
   - `json_schema` output always matches the schema's structure (see [Structured output](#structured-output)). The schema is also given to the model in the system prompt.
-- **`reasoning_effort`:** `none` or `minimal` turn the model's thinking mode off; any other value turns it on. Without it, the chat template's default applies.
+- **`reasoning_effort`:** `none` or `minimal` turn the model's thinking mode off; any other value turns it on. Without it, the chat template's default applies (thinking is off by default for Qwen3.5). vLLM's `chat_template_kwargs: {"enable_thinking": true}` is accepted as the same switch.
   - Thinking text is returned as `message.reasoning_content` (the de facto field used by compatible servers), or `delta.reasoning_content` when streaming.
   - Usage counts it in `completion_tokens_details.reasoning_tokens`.
 - **Storage:** `store` and `metadata` (in memory; saved to disk with `--store-file`). A streamed completion is stored once its stream finishes.
@@ -209,7 +209,8 @@ and usually follows them.
 Forced tool calls use the same validator. Hermes calls are JSON
 (`{"name": …, "arguments": …}`). Gemma 4 calls use Gemma's own syntax
 (`name{key:<|"|>text<|"|>,n:1}`): bare keys, strings between the
-`<|"|>` token.
+`<|"|>` token. Qwen3.5's XML calls are only forced to start (`<tool_call>`,
+or `<function=name>` for a named tool); their arguments aren't constrained.
 
 Embeddings are the model's final hidden states, mean-pooled over the input's
 tokens and L2-normalized. `dimensions` truncates and renormalizes. These are
@@ -242,6 +243,29 @@ retrieval-embedding model.
   - A response deleted while running stays deleted.
   - A background response still running at shutdown loads as `failed`.
 - **Logging.** One line per finished generation: prompt tokens (cached), generated tokens, time to first token, decode rate, total time and finish reason.
+
+## Qwen3.5 (hybrid models)
+
+Qwen3.5, 3.6 and 3.8 dense models (GGUF architecture `qwen35`) mix Gated
+DeltaNet layers, which keep a fixed-size recurrent state per sequence, with
+full-attention layers (one in four). The state can't be rebuilt from cached KV
+blocks or rewound after rejected draft tokens, so for these models:
+
+- the prefix cache and its host tier are off (every prompt is computed in full);
+- `--draft` and `--prompt-lookup` are ignored with a notice (the MTP head some
+  files carry is not used yet);
+- each running request holds a state slot: `--parallel` + 2 slots are
+  allocated up front (about 3 MB per DeltaNet layer per slot on the 27B model,
+  0.2 GiB for 10 slots on 0.8B). `rllm tune` counts them.
+
+Thinking is off by default in these models' chat template; `reasoning_effort`
+or `chat_template_kwargs: {"enable_thinking": true}` turns it on.
+
+Measured on the Strix Halo (Radeon 8060S), Qwen3.8-27B Q8_0: perplexity 5.5955
+(llama.cpp ROCm 5.5973; wikitext-2, 32 chunks of 512), pp512 433 tok/s
+(llama.cpp 390), tg64 7.81 tok/s (llama.cpp 7.78). Qwen3.5-0.8B Q8_0:
+perplexity 15.4846 (llama.cpp 15.4933); logits within llama.cpp's own noise
+on the laptop's CPU and CUDA backends, at any prefill chunk size.
 
 ## Speculative decoding
 

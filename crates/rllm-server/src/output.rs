@@ -14,24 +14,33 @@ pub enum Format {
     Hermes,
     /// Gemma 4: `<|channel>thought…<channel|>`, `<|tool_call>call:name{…}<tool_call|>`.
     Gemma,
+    /// Qwen3.5 / Qwen3-Coder: `<think>…</think>`, and tool calls as XML:
+    /// `<tool_call><function=name><parameter=p>value</parameter>…</function></tool_call>`.
+    QwenXml,
 }
 
 impl Format {
     /// Pick the format from the model's chat template.
     pub fn detect(template: &str) -> Self {
-        if template.contains("<|tool_call>") || template.contains("<|turn>") { Format::Gemma } else { Format::Hermes }
+        if template.contains("<|tool_call>") || template.contains("<|turn>") {
+            Format::Gemma
+        } else if template.contains("<function=") {
+            Format::QwenXml
+        } else {
+            Format::Hermes
+        }
     }
 
     fn think(self) -> (&'static str, &'static str) {
         match self {
-            Format::Hermes => ("<think>", "</think>"),
+            Format::Hermes | Format::QwenXml => ("<think>", "</think>"),
             Format::Gemma => ("<|channel>thought", "<channel|>"),
         }
     }
 
     fn tool(self) -> (&'static str, &'static str) {
         match self {
-            Format::Hermes => ("<tool_call>", "</tool_call>"),
+            Format::Hermes | Format::QwenXml => ("<tool_call>", "</tool_call>"),
             Format::Gemma => ("<|tool_call>", "<tool_call|>"),
         }
     }
@@ -45,6 +54,10 @@ impl Format {
             (Format::Hermes, Some(n)) => format!("<tool_call>\n{{\"name\": \"{n}\", \"arguments\": "),
             (Format::Gemma, None) => "<|tool_call>call:".into(),
             (Format::Gemma, Some(n)) => format!("<|tool_call>call:{n}"),
+            // Stops before `<function=`: the model writes `=name` with
+            // merged tokens, so a forced `=` would derail the name.
+            (Format::QwenXml, None) => "<tool_call>\n".into(),
+            (Format::QwenXml, Some(n)) => format!("<tool_call>\n<function={n}>\n"),
         }
     }
 
@@ -93,10 +106,27 @@ impl OutputParser {
         Self { format, tools, reasoning, mode: Mode::Content, buf: String::new(), at_start: true, after_reasoning: false }
     }
 
+    /// The parser for a chat prompt's output.
+    pub fn for_prompt(format: Format, prompt: &crate::prompt::ChatPrompt) -> Self {
+        let mut p = Self::new(format, prompt.tools, prompt.reasoning);
+        if prompt.reasoning_open {
+            p.open_reasoning();
+        }
+        p
+    }
+
     /// Plain text output (legacy completions): no markers recognized and
     /// the text is passed on verbatim (leading whitespace included).
     pub fn plain() -> Self {
         Self { at_start: false, ..Self::new(Format::Hermes, false, false) }
+    }
+
+    /// The prompt already opened a reasoning block (templates that end the
+    /// generation prompt with `<think>`): output starts as reasoning.
+    pub fn open_reasoning(&mut self) {
+        if self.reasoning {
+            self.mode = Mode::Reasoning;
+        }
     }
 
     /// Currently inside a reasoning block (for counting reasoning tokens).
@@ -225,6 +255,44 @@ impl OutputParser {
     }
 }
 
+/// `<function=name>` then `<parameter=p>value</parameter>` blocks, then
+/// `</function>`. A value is JSON when it parses as an object, array,
+/// number, boolean or null (the template writes those with `tojson`), else
+/// a string; one newline around it is the format's, not the value's.
+fn parse_xml_call(body: &str) -> Option<ToolCall> {
+    let rest = body.trim().strip_prefix("<function=")?;
+    let close = rest.find('>')?;
+    let name = rest[..close].trim().to_owned();
+    if name.is_empty() {
+        return None;
+    }
+    let mut rest = &rest[close + 1..];
+    let mut args = serde_json::Map::new();
+    loop {
+        let r = rest.trim_start();
+        if let Some(after) = r.strip_prefix("</function>") {
+            if !after.trim().is_empty() {
+                return None;
+            }
+            break;
+        }
+        let r = r.strip_prefix("<parameter=")?;
+        let gt = r.find('>')?;
+        let key = r[..gt].trim().to_owned();
+        let r = &r[gt + 1..];
+        let end = r.find("</parameter>")?;
+        let raw = r[..end].strip_prefix('\n').unwrap_or(&r[..end]);
+        let raw = raw.strip_suffix('\n').unwrap_or(raw);
+        let value = match serde_json::from_str::<Value>(raw) {
+            Ok(v) if !v.is_string() => v,
+            _ => Value::String(raw.to_owned()),
+        };
+        args.insert(key, value);
+        rest = &r[end + "</parameter>".len()..];
+    }
+    Some(ToolCall { name, arguments: Value::Object(args).to_string() })
+}
+
 /// Length of the longest suffix of `s` that is a proper prefix of `marker`
 /// (text to hold back because the marker may be starting).
 fn partial_suffix(s: &str, marker: &str) -> usize {
@@ -246,6 +314,7 @@ fn parse_tool_call(format: Format, body: &str) -> Option<ToolCall> {
             };
             Some(ToolCall { name, arguments })
         }
+        Format::QwenXml => parse_xml_call(body),
         Format::Gemma => {
             let body = body.trim();
             let rest = body.strip_prefix("call:")?;
@@ -488,6 +557,33 @@ mod tests {
         // Nesting within the limit still parses.
         let ok = format!("call:f{{x:{}1{}}}", "[".repeat(100), "]".repeat(100));
         assert!(parse_tool_call(Format::Gemma, &ok).is_some());
+    }
+
+    #[test]
+    fn qwen_xml_tool_calls() {
+        let text = "Let me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nNew York\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=opts>\n{\"units\": \"c\"}\n</parameter>\n</function>\n</tool_call>";
+        for split in 1..text.len() {
+            if !text.is_char_boundary(split) {
+                continue;
+            }
+            let mut p = OutputParser::new(Format::QwenXml, true, true);
+            let got = run(&mut p, &[&text[..split], &text[split..]]);
+            // Text before the call is streamed as it comes, newlines included (as for Hermes).
+            assert_eq!(got[0], Piece::Content("Let me check.\n\n".into()), "split {split}");
+            let Piece::ToolCall(c) = &got[1] else { panic!("split {split}: {got:?}") };
+            assert_eq!(c.name, "get_weather");
+            let a: Value = serde_json::from_str(&c.arguments).unwrap();
+            assert_eq!(a, serde_json::json!({ "city": "New York", "days": 3, "opts": { "units": "c" } }));
+        }
+        // Multi-line string values keep their inner newlines; bad markup stays text.
+        let c = parse_xml_call("<function=f>\n<parameter=s>\na\nb\n</parameter>\n</function>").unwrap();
+        assert_eq!(c.arguments, r#"{"s":"a\nb"}"#);
+        assert_eq!(parse_xml_call("<function=f>\n<parameter=s>\nx\n</function>"), None);
+        // A prompt that opened <think>: output starts as reasoning.
+        let mut p = OutputParser::new(Format::QwenXml, true, true);
+        p.open_reasoning();
+        assert_eq!(run(&mut p, &["thinking</think>\n\nanswer"]), vec![Piece::Reasoning("thinking".into()), Piece::Content("answer".into())]);
+        assert_eq!(Format::detect("...<tool_call>\n<function=example_function_name>..."), Format::QwenXml);
     }
 
     #[test]

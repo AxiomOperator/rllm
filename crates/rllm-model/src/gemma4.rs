@@ -539,7 +539,7 @@ impl<B: Backend> Gemma4<B> {
 impl<B: Backend> Model<B> for Gemma4<B> {
     type Cache = Cache<B>;
 
-    fn alloc_cache(&self, b: &B, n_blocks: usize, block_size: usize, kv: KvType) -> Result<Cache<B>> {
+    fn alloc_cache(&self, b: &B, n_blocks: usize, block_size: usize, kv: KvType, _max_seqs: usize) -> Result<Cache<B>> {
         let [swa, global] = self.kv_layouts(n_blocks, block_size, kv);
         Ok(Cache {
             swa: b.alloc_kv(swa).context("allocating sliding-window KV cache")?,

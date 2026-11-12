@@ -102,6 +102,9 @@ pub struct ChatPrompt {
     pub forced: String,
     pub tools: bool,
     pub reasoning: bool,
+    /// The rendered prompt ends inside an opened reasoning block (the
+    /// template wrote `<think>`): output starts as reasoning.
+    pub reasoning_open: bool,
     /// Decoding constraint for the output (JSON mode, or a forced tool
     /// call's JSON), and text that closes the output once it completes.
     pub constraint: Option<JsonState>,
@@ -309,6 +312,8 @@ pub fn build(
     // schemas (JSON for Hermes, Gemma's own syntax for Gemma), then closed.
     let (constraint, suffix) = match choice {
         _ if forced.is_empty() => (json_format.map(JsonFormat::constraint), String::new()),
+        // XML tool calls: the opening is forced, the rest isn't constrained.
+        _ if state.format == Format::QwenXml => (None, String::new()),
         ToolChoice::Named(n) if state.format == Format::Gemma => {
             let params = tools.iter().find(|t| t["function"]["name"] == n.as_str()).map(tool_params).unwrap_or_default();
             (Some(JsonState::with_schema(Arc::new(Schema::gemma(&params)))), "<tool_call|>".to_owned())
@@ -332,7 +337,9 @@ pub fn build(
     if constraint.as_ref().is_some_and(JsonState::too_complex) {
         return Err(ApiError::invalid("JSON schema is too large or too deeply self-referencing to enforce", Some("response_format")));
     }
-    Ok(ChatPrompt { ids, forced, tools: use_tools, reasoning: thinking != Some(false) && json_format.is_none(), constraint, suffix })
+    let reasoning = thinking != Some(false) && json_format.is_none();
+    let reasoning_open = reasoning && forced.is_empty() && text.trim_end().ends_with("<think>");
+    Ok(ChatPrompt { ids, forced, tools: use_tools, reasoning, reasoning_open, constraint, suffix })
 }
 
 /// A function tool's parameter schema (an object schema by default).

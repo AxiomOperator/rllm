@@ -26,6 +26,8 @@ use tokenizers::{AddedToken, DecoderWrapper, PreTokenizerWrapper, SplitDelimiter
 
 // Same patterns as llama.cpp's `llm_tokenizer_bpe` for each `tokenizer.ggml.pre`.
 const PRE_QWEN2: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// Qwen3.5+: Qwen2's split with combining marks (`\p{M}`) kept in letter runs.
+const PRE_QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const PRE_LLAMA3: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const PRE_GEMMA4: &str = r"[^\n]+|[\n]+";
 
@@ -78,6 +80,7 @@ impl Tokenizer {
         }
         let kind = match (model, pre) {
             ("gpt2", "qwen2") => Kind::Gpt2(PRE_QWEN2),
+            ("gpt2", "qwen35") => Kind::Gpt2(PRE_QWEN35),
             ("gpt2", "llama-bpe") => Kind::Gpt2(PRE_LLAMA3),
             ("gemma4", _) => Kind::Gemma4,
             ("llama", _) => Kind::Spm,

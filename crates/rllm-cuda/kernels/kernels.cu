@@ -1569,6 +1569,121 @@ extern "C" __global__ void mul_inplace(float* x, const float* __restrict__ y, lo
     if (i < n) x[i] *= y[i];
 }
 
+// x *= sigmoid(g) (gated attention output, Qwen3.5).
+extern "C" __global__ void sigmoid_mul_inplace(float* x, const float* __restrict__ g, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= 1.f / (1.f + expf(-g[i]));
+}
+
+// ---------------------------------------------------------------------------
+// Gated DeltaNet (Qwen3.5 linear-attention layers). Sequences of a step are
+// runs of tokens starts[s]..starts[s+1], each with a state slot and a
+// "fresh" flag (start from zero state). See Backend::conv1d_silu and
+// Backend::gated_delta_net in rllm-core for the math.
+
+#define GDN_MAX_KERNEL 16
+
+// Causal depthwise conv + SiLU. One thread per (channel, sequence); the
+// window slides over the sequence's tokens. w: [channels, kernel] f32;
+// state: [slots, channels, kernel - 1], the last inputs (updated).
+extern "C" __global__ void conv1d_silu(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ state,
+                                       const u32* __restrict__ starts, const u32* __restrict__ slots, const u32* __restrict__ fresh,
+                                       float* __restrict__ out, int channels, int kernel) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int s = blockIdx.y;
+    if (c >= channels) return;
+    const int keep = kernel - 1;
+    float win[GDN_MAX_KERNEL];
+    float wc[GDN_MAX_KERNEL];
+    float* st = state + ((long)slots[s] * channels + c) * keep;
+    const bool f = fresh[s] != 0;
+#pragma unroll
+    for (int j = 0; j < GDN_MAX_KERNEL; j++) {
+        // win[1..kernel) holds the previous inputs.
+        win[j] = (j >= 1 && j < kernel && !f) ? st[j - 1] : 0.f;
+        wc[j] = j < kernel ? w[(long)c * kernel + j] : 0.f;
+    }
+    for (u32 t = starts[s]; t < starts[s + 1]; t++) {
+#pragma unroll
+        for (int j = 0; j + 1 < GDN_MAX_KERNEL; j++) win[j] = win[j + 1];
+        // The new input goes to place kernel - 1; unrolled stores keep win in registers.
+        float xv = x[(long)t * channels + c];
+        float acc = 0.f;
+#pragma unroll
+        for (int j = 0; j < GDN_MAX_KERNEL; j++) {
+            if (j == kernel - 1) win[j] = xv;
+            if (j < kernel) acc += win[j] * wc[j];
+        }
+        out[(long)t * channels + c] = acc / (1.f + expf(-acc));
+    }
+#pragma unroll
+    for (int j = 1; j < GDN_MAX_KERNEL; j++)
+        if (j < kernel) st[j - 1] = win[j];
+}
+
+// The recurrence. One block per (value head, sequence), D threads: thread j
+// owns column j of the head's D x D state S (S[i][j] at state[i*D + j], so
+// loads are coalesced) in registers. Per token: q, k (L2-normalized, shared),
+// S = g S; delta = (v - S^T k) b; S += k delta^T; out = S^T q / sqrt(D).
+template <int D>
+__device__ void gated_delta_net_impl(const float* __restrict__ qkv, const float* __restrict__ alpha, const float* __restrict__ beta,
+                                     const float* __restrict__ dt_bias, const float* __restrict__ a, float* __restrict__ state,
+                                     const u32* __restrict__ starts, const u32* __restrict__ slots, const u32* __restrict__ fresh,
+                                     float* __restrict__ out, int n_k_heads, int n_v_heads, float eps) {
+    __shared__ float qs[D], ks[D], red[32];
+    const int h = blockIdx.x, s = blockIdx.y, j = threadIdx.x;
+    const int kh = h % n_k_heads;
+    const long width = (long)(2 * n_k_heads + n_v_heads) * D;
+    float* st = state + ((long)slots[s] * n_v_heads + h) * D * D;
+    const bool f = fresh[s] != 0;
+    float col[D];
+#pragma unroll
+    for (int i = 0; i < D; i++) col[i] = f ? 0.f : st[(long)i * D + j];
+    const float scale = rsqrtf((float)D);
+    const float dtb = dt_bias[h], ah = a[h];
+    for (u32 t = starts[s]; t < starts[s + 1]; t++) {
+        const float* row = qkv + (long)t * width;
+        float qv = row[kh * D + j], kv = row[(n_k_heads + kh) * D + j], vv = row[(2 * n_k_heads + h) * D + j];
+        float qn = block_sum(qv * qv, red);
+        float kn = block_sum(kv * kv, red);
+        __syncthreads();  // previous token's readers of qs/ks are done
+        qs[j] = qv * rsqrtf(qn + eps);
+        ks[j] = kv * rsqrtf(kn + eps);
+        __syncthreads();
+        float z = alpha[(long)t * n_v_heads + h] + dtb;
+        float sp = z > 20.f ? z : log1pf(expf(z));
+        float g = expf(sp * ah);
+        float b = 1.f / (1.f + expf(-beta[(long)t * n_v_heads + h]));
+        float sk = 0.f;
+#pragma unroll
+        for (int i = 0; i < D; i++) {
+            col[i] *= g;
+            sk += col[i] * ks[i];
+        }
+        float delta = (vv - sk) * b;
+        float o = 0.f;
+#pragma unroll
+        for (int i = 0; i < D; i++) {
+            col[i] += ks[i] * delta;
+            o += col[i] * qs[i];
+        }
+        out[(long)t * n_v_heads * D + (long)h * D + j] = o * scale;
+    }
+#pragma unroll
+    for (int i = 0; i < D; i++) st[(long)i * D + j] = col[i];
+}
+
+#define INSTANTIATE_GDN(D)                                                                                                     \
+    extern "C" __global__ void __launch_bounds__(D) gated_delta_net_d##D(                                                     \
+        const float* __restrict__ qkv, const float* __restrict__ alpha, const float* __restrict__ beta,                        \
+        const float* __restrict__ dt_bias, const float* __restrict__ a, float* __restrict__ state, const u32* __restrict__ starts, \
+        const u32* __restrict__ slots, const u32* __restrict__ fresh, float* __restrict__ out, int n_k_heads, int n_v_heads,  \
+        float eps) {                                                                                                          \
+        gated_delta_net_impl<D>(qkv, alpha, beta, dt_bias, a, state, starts, slots, fresh, out, n_k_heads, n_v_heads, eps);   \
+    }
+INSTANTIATE_GDN(64)
+INSTANTIATE_GDN(128)
+
 extern "C" __global__ void scale_inplace(float* x, float s, long n) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] *= s;

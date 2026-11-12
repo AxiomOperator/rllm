@@ -10,6 +10,10 @@ pub enum Error {
     OutOfBlocks { need: usize, free: usize },
     #[error("KV block copy: {0}")]
     Copy(String),
+    #[error("no free recurrent-state slot ({0} in use)")]
+    NoStateSlots(usize),
+    #[error("sequence has {0} cached tokens but no recurrent state (prefix reuse is not supported for this model)")]
+    StateMissing(usize),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -20,13 +24,52 @@ pub struct BlockAllocator {
     block_size: usize,
     free: Vec<u32>,
     refcount: Vec<u32>,
+    /// Recurrent-state slots (hybrid models such as Qwen3.5 keep a fixed-size
+    /// state per sequence besides its KV blocks): free slots, and which are
+    /// in use. Empty for models without recurrent layers.
+    state_free: Vec<u32>,
+    state_used: Vec<bool>,
 }
 
 impl BlockAllocator {
     pub fn new(n_blocks: usize, block_size: usize) -> Self {
         // Hand out low block ids first.
         let free = (0..n_blocks as u32).rev().collect();
-        Self { block_size, free, refcount: vec![0; n_blocks] }
+        Self { block_size, free, refcount: vec![0; n_blocks], state_free: Vec::new(), state_used: Vec::new() }
+    }
+
+    /// Also hand out `n` recurrent-state slots: every sequence takes one when
+    /// its first token is appended and returns it when freed.
+    pub fn with_state_slots(mut self, n: usize) -> Self {
+        self.state_free = (0..n as u32).rev().collect();
+        self.state_used = vec![false; n];
+        self
+    }
+
+    /// Whether sequences carry a recurrent-state slot.
+    pub fn has_state(&self) -> bool {
+        !self.state_used.is_empty()
+    }
+
+    /// Free recurrent-state slots.
+    pub fn n_free_state(&self) -> usize {
+        self.state_free.len()
+    }
+
+    fn alloc_state(&mut self) -> Option<u32> {
+        let s = self.state_free.pop()?;
+        self.state_used[s as usize] = true;
+        Some(s)
+    }
+
+    fn release_state(&mut self, slot: u32) {
+        match self.state_used.get_mut(slot as usize) {
+            Some(used) if *used => {
+                *used = false;
+                self.state_free.push(slot);
+            }
+            _ => eprintln!("[rllm] KV bookkeeping error: double free of state slot {slot}"),
+        }
     }
 
     pub fn block_size(&self) -> usize {
@@ -95,13 +138,16 @@ impl BlockAllocator {
 pub struct SeqKv {
     pub block_table: Vec<u32>,
     pub len: usize,
+    /// Recurrent-state slot (see [`BlockAllocator::with_state_slots`]),
+    /// taken with the first token.
+    pub state: Option<u32>,
 }
 
 impl SeqKv {
     /// A sequence starting with `len` tokens already in `blocks` (references
     /// the caller has taken, e.g. from [`PrefixCache::lookup`]).
     pub fn with_prefix(blocks: Vec<u32>, len: usize) -> Self {
-        Self { block_table: blocks, len }
+        Self { block_table: blocks, len, state: None }
     }
 
     /// Blocks needed to hold `n` more tokens.
@@ -116,6 +162,13 @@ impl SeqKv {
         let need = (self.len + n).div_ceil(bs).saturating_sub(self.block_table.len());
         if need > alloc.n_free() {
             return Err(Error::OutOfBlocks { need, free: alloc.n_free() });
+        }
+        if alloc.has_state() && self.state.is_none() {
+            // A recurrent state can only be built from the first token on.
+            if self.len > 0 {
+                return Err(Error::StateMissing(self.len));
+            }
+            self.state = Some(alloc.alloc_state().ok_or(Error::NoStateSlots(alloc.state_used.len()))?);
         }
         for _ in 0..need {
             self.block_table.push(alloc.alloc().expect("checked above"));
@@ -134,6 +187,9 @@ impl SeqKv {
         if len >= self.len {
             return;
         }
+        // A recurrent state can't be rewound: callers don't truncate
+        // sequences of such models (no speculative decoding there).
+        debug_assert!(self.state.is_none(), "truncating a sequence with recurrent state");
         for b in self.block_table.drain(len.div_ceil(alloc.block_size())..) {
             alloc.release(b);
         }
@@ -144,6 +200,9 @@ impl SeqKv {
     pub fn free(&mut self, alloc: &mut BlockAllocator) {
         for b in self.block_table.drain(..) {
             alloc.release(b);
+        }
+        if let Some(s) = self.state.take() {
+            alloc.release_state(s);
         }
         self.len = 0;
     }
@@ -335,6 +394,10 @@ impl PrefixCache {
     /// Retire a sequence whose cache holds `tokens` (`seq.len == tokens.len()`).
     /// Its full blocks join the cache; the partial last block is released.
     pub fn insert(&mut self, store: &mut impl BlockStore, tokens: &[u32], mut seq: SeqKv) {
+        // Cached blocks are reused without a recurrent state: give it back.
+        if let Some(s) = seq.state.take() {
+            store.device().release_state(s);
+        }
         let bs = store.device().block_size();
         let full = seq.len.min(tokens.len()) / bs;
         for b in seq.block_table.drain(full..) {
@@ -483,6 +546,39 @@ impl PrefixCache {
         for e in std::mem::take(&mut self.entries) {
             Self::release(store, e);
         }
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn state_slots_follow_sequences() {
+        let mut a = BlockAllocator::new(8, 2).with_state_slots(2);
+        let (mut s1, mut s2, mut s3) = (SeqKv::default(), SeqKv::default(), SeqKv::default());
+        s1.append(&mut a, 3).unwrap();
+        s2.append(&mut a, 1).unwrap();
+        assert_eq!((s1.state, s2.state, a.n_free_state()), (Some(0), Some(1), 0));
+        // No slot left: nothing is allocated (all-or-nothing).
+        let free = a.n_free();
+        assert!(matches!(s3.append(&mut a, 1), Err(Error::NoStateSlots(2))));
+        assert_eq!((a.n_free(), s3.len), (free, 0));
+        // Later appends keep the slot; freeing returns it.
+        s1.append(&mut a, 1).unwrap();
+        assert_eq!(s1.state, Some(0));
+        s1.free(&mut a);
+        assert_eq!(a.n_free_state(), 1);
+        s3.append(&mut a, 1).unwrap();
+        assert_eq!(s3.state, Some(0));
+        // A cached prefix has no state to continue from.
+        let mut p = SeqKv::with_prefix(a.alloc_n(1).unwrap(), 2);
+        assert!(matches!(p.append(&mut a, 1), Err(Error::StateMissing(2))));
+        // Models without recurrent layers never take slots.
+        let mut plain = BlockAllocator::new(4, 2);
+        let mut s = SeqKv::default();
+        s.append(&mut plain, 3).unwrap();
+        assert_eq!(s.state, None);
     }
 }
 

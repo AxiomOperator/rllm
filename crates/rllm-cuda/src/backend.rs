@@ -7,11 +7,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::gpu::{self, DevicePtr, LaunchConfig, PushKernelArg};
 use rllm_core::quant::dequantize_row;
-use rllm_core::{Activation, AttnMeta, Backend, DType, Error, HostTensor, KvLayout, KvType, Result, RowSample};
+use rllm_core::{Activation, AttnMeta, Backend, DType, Error, GdnShape, HostTensor, KvLayout, KvType, Result, RowSample, SeqRuns};
 
 const KERNELS: &str = include_str!("../kernels/kernels.cu");
 /// Must match MV_MAX_M in kernels.cu.
 const MATVEC_MAX_M: usize = 8;
+/// Mirrors GDN_MAX_KERNEL in kernels.cu (longest conv1d_silu kernel).
+const GDN_MAX_KERNEL: usize = 16;
 const MATVEC_WARPS: u32 = 4;
 /// Head dims with an `attn_fa_d{HD}` prefill kernel (INSTANTIATE_FA).
 const FA_HEAD_DIMS: [usize; 4] = [64, 128, 256, 512];
@@ -642,7 +644,7 @@ impl CudaBackend {
         };
 
         let mut names: Vec<String> = [
-            "f32_to_f16", "f32_to_bf16", "half_to_f32", "logit_adjust", "sample_rows", "rms_norm", "add_rms_norm", "rms_norm_add", "qkv_norm_rope_store", "rms_norm_rope", "rope_neox", "silu_mul", "gelu_mul", "gelu_mul_strided", "ple_gate_f32", "gelu", "mul_inplace", "scale_inplace", "softcap_inplace",
+            "f32_to_f16", "f32_to_bf16", "half_to_f32", "logit_adjust", "sample_rows", "rms_norm", "add_rms_norm", "rms_norm_add", "qkv_norm_rope_store", "rms_norm_rope", "rope_neox", "silu_mul", "gelu_mul", "gelu_mul_strided", "ple_gate_f32", "gelu", "mul_inplace", "scale_inplace", "softcap_inplace", "sigmoid_mul_inplace", "conv1d_silu", "gated_delta_net_d64", "gated_delta_net_d128",
             "add_inplace", "gather_rows", "gather_strided", "kv_store", "kv_store_q8", "kv_copy_blocks", "kv_dequant_blocks", "kv_rotate_q", "attn_decode_combine", "paged_attention", "attn_prefill", "attn_prefill_tc", "quantize_q8", "repack_q8_0",
             "repack_q4_k", "repack_q6_k", "repack_q5_k", "repack_iq4_xs", "mmq_sum_splits",
             "matvec_glu_silu_f32", "matvec_glu_silu_f16", "matvec_glu_silu_bf16", "matvec_glu_gelu_f32", "matvec_glu_gelu_f16", "matvec_glu_gelu_bf16",
@@ -1490,7 +1492,10 @@ impl Backend for CudaBackend {
         // Not part of a step: the launches below must really run.
         self.abort_step();
         let (rows, cols) = t.as_2d();
-        if cols % 32 != 0 {
+        // Matrices feed the matmul kernels, which work in 32-wide units;
+        // unquantized vectors (norms, biases) are only read as f32 arrays.
+        let vector = t.shape.len() == 1 && !Fmt::of(t.dtype).quantized();
+        if cols % 32 != 0 && !vector {
             return Err(Error::Shape(format!("{}: {cols} columns not a multiple of 32", t.name)));
         }
         // Repacking works in whole quant blocks per row (and a zero row size
@@ -2417,6 +2422,75 @@ impl Backend for CudaBackend {
             check_len("add", x.len().min(y.len()), len)?;
             let n = len as i64;
             launch!(self, "add_inplace", grid_1d(len, 256)?, [x, y, &n])
+        })
+    }
+
+    fn sigmoid_mul(&self, x: &mut CudaBuf, g: &CudaBuf, len: usize) -> Result<()> {
+        self.in_step(|| {
+            check_len("sigmoid_mul", x.len().min(g.len()), len)?;
+            let n = len as i64;
+            launch!(self, "sigmoid_mul_inplace", grid_1d(len, 256)?, [x, g, &n])
+        })
+    }
+
+    fn conv1d_silu(&self, x: &CudaBuf, w: &CudaWeight, state: &mut CudaBuf, runs: &SeqRuns, out: &mut CudaBuf, channels: usize, kernel: usize) -> Result<()> {
+        self.in_step(|| {
+            let wd = w
+                .dense
+                .as_ref()
+                .filter(|_| w.cols == channels * kernel && (2..=GDN_MAX_KERNEL).contains(&kernel) && channels > 0)
+                .ok_or_else(|| Error::Shape(format!("conv1d_silu: weight must be 1-D with {channels} x {kernel} values (kernel 2..={GDN_MAX_KERNEL})")))?;
+            let n = *runs.starts.last().unwrap_or(&0) as usize;
+            runs.check(n, state.len() / (channels * (kernel - 1)))?;
+            check_len("conv1d_silu x", x.len(), n * channels)?;
+            check_len("conv1d_silu out", out.len(), n * channels)?;
+            let mut cache = self.index_cache.lock().unwrap();
+            self.sync_index(&mut cache, "gdn_starts", runs.starts)?;
+            self.sync_index(&mut cache, "gdn_slots", runs.slots)?;
+            self.sync_index(&mut cache, "gdn_fresh", runs.fresh)?;
+            let (st, sl, fr) = (&cache["gdn_starts"].dev, &cache["gdn_slots"].dev, &cache["gdn_fresh"].dev);
+            let cfg = LaunchConfig { grid_dim: (channels.div_ceil(128) as u32, runs.n_seqs() as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+            let (c, k) = (channels as i32, kernel as i32);
+            launch!(self, "conv1d_silu", cfg, [x, wd, state, st, sl, fr, out, &c, &k])
+        })
+    }
+
+    fn gated_delta_net(
+        &self,
+        qkv: &CudaBuf,
+        alpha: &CudaBuf,
+        beta: &CudaBuf,
+        dt_bias: &CudaWeight,
+        a: &CudaWeight,
+        state: &mut CudaBuf,
+        runs: &SeqRuns,
+        out: &mut CudaBuf,
+        shape: GdnShape,
+        eps: f32,
+    ) -> Result<()> {
+        self.in_step(|| {
+            let GdnShape { n_k_heads: hk, n_v_heads: hv, head_dim: d } = shape;
+            if hk == 0 || !hv.is_multiple_of(hk) || !matches!(d, 64 | 128) {
+                return Err(Error::Shape(format!("gated_delta_net: {hk} key / {hv} value heads of {d} (the GPU supports head size 64 or 128)")));
+            }
+            fn vec<'w>(w: &'w CudaWeight, what: &str, hv: usize) -> Result<&'w gpu::Slice<f32>> {
+                w.dense.as_ref().filter(|_| w.cols == hv).ok_or_else(|| Error::Shape(format!("gated_delta_net: {what} must be 1-D with {hv} values")))
+            }
+            let (dt, av) = (vec(dt_bias, "dt_bias", hv)?, vec(a, "a", hv)?);
+            let n = *runs.starts.last().unwrap_or(&0) as usize;
+            runs.check(n, state.len() / shape.state_len())?;
+            check_len("gated_delta_net qkv", qkv.len(), n * shape.qkv_width())?;
+            check_len("gated_delta_net alpha", alpha.len().min(beta.len()), n * hv)?;
+            check_len("gated_delta_net out", out.len(), n * hv * d)?;
+            let mut cache = self.index_cache.lock().unwrap();
+            self.sync_index(&mut cache, "gdn_starts", runs.starts)?;
+            self.sync_index(&mut cache, "gdn_slots", runs.slots)?;
+            self.sync_index(&mut cache, "gdn_fresh", runs.fresh)?;
+            let (st, sl, fr) = (&cache["gdn_starts"].dev, &cache["gdn_slots"].dev, &cache["gdn_fresh"].dev);
+            let cfg = LaunchConfig { grid_dim: (hv as u32, runs.n_seqs() as u32, 1), block_dim: (d as u32, 1, 1), shared_mem_bytes: 0 };
+            let (k, v) = (hk as i32, hv as i32);
+            let name = if d == 64 { "gated_delta_net_d64" } else { "gated_delta_net_d128" };
+            launch!(self, name, cfg, [qkv, alpha, beta, dt, av, state, st, sl, fr, out, &k, &v, &eps])
         })
     }
 

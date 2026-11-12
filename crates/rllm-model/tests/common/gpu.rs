@@ -151,7 +151,7 @@ fn host_tier_round_trip() {
     let mut q = tokens(200, vocab, 11);
     q.extend(tokens(9, vocab, 12));
     for kv in [KvType::F16, KvType::Q8] {
-        let mut pool = KvPool::new(&b, &model, 64 * 16, 16, kv).unwrap();
+        let mut pool = KvPool::new(&b, &model, 64 * 16, 16, kv, 4).unwrap();
         let block = rllm_model::Model::kv_block_bytes(&model, 16, kv);
         assert_eq!(pool.add_host_tier(32 * block, kv).unwrap(), 32);
         let mut cache = PrefixCache::default();

@@ -41,14 +41,21 @@ pub struct KvPool<'m, B: Backend, M: Model<B>> {
 static NEXT_POOL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
-    pub fn new(backend: &'m B, model: &'m M, max_tokens: usize, block_size: usize, kv: KvType) -> Result<Self> {
+    /// A pool of `max_tokens` KV slots. `max_seqs` bounds how many sequences
+    /// can hold blocks at once for models with recurrent state (one state
+    /// slot each); other models ignore it.
+    pub fn new(backend: &'m B, model: &'m M, max_tokens: usize, block_size: usize, kv: KvType, max_seqs: usize) -> Result<Self> {
         anyhow::ensure!(block_size > 0, "KV block size must be positive");
         anyhow::ensure!(max_tokens > 0, "KV cache must hold at least one token");
         let n_blocks = max_tokens.div_ceil(block_size);
         anyhow::ensure!(u32::try_from(n_blocks).is_ok(), "KV cache of {max_tokens} tokens is too large");
-        let kv = model.alloc_cache(backend, n_blocks, block_size, kv)?;
+        let kv = model.alloc_cache(backend, n_blocks, block_size, kv, max_seqs)?;
         let id = NEXT_POOL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Self { backend, model, kv, alloc: BlockAllocator::new(n_blocks, block_size), block_size, id, host: None })
+        let mut alloc = BlockAllocator::new(n_blocks, block_size);
+        if model.recurrent() {
+            alloc = alloc.with_state_slots(max_seqs);
+        }
+        Ok(Self { backend, model, kv, alloc, block_size, id, host: None })
     }
 
     /// Add a host tier of `bytes` (rounded down to whole blocks) that the
@@ -72,6 +79,11 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
 
     pub fn model(&self) -> &M {
         self.model
+    }
+
+    /// Whether sequences carry recurrent state (see [`Model::recurrent`]).
+    pub fn recurrent(&self) -> bool {
+        self.model.recurrent()
     }
 
     /// One forward pass over all `items` (each appended to its sequence).
@@ -104,6 +116,7 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
         let (mut tokens, mut token_seq, mut positions, mut slots, mut rows) =
             (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n), Vec::new());
         let mut tables = Vec::with_capacity(items.len());
+        let mut states = Vec::new();
         for (si, it) in items.iter_mut().enumerate() {
             let base = tokens.len() as u32;
             let start = it.seq.len as u32;
@@ -118,6 +131,9 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
                 Want::All => rows.extend(base..base + k),
             }
             tables.push(it.seq.block_table.clone());
+            if let Some(s) = it.seq.state {
+                states.push(s);
+            }
         }
         if rows.is_empty() {
             // The model always produces at least one row.
@@ -133,6 +149,7 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
             hidden,
             cache_id: self.id,
             sample,
+            state_slots: &states,
         };
         let out = self.model.forward(self.backend, &mut self.kv, &batch, self.block_size)?;
         if items.iter().all(|i| i.want == Want::None) {
@@ -178,7 +195,7 @@ impl<'m, B: Backend, M: Model<B>> Generator<'m, B, M> {
 
     /// Like [`Self::new`] with a choice of KV cache storage.
     pub fn with_kv(backend: &'m B, model: &'m M, max_tokens: usize, block_size: usize, kv: KvType) -> Result<Self> {
-        Ok(Self { pool: KvPool::new(backend, model, max_tokens, block_size, kv)?, seq: SeqKv::default() })
+        Ok(Self { pool: KvPool::new(backend, model, max_tokens, block_size, kv, 1)?, seq: SeqKv::default() })
     }
 
     /// Tokens currently in the cache.
@@ -276,6 +293,7 @@ impl<'m, B: Backend, M: Model<B>> Generator<'m, B, M> {
             hidden,
             cache_id: p.id,
             sample: &[],
+            state_slots: self.seq.state.as_slice(),
         };
         Ok(p.model.forward(p.backend, &mut p.kv, &batch, p.block_size)?.rows)
     }

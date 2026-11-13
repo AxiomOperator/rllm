@@ -19,6 +19,10 @@ pub struct Power {
     pub boot_limits: Option<String>,
     /// From `ryzenadj --info` when sudo allows it.
     pub current: Option<String>,
+    /// The live (sustained, slow, fast) limits in W, and which profile they
+    /// are ("balanced", "performance" or "custom").
+    pub limits_w: Option<[f64; 3]>,
+    pub active_profile: Option<String>,
     pub sudoers_hint: String,
 }
 
@@ -50,23 +54,40 @@ pub async fn status() -> Power {
             .collect();
         (!lim.is_empty()).then(|| lim.join(" "))
     };
-    let current = if can_apply {
-        sys::run("sudo", &["-n", RYZENADJ, "--info"]).await.ok().map(|(_, out)| {
-            out.lines()
-                .filter(|l| ["STAPM LIMIT", "PPT LIMIT FAST", "PPT LIMIT SLOW", "THM LIMIT CORE"].iter().any(|k| l.contains(k)))
-                .map(|l| l.split('|').map(str::trim).filter(|s| !s.is_empty()).take(2).collect::<Vec<_>>().join(" "))
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-    } else {
-        None
+    let info = if can_apply { sys::run("sudo", &["-n", RYZENADJ, "--info"]).await.ok().map(|(_, out)| out) } else { None };
+    // `| STAPM LIMIT | 120.000 | stapm-limit |` rows.
+    let value = |key: &str| -> Option<f64> {
+        info.as_deref()?.lines().find(|l| l.split('|').nth(1).is_some_and(|k| k.trim() == key))?.split('|').nth(2)?.trim().parse().ok()
     };
+    let current = info.as_ref().map(|out| {
+        out.lines()
+            .filter(|l| ["STAPM LIMIT", "PPT LIMIT FAST", "PPT LIMIT SLOW", "THM LIMIT CORE"].iter().any(|k| l.contains(k)))
+            .map(|l| l.split('|').map(str::trim).filter(|s| !s.is_empty()).take(2).collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
+    let limits_w = match (value("STAPM LIMIT"), value("PPT LIMIT SLOW"), value("PPT LIMIT FAST")) {
+        (Some(a), Some(b), Some(c)) => Some([a, b, c]),
+        _ => None,
+    };
+    let active_profile = limits_w.map(|l| {
+        let near = |p: [f64; 3]| l.iter().zip(p).all(|(a, b)| (a - b).abs() < 1.0);
+        if near([85.0, 85.0, 100.0]) {
+            "balanced".to_string()
+        } else if near([120.0, 120.0, 140.0]) {
+            "performance".to_string()
+        } else {
+            "custom".to_string()
+        }
+    });
     Power {
         ryzenadj_installed: installed,
         can_apply,
         boot_service,
         boot_limits,
         current,
+        limits_w,
+        active_profile,
         sudoers_hint: format!("echo '{} ALL=(root) NOPASSWD: {RYZENADJ}' | sudo tee /etc/sudoers.d/rllm-ryzenadj && sudo chmod 440 /etc/sudoers.d/rllm-ryzenadj", user()),
     }
 }

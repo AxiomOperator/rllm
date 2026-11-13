@@ -314,12 +314,12 @@ function powerView() {
     return `<tr><td>${esc(p.name)}<div class="sub">${esc(status[p.name]?.host?.product || "")}</div></td>
       <td>${g.socket_watts != null ? g.socket_watts.toFixed(0) + " W" : "–"} · ${g.gfx_mhz ?? "–"} MHz (max ${g.gfx_max_mhz ?? "–"})</td>
       <td>${esc(w.boot_service || "none")}<div class="sub mono">${esc(w.boot_limits || "")}</div></td>
-      <td class="mono">${esc(w.current || (w.can_apply === false ? "needs sudo for ryzenadj" : "–"))}</td>
-      <td>${w.ryzenadj_installed ? `<select id="pw_${esc(p.name)}"><option>balanced</option><option>performance</option></select>
+      <td>${w.limits_w ? `${w.limits_w.map(x => x.toFixed(0)).join(" / ")} W <span class="chip">${esc(w.active_profile)}</span>` : `<span class="sub">${!w.ryzenadj_installed ? "–" : w.can_apply === false ? "needs sudo for ryzenadj" : "–"}</span>`}</td>
+      <td>${w.ryzenadj_installed ? `<select id="pw_${esc(p.name)}">${["balanced", "performance"].map(o => `<option value="${o}" ${o === w.active_profile ? "selected" : ""}>${o}${o === w.active_profile ? " (active)" : ""}</option>`).join("")}</select>
         <button class="s" onclick="act('power ${esc(p.name)}', () => host('${esc(p.name)}', '/api/power/apply', {profile: $('#pw_${esc(p.name)}').value}))" ${w.can_apply ? "" : "disabled"}>Apply</button>
         ${w.can_apply ? "" : `<div class="sub">allow it: <span class="mono">${esc(w.sudoers_hint)}</span></div>`}` : `<span class="sub">ryzenadj not installed</span>`}</td></tr>`;
   }).join("");
-  return `<section><h3>Power</h3><div class="tw"><table><tr><th>Machine</th><th>Now</th><th>At boot (ryzenadj.service)</th><th>Current limits</th><th>Profile</th></tr>${rows}</table></div>
+  return `<section><h3>Power</h3><div class="tw"><table><tr><th>Machine</th><th>Now</th><th>At boot (ryzenadj.service)</th><th>Current limits (sustained / slow / fast)</th><th>Profile</th></tr>${rows}</table></div>
     <p class="sub">balanced: 85/85/100 W, performance: 120/120/140 W (sustained/slow/fast). Applied until reboot; the boot profile is ryzenadj.service's. <button class="s" onclick="loadPower()">Refresh</button></p></section>`;
 }
 

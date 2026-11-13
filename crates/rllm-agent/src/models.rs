@@ -204,7 +204,11 @@ async fn fetch_range(url: &str, auth: Option<&str>, part: &Path, start: u64, end
         let out = c.arg(url).output().await.context("running curl")?;
         let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let n = file_len(&tryf);
-        if code == "206" && got + n <= len && n > 0 {
+        if code == "206" && got + n <= len && n > 0 && got == 0 {
+            // The first attempt: it is the part.
+            tokio::fs::rename(&tryf, part).await?;
+            failures = 0;
+        } else if code == "206" && got + n <= len && n > 0 {
             let mut from = tokio::fs::File::open(&tryf).await?;
             let mut to = tokio::fs::OpenOptions::new().create(true).append(true).open(part).await?;
             tokio::io::copy(&mut from, &mut to).await?;
@@ -219,12 +223,77 @@ async fn fetch_range(url: &str, auth: Option<&str>, part: &Path, start: u64, end
     Ok(())
 }
 
+/// Bytes per second over the last few seconds, from (time, bytes) samples.
+struct Meter(std::collections::VecDeque<(std::time::Instant, u64)>);
+
+impl Meter {
+    fn new() -> Self {
+        Self(std::collections::VecDeque::new())
+    }
+    fn rate(&mut self, done: u64) -> f64 {
+        let now = std::time::Instant::now();
+        self.0.push_back((now, done));
+        while self.0.len() > 2 && now.duration_since(self.0[0].0).as_secs_f64() > 8.0 {
+            self.0.pop_front();
+        }
+        let (t0, d0) = self.0[0];
+        let dt = now.duration_since(t0).as_secs_f64();
+        if dt < 0.5 { 0.0 } else { done.saturating_sub(d0) as f64 / dt }
+    }
+}
+
+/// How far process `pid` has read into `path` (its file offset), from /proc.
+fn read_offset(pid: u32, path: &Path) -> Option<u64> {
+    for e in std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?.flatten() {
+        if std::fs::read_link(e.path()).ok().as_deref() == Some(path) {
+            let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{}", e.file_name().to_string_lossy())).ok()?;
+            return info.lines().find_map(|l| l.strip_prefix("pos:")).and_then(|v| v.trim().parse().ok());
+        }
+    }
+    None
+}
+
+/// SHA-256 of `path` with sha256sum, reporting how far it has read.
+async fn sha256_watched(ctx: &JobCtx, path: &Path, size: u64, p0: f64, p1: f64) -> Result<String> {
+    let path = std::fs::canonicalize(path)?;
+    let mut child = Command::new("sha256sum").arg(&path).stdout(std::process::Stdio::piped()).kill_on_drop(true).spawn().context("running sha256sum")?;
+    let pid = child.id().unwrap_or(0);
+    let mut stdout = child.stdout.take().context("sha256sum stdout")?;
+    let mut meter = Meter::new();
+    let status = loop {
+        tokio::select! {
+            st = child.wait() => break st?,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                if let Some(pos) = read_offset(pid, &path) {
+                    let rate = meter.rate(pos);
+                    ctx.transfer(|t| { t.done = pos; t.rate = rate; });
+                    ctx.progress(p0 + (p1 - p0) * pos as f64 / size.max(1) as f64);
+                }
+            }
+        }
+    };
+    let mut out = String::new();
+    tokio::io::AsyncReadExt::read_to_string(&mut stdout, &mut out).await?;
+    ensure!(status.success(), "sha256sum {} failed", path.display());
+    let h = out.split_whitespace().next().unwrap_or("").to_string();
+    ensure!(h.len() == 64, "sha256sum: unexpected output {out:?}");
+    Ok(h)
+}
+
 /// Download `name` into `dir` from `src`, verify, and move it into place.
 pub async fn fetch(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sha: Option<String>) -> Result<String> {
     sys::safe_name(&name)?;
     let dest = dir.join(&name);
     ensure!(!dest.exists(), "{} already exists", dest.display());
     std::fs::create_dir_all(&dir)?;
+    ctx.transfer(|t| {
+        t.model = name.clone();
+        t.source = match &src {
+            Source::Url(_) => "Hugging Face".into(),
+            Source::Peer(addr, _) => addr.clone(),
+        };
+        t.phase = "preparing".into();
+    });
     let (url, auth, size, sha) = match &src {
         Source::Url(u) => {
             ctx.log(format!("asking Hugging Face for the size and SHA-256 of {u}"));
@@ -244,6 +313,10 @@ pub async fn fetch(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sh
     let (free, _) = sys::disk_space(&dir);
     ensure!(free > size + (2 << 30), "not enough disk: {} GiB free, {} GiB needed", free >> 30, size >> 30);
     ctx.log(format!("{name}: {size} bytes, sha256 {sha}"));
+    ctx.transfer(|t| {
+        t.phase = "downloading".into();
+        t.total = size;
+    });
     // Peers on the LAN: 2 streams; the internet: 8 (one stream gets a
     // fraction of the link).
     let n: u64 = if matches!(src, Source::Peer(..)) { 2 } else { 8 };
@@ -264,10 +337,16 @@ pub async fn fetch(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sh
     let watch = {
         let (ctx, parts) = (ctx.clone(), parts.clone());
         tokio::spawn(async move {
+            let mut meter = Meter::new();
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let have: u64 = parts.iter().map(|p| file_len(p) + file_len(&try_path(p))).sum();
-                ctx.progress(have as f64 / size.max(1) as f64 * 0.95);
+                let have: u64 = parts.iter().map(|p| file_len(p) + file_len(&try_path(p))).sum::<u64>().min(size);
+                let rate = meter.rate(have);
+                ctx.transfer(|t| {
+                    t.done = have;
+                    t.rate = rate;
+                });
+                ctx.progress(have as f64 / size.max(1) as f64 * 0.9);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         })
     };
@@ -283,14 +362,41 @@ pub async fn fetch(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sh
     }
     let secs = started.elapsed().as_secs_f64().max(0.001);
     ctx.log(format!("downloaded in {secs:.0} s ({:.0} MB/s); joining parts", size as f64 / secs / 1e6));
+    // The other parts are appended to the first, which becomes the file.
     let tmp = dir.join(format!(".{name}.tmp"));
+    std::fs::rename(&parts[0], &tmp)?;
+    ctx.transfer(|t| {
+        t.phase = "joining".into();
+        t.done = file_len(&tmp);
+        t.rate = 0.0;
+    });
     {
-        use tokio::io::AsyncWriteExt;
-        let mut out = tokio::fs::File::create(&tmp).await?;
-        for p in &parts {
-            if p.exists() {
-                let mut f = tokio::fs::File::open(p).await?;
-                tokio::io::copy(&mut f, &mut out).await?;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut out = tokio::fs::OpenOptions::new().append(true).open(&tmp).await?;
+        let mut buf = vec![0u8; 8 << 20];
+        let (mut done, mut meter, mut last) = (file_len(&tmp), Meter::new(), std::time::Instant::now());
+        meter.rate(done);
+        for p in &parts[1..] {
+            if !p.exists() {
+                continue;
+            }
+            let mut f = tokio::fs::File::open(p).await?;
+            loop {
+                let n = f.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all(&buf[..n]).await?;
+                done += n as u64;
+                if last.elapsed().as_secs_f64() >= 1.0 {
+                    last = std::time::Instant::now();
+                    let rate = meter.rate(done);
+                    ctx.transfer(|t| {
+                        t.done = done;
+                        t.rate = rate;
+                    });
+                    ctx.progress(0.9 + 0.03 * done as f64 / size.max(1) as f64);
+                }
             }
         }
         out.flush().await?;
@@ -300,7 +406,12 @@ pub async fn fetch(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sh
     }
     ensure!(file_len(&tmp) == size, "joined file is {} bytes, expected {size}", file_len(&tmp));
     ctx.log("verifying SHA-256");
-    let got = sys::sha256(&tmp).await?;
+    ctx.transfer(|t| {
+        t.phase = "verifying".into();
+        t.done = 0;
+        t.rate = 0.0;
+    });
+    let got = sha256_watched(&ctx, &tmp, size, 0.93, 1.0).await?;
     if got != sha {
         let _ = std::fs::remove_file(&tmp);
         bail!("SHA-256 mismatch: got {got}, expected {sha} (file removed)");

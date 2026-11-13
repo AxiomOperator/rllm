@@ -451,7 +451,10 @@ async fn proxy(State(st): S, UrlPath((name, rest)): UrlPath<(String, String)>, r
 }
 
 /// POST to a peer's agent and wait for the job it starts, mirroring it.
-async fn remote_job(ctx: &JobCtx, peer: &Peer, token: &str, path: &str, body: Value) -> Result<String> {
+/// Progress of several remote jobs, combined into the local job's.
+type Shares = Option<(Arc<std::sync::Mutex<Vec<f64>>>, usize)>;
+
+async fn remote_job(ctx: &JobCtx, peer: &Peer, token: &str, path: &str, body: Value, share: Shares) -> Result<String> {
     let r = http::request(&peer.addr, "POST", path, Some(token), Some(body.to_string().as_bytes()), Duration::from_secs(60)).await?;
     let v: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
     ensure!(r.status == 200, "{}: {}", peer.name, v["error"].as_str().unwrap_or("request failed"));
@@ -475,6 +478,11 @@ async fn remote_job(ctx: &JobCtx, peer: &Peer, token: &str, path: &str, body: Va
             ctx.log(format!("{}: {}", peer.name, l.as_str().unwrap_or("")));
         }
         seen = log.len();
+        if let (Some((all, i)), Some(p)) = (&share, j["progress"].as_f64()) {
+            let mut v = all.lock().unwrap();
+            v[*i] = p;
+            ctx.progress(v.iter().sum::<f64>() / v.len().max(1) as f64);
+        }
         match j["state"].as_str() {
             Some("ok") => return Ok(j["summary"].as_str().unwrap_or("").to_string()),
             Some("failed") => bail!("{}: {}", peer.name, j["summary"].as_str().unwrap_or("failed")),
@@ -500,7 +508,7 @@ async fn fleet_deploy(State(st): S, Json(r): Json<FleetDeploy>) -> R<Json<Value>
         let mut done = Vec::new();
         for (i, t) in targets.iter().enumerate() {
             ctx.log(format!("== {} ({}/{})", t.name, i + 1, targets.len()));
-            match remote_job(&ctx, t, &token, "/api/deploy", json!({"source": r.source})).await {
+            match remote_job(&ctx, t, &token, "/api/deploy", json!({"source": r.source}), None).await {
                 Ok(s) => done.push(format!("{}: {s}", t.name)),
                 Err(e) => bail!("stopped at {}: {e:#} (done: {})", t.name, if done.is_empty() { "none".into() } else { done.join("; ") }),
             }
@@ -527,9 +535,10 @@ async fn fleet_distribute(State(st): S, Json(r): Json<FleetDistribute>) -> R<Jso
     let title = format!("copy {} from {} to {} machine(s)", r.model, r.source, targets.len());
     let id = st.jobs.spawn("fleet", title, move |ctx: JobCtx| async move {
         let mut tasks = Vec::new();
-        for t in targets {
-            let (ctx, token, body) = (ctx.clone(), token.clone(), json!({"name": r.model, "peer": r.source}));
-            tasks.push(tokio::spawn(async move { (t.name.clone(), remote_job(&ctx, &t, &token, "/api/models/fetch", body).await) }));
+        let all = Arc::new(std::sync::Mutex::new(vec![0.0; targets.len()]));
+        for (i, t) in targets.into_iter().enumerate() {
+            let (ctx, token, body, share) = (ctx.clone(), token.clone(), json!({"name": r.model, "peer": r.source}), Some((all.clone(), i)));
+            tasks.push(tokio::spawn(async move { (t.name.clone(), remote_job(&ctx, &t, &token, "/api/models/fetch", body, share).await) }));
         }
         let mut lines = Vec::new();
         let mut failed = false;
@@ -566,7 +575,7 @@ async fn fleet_tests(State(st): S, Json(r): Json<FleetTests>) -> R<Json<Value>> 
         let mut tasks = Vec::new();
         for t in targets {
             let (ctx, token, body) = (ctx.clone(), token.clone(), json!({"suite": r.suite, "model": r.model}));
-            tasks.push(tokio::spawn(async move { (t.name.clone(), remote_job(&ctx, &t, &token, "/api/tests/run", body).await) }));
+            tasks.push(tokio::spawn(async move { (t.name.clone(), remote_job(&ctx, &t, &token, "/api/tests/run", body, None).await) }));
         }
         let (mut lines, mut failed) = (Vec::new(), false);
         for t in tasks {

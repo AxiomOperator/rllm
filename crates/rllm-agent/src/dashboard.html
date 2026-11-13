@@ -58,7 +58,10 @@ dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--p
 dialog::backdrop { background: rgba(0,0,0,.4); }
 pre { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; max-height: 60vh; overflow: auto; margin: 8px 0; }
 .prog { height: 6px; background: var(--bar); border-radius: 3px; overflow: hidden; width: 120px; display: inline-block; vertical-align: middle; }
-.prog > div { height: 100%; background: var(--accent); }
+.prog > div { height: 100%; background: var(--accent); transition: width .8s linear; }
+.prog.wide { width: 100%; display: block; margin: 4px 0 2px; }
+.prog.busy > div { background: repeating-linear-gradient(90deg, var(--accent) 0 10px, transparent 10px 16px); }
+.xcell { width: 190px; font-size: 12px; }
 .toast { position: fixed; bottom: 16px; right: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; max-width: 420px; box-shadow: 0 4px 16px rgba(0,0,0,.15); z-index: 20; }
 @media (max-width: 600px) { main { padding: 10px; } .grid { grid-template-columns: 1fr; } }
 </style>
@@ -249,18 +252,73 @@ function startDialog(h) {
   $("#f_go").onclick = async () => { const r = await act("start on " + h, () => host(h, "/api/servers/start", req())); if (r) dlg.close(); };
 }
 
-function modelsView() {
-  const names = [...new Set(Object.values(modelsBy).flatMap(l => (l || []).map(m => m.name)))].sort();
-  const hosts = fleet.peers.map(p => p.name);
+// Model fetches (downloads and LAN copies) from every machine's jobs:
+// running ones, and those that finished in the last hour.
+function transfers() {
+  const now = Date.now() / 1000, out = [];
+  for (const p of fleet.peers) for (const j of status[p.name]?.jobs || [])
+    if (j.kind === "fetch" && j.transfer?.model && (j.state === "running" || now - (j.finished || 0) < 3600)) out.push({ h: p.name, ...j });
+  return out.sort((a, b) => (a.state === "running") - (b.state === "running") || a.started - b.started).reverse();
+}
+const rate = (b) => b >= 1e9 ? (b / 1e9).toFixed(2) + " GB/s" : (b / 1e6).toFixed(0) + " MB/s";
+function dur(s) { s = Math.max(0, Math.round(s)); const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, x = s % 60; return h ? `${h}h ${m}m` : m ? `${m}m ${String(x).padStart(2, "0")}s` : `${x}s`; }
+const PHASE = { preparing: "preparing", downloading: "downloading", joining: "joining parts", verifying: "verifying SHA-256" };
+// One transfer, as {pct, bar, line}: the current phase's progress.
+function xfer(j) {
+  const t = j.transfer, frac = t.total ? t.done / t.total : 0, pct = (frac * 100).toFixed(t.total ? 1 : 0);
+  const eta = t.rate > 0 && t.total ? (t.total - t.done) / t.rate : null;
+  const bar = `<span class="prog wide ${t.phase === "preparing" ? "busy" : ""}"><div style="width:${t.phase === "preparing" ? 100 : (frac * 100).toFixed(1)}%"></div></span>`;
+  let line;
+  if (j.state === "ok") line = `<span class="ok">done</span> ${esc(j.summary)}`;
+  else if (j.state === "failed") line = `<span class="bad">failed</span> ${esc(j.summary)}`;
+  else if (t.phase === "preparing") line = `${PHASE.preparing}: ${esc(j.log?.slice(-1)[0] || "")}`;
+  else line = `${PHASE[t.phase] || esc(t.phase)} ${pct}% · ${gb(t.done)} / ${gb(t.total)}${t.rate > 0 ? " · " + rate(t.rate) : ""}${eta != null ? " · " + dur(eta) + " left" : ""}`;
+  return { pct, bar, line, eta };
+}
+function transfersHtml() {
+  const xs = transfers();
+  if (!xs.length) return `<p class="sub">No downloads or copies in the last hour.</p>`;
+  const now = Date.now() / 1000;
+  return `<div class="tw"><table><tr><th>Model</th><th>To</th><th>From</th><th style="width:45%">Progress</th><th>Time</th><th></th></tr>${xs.map(j => { const x = xfer(j);
+    return `<tr><td class="mono">${esc(j.transfer.model)}</td><td>${esc(j.h)}</td><td>${esc(fleet.peers.find(p => p.addr === j.transfer.source)?.name || j.transfer.source)}</td>
+      <td>${j.state === "running" ? x.bar : ""}<div class="sub">${x.line}</div></td>
+      <td class="sub">${dur((j.finished || now) - j.started)}${j.state === "running" ? " elapsed" : ""}</td>
+      <td><button class="s" onclick="jobLog('${esc(j.h)}', ${j.id})">Log</button></td></tr>`; }).join("")}</table></div>`;
+}
+function modelsTableHtml() {
+  const hosts = fleet.peers.map(p => p.name), xs = transfers();
+  const names = [...new Set([...Object.values(modelsBy).flatMap(l => (l || []).map(m => m.name)), ...xs.filter(j => j.state === "running").map(j => j.transfer.model)])].sort();
   const info = n => { for (const h of hosts) { const m = (modelsBy[h] || []).find(m => m.name === n); if (m) return m; } };
   const rows = names.map(n => {
-    const m = info(n), have = hosts.filter(h => (modelsBy[h] || []).some(x => x.name === n)), missing = hosts.filter(h => !have.includes(h) && status[h]?.online);
-    return `<tr><td class="mono">${esc(n)}<div class="sub">${esc(m.title || "")} · ${esc(m.arch)}${m.mtp ? " · MTP" : ""} · ${gb(m.size)} file · ${gib(m.weights_bytes)} on GPU</div></td>
-      ${hosts.map(h => `<td>${have.includes(h) ? `<span class="ok">✓</span>` : `<span class="muted">–</span>`}</td>`).join("")}
-      <td>${missing.length ? `<button class="s" onclick="copyDialog('${esc(n)}')">Copy…</button>` : ""}</td></tr>`;
+    const m = info(n), have = hosts.filter(h => (modelsBy[h] || []).some(x => x.name === n));
+    const live = h => xs.find(j => j.h === h && j.transfer.model === n && (j.state === "running" || (j.state === "failed" && !have.includes(h))));
+    const missing = hosts.filter(h => !have.includes(h) && status[h]?.online && live(h)?.state !== "running");
+    const cell = h => {
+      if (have.includes(h)) return `<span class="ok">✓</span>`;
+      const j = live(h);
+      if (!j) return `<span class="muted">–</span>`;
+      if (j.state === "failed") return `<span class="bad">failed</span> <button class="s" onclick="jobLog('${esc(h)}', ${j.id})">Log</button>`;
+      const x = xfer(j), t = j.transfer;
+      return `<div class="xcell">${x.bar}<div class="sub">${t.phase === "downloading" ? `${x.pct}%${t.rate > 0 ? " · " + rate(t.rate) : ""}` : PHASE[t.phase] || esc(t.phase)}${t.phase !== "preparing" && t.phase !== "downloading" ? " " + x.pct + "%" : ""}${x.eta != null ? " · " + dur(x.eta) + " left" : ""}</div></div>`;
+    };
+    const desc = m ? `${esc(m.title || "")} · ${esc(m.arch)}${m.mtp ? " · MTP" : ""} · ${gb(m.size)} file · ${gib(m.weights_bytes)} on GPU` : "downloading";
+    return `<tr><td class="mono">${esc(n)}<div class="sub">${desc}</div></td>
+      ${hosts.map(h => `<td>${cell(h)}</td>`).join("")}
+      <td>${missing.length && have.length ? `<button class="s" onclick="copyDialog('${esc(n)}')">Copy…</button>` : ""}</td></tr>`;
   }).join("");
-  return `<section><h3>Models</h3><div class="tw"><table><tr><th>Model</th>${hosts.map(h => `<th>${esc(h)}</th>`).join("")}<th></th></tr>${rows}</table></div>
+  return `<table><tr><th>Model</th>${hosts.map(h => `<th>${esc(h)}</th>`).join("")}<th></th></tr>${rows}</table>`;
+}
+// The Models view's live parts, redrawn on every poll (the forms aren't).
+function modelsLive() {
+  const a = $("#m_table"), b = $("#m_xfers");
+  if (a) a.innerHTML = modelsTableHtml();
+  if (b) b.innerHTML = transfersHtml();
+}
+function modelsView() {
+  const hosts = fleet.peers.map(p => p.name);
+  return `<section><h3>Models</h3><div class="tw" id="m_table">${modelsTableHtml()}</div>
     <p class="sub">Copies go over the LAN from a machine that has the model, two streams per copy, checked against the source's SHA-256.</p></section>
+    <section><h3>Downloads and copies</h3><div id="m_xfers">${transfersHtml()}</div></section>
     <section><h3>Fetch from Hugging Face</h3>
     <div class="form"><label>File URL (…/resolve/main/…gguf)<input id="hf_url" size="70" placeholder="https://huggingface.co/org/repo/resolve/main/model.gguf"></label>
       <label>To<select id="hf_host">${hosts.filter(h => status[h]?.online).map(h => `<option>${esc(h)}</option>`).join("")}</select></label>
@@ -342,13 +400,19 @@ function draw(force) {
   if (!token || !fleet.peers.length) return;
   banners();
   const v = { Machines: machines, Models: modelsView, Deploy: deployView, Tests: testsView, Power: powerView, Jobs: jobsView }[tab] || machines;
-  if (FORM_VIEWS.includes(tab) && $("#view").dataset.tab === tab && !force) return;
+  if (FORM_VIEWS.includes(tab) && $("#view").dataset.tab === tab && !force) { if (tab === "Models") modelsLive(); return; }
   $("#view").dataset.tab = tab;
   $("#view").innerHTML = v();
 }
 
 refresh(true).then(() => { if (tab === "Tests") loadHistory(); if (tab === "Power") loadPower(); });
-setInterval(() => { if (!dlg.open) refresh(); }, 4000);
+// Every 4 s; every 2 s on the Models view while something is transferring.
+let lastPoll = 0;
+setInterval(() => {
+  const fast = tab === "Models" && transfers().some(j => j.state === "running");
+  if (dlg.open || Date.now() - lastPoll < (fast ? 2000 : 4000) - 100) return;
+  lastPoll = Date.now(); refresh();
+}, 1000);
 setInterval(() => { if (tab === "Tests") loadHistory(); }, 30000);
 </script>
 </body>

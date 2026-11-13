@@ -33,6 +33,21 @@ pub struct Job {
     pub started: u64,
     pub finished: Option<u64>,
     pub log: VecDeque<String>,
+    /// A file being moved (model fetches): what, how far, how fast.
+    pub transfer: Option<Transfer>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Transfer {
+    pub model: String,
+    /// "Hugging Face" or the peer's address.
+    pub source: String,
+    /// preparing, downloading, joining, verifying
+    pub phase: String,
+    pub done: u64,
+    pub total: u64,
+    /// Bytes per second over the last few seconds (current phase).
+    pub rate: f64,
 }
 
 pub fn now() -> u64 {
@@ -84,6 +99,7 @@ impl Jobs {
                 started: now(),
                 finished: None,
                 log: VecDeque::new(),
+                transfer: None,
             });
             while g.jobs.len() > MAX_JOBS {
                 // Drop the oldest finished job (running ones stay).
@@ -143,6 +159,11 @@ impl JobCtx {
 
     pub fn progress(&self, p: f64) {
         self.jobs.update(self.id, |j| j.progress = Some(p.clamp(0.0, 1.0)));
+    }
+
+    /// Set or change the job's transfer.
+    pub fn transfer(&self, f: impl FnOnce(&mut Transfer)) {
+        self.jobs.update(self.id, |j| f(j.transfer.get_or_insert_with(Transfer::default)));
     }
 
     fn finish(&self, r: anyhow::Result<String>) {

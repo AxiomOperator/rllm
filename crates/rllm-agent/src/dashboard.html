@@ -319,17 +319,24 @@ function modelsView() {
   return `<section><h3>Models</h3><div class="tw" id="m_table">${modelsTableHtml()}</div>
     <p class="sub">Copies go over the LAN from a machine that has the model, two streams per copy, checked against the source's SHA-256.</p></section>
     <section><h3>Downloads and copies</h3><div id="m_xfers">${transfersHtml()}</div></section>
-    <section><h3>Fetch from Hugging Face</h3>
-    <div class="form"><label>File URL (…/resolve/main/…gguf)<input id="hf_url" size="70" placeholder="https://huggingface.co/org/repo/resolve/main/model.gguf"></label>
+    <section><h3>Download from a URL</h3>
+    <div class="form"><label>File URL<input id="hf_url" size="70" placeholder="https://huggingface.co/org/repo/resolve/main/model.gguf" oninput="urlName()"></label>
+      <label>Save as<input id="hf_name" size="36" placeholder="model.gguf"></label>
+      <label>SHA-256 (optional)<input id="hf_sha" size="30" placeholder="from Hugging Face if empty"></label>
       <label>To<select id="hf_host">${hosts.filter(h => status[h]?.online).map(h => `<option>${esc(h)}</option>`).join("")}</select></label>
-      <button class="b" onclick="hfFetch()">Fetch</button></div>
-    <p class="sub">Downloads once, in 8 parallel ranges, checked against Hugging Face's SHA-256. Then copy it to the other machines over the LAN.</p></section>`;
+      <button class="b" onclick="hfFetch()">Download</button></div>
+    <p class="sub">Any http(s) URL. Downloads once, in 8 parallel ranges when the server allows (one stream otherwise). Hugging Face <span class="mono">…/resolve/…</span> URLs are checked against Hugging Face's SHA-256; other URLs against the SHA-256 you give, or by size only. Then copy it to the other machines over the LAN.</p></section>`;
+}
+function urlName() {
+  let n = "";
+  try { n = decodeURIComponent(new URL($("#hf_url").value.trim()).pathname.split("/").pop()); } catch (e) {}
+  $("#hf_name").value = n;
 }
 function hfFetch() {
-  const url = $("#hf_url").value.trim(), h = $("#hf_host").value;
-  const name = url.split("/").pop().split("?")[0];
-  if (!name.endsWith(".gguf")) { toast("the URL should end in .gguf", true); return; }
-  act("fetch " + name + " on " + h, () => host(h, "/api/models/fetch", { name, url }));
+  const url = $("#hf_url").value.trim(), h = $("#hf_host").value, name = $("#hf_name").value.trim(), sha256 = $("#hf_sha").value.trim() || null;
+  if (!/^https?:\/\//.test(url)) { toast("give an http(s) URL", true); return; }
+  if (!name.endsWith(".gguf")) { toast("the file name should end in .gguf", true); return; }
+  act("download " + name + " on " + h, () => host(h, "/api/models/fetch", { name, url, sha256 }));
 }
 function copyDialog(n) {
   const hosts = fleet.peers.map(p => p.name).filter(h => status[h]?.online);

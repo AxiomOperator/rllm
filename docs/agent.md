@@ -58,8 +58,11 @@ hostname), `peers`, `bin_dir` (default `~/rllm-bin`: `rllm`, `parity`,
   refuses to start an rllm server next to one.
 - **Models**: which file is on which machine. A copy goes over the LAN
   from a machine that has it (two ranged streams, checked against the
-  source's SHA-256); a Hugging Face URL is downloaded once in 8 parallel
-  ranges and checked against Hugging Face's LFS SHA-256. Each range
+  source's SHA-256); any http(s) URL is downloaded once, in 8 parallel
+  ranges if the server serves ranges (one stream if not), and checked
+  against Hugging Face's LFS SHA-256 for a Hugging Face `.../resolve/...`
+  URL, otherwise against the SHA-256 given with the request (or by size
+  only, the computed hash then shown). Each range
   attempt goes to its own scratch file and is kept only on an HTTP 206 for
   exactly the requested offset; nothing replaces the file until the hash
   matches.

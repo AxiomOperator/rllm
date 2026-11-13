@@ -1,5 +1,5 @@
 //! `rllm agent`: runs on each machine of a fleet. It manages rllm servers
-//! (systemd user units), lists and fetches models (from Hugging Face or
+//! (systemd user units), lists and fetches models (from a URL or
 //! another agent over the LAN, SHA-256 checked), deploys binaries (gated on
 //! the GPU parity tests), shows power and memory, runs test suites (also on
 //! a schedule), and keeps llama-server from running. It serves a dashboard
@@ -242,7 +242,8 @@ struct FetchReq {
     name: String,
     /// A peer's name, or ...
     peer: Option<String>,
-    /// ... a Hugging Face `.../resolve/<rev>/<file>` URL.
+    /// ... an http(s) URL (Hugging Face `.../resolve/...` URLs bring their
+    /// own SHA-256).
     url: Option<String>,
     sha256: Option<String>,
 }

@@ -148,8 +148,38 @@ pub fn plan(m: &ModelInfo, ctx: u64, parallel: u64, kv: KvType, kv_tokens: Optio
 pub enum Source {
     /// A peer agent: (addr, token).
     Peer(String, String),
-    /// A Hugging Face `.../resolve/<rev>/<file>` URL.
+    /// An http(s) URL. Hugging Face `.../resolve/<rev>/<file>` URLs get
+    /// their SHA-256 from the Hub's API.
     Url(String),
+}
+
+fn is_hf(url: &str) -> bool {
+    url.starts_with("https://huggingface.co/") && url.contains("/resolve/")
+}
+
+/// Size of the file at `url` and whether its server serves byte ranges:
+/// a GET for byte 0 that answers 206 with a Content-Range total, or a 200
+/// with a Content-Length (one stream then).
+async fn url_meta(url: &str) -> Result<(u64, bool)> {
+    let (ok, out) = sys::run("curl", &["-sSL", "--max-time", "60", "-r", "0-0", "-D", "-", "-o", "/dev/null", url]).await?;
+    ensure!(ok, "{url}: {}", out.trim());
+    // The headers of every hop; the last response is the file's.
+    let last = out.split("\r\n\r\n").map(str::trim_start).filter(|b| b.starts_with("HTTP/")).last().unwrap_or("");
+    let code: u16 = last.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let header = |name: &str| {
+        last.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+        })
+    };
+    match code {
+        206 => {
+            let total = header("content-range").and_then(|r| r.rsplit('/').next().and_then(|t| t.parse().ok()));
+            Ok((total.context("206 without a Content-Range total")?, true))
+        }
+        200 => Ok((header("content-length").and_then(|l| l.parse().ok()).context("the server didn't say how big the file is")?, false)),
+        c => bail!("{url}: HTTP {c}"),
+    }
 }
 
 /// Expected (size, sha256) of a Hugging Face file, from the repo's tree API.
@@ -190,13 +220,27 @@ fn file_len(p: &Path) -> u64 {
 
 /// Fetch byte range [start, end] of `url` into `part`, resuming; an attempt
 /// is kept only if the server answered 206 for exactly the requested offset.
-async fn fetch_range(url: &str, auth: Option<&str>, part: &Path, start: u64, end: u64) -> Result<()> {
+async fn fetch_range(url: &str, auth: Option<&str>, part: &Path, start: u64, end: u64, ranged: bool) -> Result<()> {
     let len = end - start + 1;
     let tryf = try_path(part);
     let mut failures = 0;
     while file_len(part) < len {
         let got = file_len(part);
         let mut c = Command::new("curl");
+        if !ranged {
+            // No ranges: the whole file in one go, from the start each try.
+            let out = c.args(["-sSL", "--max-time", "21600", "-o"]).arg(&tryf).args(["-w", "%{http_code}", url]).output().await.context("running curl")?;
+            let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if code == "200" && file_len(&tryf) == len {
+                tokio::fs::rename(&tryf, part).await?;
+            } else {
+                let _ = tokio::fs::remove_file(&tryf).await;
+                failures += 1;
+                ensure!(failures < 5, "giving up after 5 failed attempts (last HTTP {code}, {} of {len} bytes)", file_len(&tryf));
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            continue;
+        }
         c.args(["-sSL", "--max-time", "1800", "-o"]).arg(&tryf).args(["-w", "%{http_code}", "-r", &format!("{}-{}", start + got, end)]);
         if let Some(a) = auth {
             c.args(["-H", &format!("Authorization: Bearer {a}")]);
@@ -289,16 +333,29 @@ pub async fn fetch(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sh
     ctx.transfer(|t| {
         t.model = name.clone();
         t.source = match &src {
-            Source::Url(_) => "Hugging Face".into(),
+            Source::Url(u) if is_hf(u) => "Hugging Face".into(),
+            Source::Url(u) => u.split('/').nth(2).unwrap_or(u).to_string(),
             Source::Peer(addr, _) => addr.clone(),
         };
         t.phase = "preparing".into();
     });
-    let (url, auth, size, sha) = match &src {
-        Source::Url(u) => {
+    let (url, auth, size, sha, ranged) = match &src {
+        Source::Url(u) if is_hf(u) => {
             ctx.log(format!("asking Hugging Face for the size and SHA-256 of {u}"));
             let (size, sha) = hf_meta(u).await?;
-            (u.clone(), None, size, want_sha.unwrap_or(sha))
+            (u.clone(), None, size, Some(want_sha.unwrap_or(sha)), true)
+        }
+        Source::Url(u) => {
+            ensure!(u.starts_with("http://") || u.starts_with("https://"), "only http(s) URLs");
+            ctx.log(format!("asking {u} for the file's size"));
+            let (size, ranged) = url_meta(u).await?;
+            if !ranged {
+                ctx.log("the server doesn't serve byte ranges: one stream");
+            }
+            if want_sha.is_none() {
+                ctx.log("no SHA-256 given: the download is checked by size only");
+            }
+            (u.clone(), None, size, want_sha, ranged)
         }
         Source::Peer(addr, token) => {
             ctx.log(format!("asking {addr} for the size and SHA-256 of {name} (hashing may take a minute)"));
@@ -307,19 +364,23 @@ pub async fn fetch(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sh
             let j: serde_json::Value = serde_json::from_slice(&v.body)?;
             let size = j["size"].as_u64().context("no size")?;
             let sha = j["sha256"].as_str().context("no sha256")?.to_string();
-            (format!("http://{addr}/api/files/models/{name}"), Some(token.clone()), size, want_sha.unwrap_or(sha))
+            (format!("http://{addr}/api/files/models/{name}"), Some(token.clone()), size, Some(want_sha.unwrap_or(sha)), true)
         }
     };
     let (free, _) = sys::disk_space(&dir);
     ensure!(free > size + (2 << 30), "not enough disk: {} GiB free, {} GiB needed", free >> 30, size >> 30);
-    ctx.log(format!("{name}: {size} bytes, sha256 {sha}"));
+    let sha = sha.map(|h| h.trim().to_ascii_lowercase());
+    if let Some(h) = &sha {
+        ensure!(h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()), "not a SHA-256: {h:?}");
+    }
+    ctx.log(format!("{name}: {size} bytes, sha256 {}", sha.as_deref().unwrap_or("unknown")));
     ctx.transfer(|t| {
         t.phase = "downloading".into();
         t.total = size;
     });
     // Peers on the LAN: 2 streams; the internet: 8 (one stream gets a
     // fraction of the link).
-    let n: u64 = if matches!(src, Source::Peer(..)) { 2 } else { 8 };
+    let n: u64 = if !ranged { 1 } else if matches!(src, Source::Peer(..)) { 2 } else { 8 };
     let chunk = size.div_ceil(n);
     let parts: Vec<PathBuf> = (0..n).map(|i| dir.join(format!(".{name}.part{i}"))).collect();
     let started = std::time::Instant::now();
@@ -331,7 +392,7 @@ pub async fn fetch(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sh
         }
         let end = (start + chunk).min(size) - 1;
         let (url, auth, part) = (url.clone(), auth.clone(), part.clone());
-        tasks.push(tokio::spawn(async move { fetch_range(&url, auth.as_deref(), &part, start, end).await }));
+        tasks.push(tokio::spawn(async move { fetch_range(&url, auth.as_deref(), &part, start, end, ranged).await }));
     }
     // Progress while the ranges download.
     let watch = {
@@ -405,18 +466,21 @@ pub async fn fetch(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sh
         let _ = std::fs::remove_file(p);
     }
     ensure!(file_len(&tmp) == size, "joined file is {} bytes, expected {size}", file_len(&tmp));
-    ctx.log("verifying SHA-256");
+    ctx.log(if sha.is_some() { "verifying SHA-256" } else { "computing SHA-256" });
     ctx.transfer(|t| {
         t.phase = "verifying".into();
         t.done = 0;
         t.rate = 0.0;
     });
     let got = sha256_watched(&ctx, &tmp, size, 0.93, 1.0).await?;
-    if got != sha {
-        let _ = std::fs::remove_file(&tmp);
-        bail!("SHA-256 mismatch: got {got}, expected {sha} (file removed)");
+    if let Some(sha) = &sha {
+        if got != *sha {
+            let _ = std::fs::remove_file(&tmp);
+            bail!("SHA-256 mismatch: got {got}, expected {sha} (file removed)");
+        }
     }
     std::fs::rename(&tmp, &dest)?;
     sys::remember_sha256(&dest, &got);
-    Ok(format!("{name}: {:.1} GB in {secs:.0} s, SHA-256 verified", size as f64 / 1e9))
+    let check = if sha.is_some() { "SHA-256 verified".to_string() } else { format!("SHA-256 {got} (not checked: none given)") };
+    Ok(format!("{name}: {:.1} GB in {secs:.0} s, {check}", size as f64 / 1e9))
 }

@@ -22,6 +22,36 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum AgentCmd {
+    /// Run the agent (`rllm agent install` runs it as a systemd user service).
+    Run {
+        /// Default: ~/.config/rllm/agent.json.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Write a config: a new token (or --token, the same on every machine) and the peers.
+    Init {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        token: Option<String>,
+        /// A machine of the fleet, name=host:port (repeat; include this one).
+        #[arg(long)]
+        peer: Vec<String>,
+        /// API key for the servers the agent starts.
+        #[arg(long)]
+        serve_api_key: Option<String>,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Install and start the agent as a systemd user service.
+    Install {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Print GGUF metadata and tensor list.
     Inspect {
@@ -129,6 +159,12 @@ enum Cmd {
     /// system memory, KV cache size and type, parallel requests, draft
     /// model, host cache. `--measure` loads the model to confirm them.
     Tune(tune::TuneArgs),
+    /// Fleet agent: manage rllm servers, models, binaries, power and tests
+    /// on this machine, and serve a dashboard for every machine it knows.
+    Agent {
+        #[command(subcommand)]
+        action: AgentCmd,
+    },
     /// Perplexity over a text file, same method as llama.cpp's llama-perplexity:
     /// the text is tokenized once and cut into `ctx`-token chunks; each chunk
     /// starts with BOS (if the model uses one) and is scored on its second half.
@@ -359,7 +395,7 @@ fn check_args(cmd: &Cmd) -> Result<()> {
             check_arg("block-size", *block_size, 1, MAX_BLOCK_SIZE)?;
             check_arg("prefill-chunk", *prefill_chunk, 1, MAX_TOKENS)?;
         }
-        Cmd::Inspect { .. } | Cmd::Tokenize { .. } | Cmd::Tune(_) => {}
+        Cmd::Inspect { .. } | Cmd::Tokenize { .. } | Cmd::Tune(_) | Cmd::Agent { .. } => {}
     }
     Ok(())
 }
@@ -393,6 +429,13 @@ fn real_main() -> Result<()> {
     match cmd {
         Cmd::Inspect { model, tensors } => inspect(&model, tensors),
         Cmd::Tune(args) => tune::tune(args),
+        Cmd::Agent { action } => match action {
+            AgentCmd::Run { config } => rllm_agent::run(&config.unwrap_or_else(rllm_agent::default_config_path)),
+            AgentCmd::Init { config, token, peer, serve_api_key, force } => {
+                rllm_agent::init(&config.unwrap_or_else(rllm_agent::default_config_path), token, &peer, serve_api_key, force)
+            }
+            AgentCmd::Install { config } => rllm_agent::install(&config.unwrap_or_else(rllm_agent::default_config_path)),
+        },
         Cmd::Tokenize { model, text } => tokenize(&model, &text),
         Cmd::Run(args) => {
             let device = args.device.clone();

@@ -1,0 +1,19 @@
+[package]
+name = "rllm-agent"
+description = "Fleet agent and dashboard: manage rllm servers, models, binaries, power and tests on several machines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rllm-core.workspace = true
+rllm-gguf.workspace = true
+rllm-model.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["process", "fs", "io-util"] }
+tower-http = { workspace = true, features = ["fs"] }
+tower.workspace = true
+libc.workspace = true

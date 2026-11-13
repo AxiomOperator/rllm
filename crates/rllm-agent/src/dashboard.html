@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rllm fleet</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1b1f24; --muted: #5f6b7a; --line: #dde2e8;
+  --accent: #2563eb; --ok: #15803d; --warn: #b45309; --bad: #b91c1c; --bar: #e8ecf1;
+  --chip: #eef2f7; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0f1216; --panel: #171b21; --ink: #e6e9ee; --muted: #94a0b0; --line: #2a313b;
+    --accent: #6ea0ff; --ok: #4ade80; --warn: #fbbf24; --bad: #f87171; --bar: #232a33; --chip: #222833; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-size: 14px; }
+header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5; }
+header h1 { font-size: 17px; margin: 0 12px 0 0; }
+nav { display: flex; gap: 4px; flex-wrap: wrap; }
+nav button { background: none; border: 1px solid transparent; color: var(--muted); padding: 6px 10px; border-radius: 6px; cursor: pointer; font: inherit; }
+nav button.on { color: var(--ink); border-color: var(--line); background: var(--chip); }
+.grow { flex: 1; }
+input, select, button, textarea { font: inherit; color: inherit; }
+input, select, textarea { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+button.b { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+button.s { background: var(--chip); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button.danger { background: var(--bad); color: #fff; border: 0; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button:disabled { opacity: .5; cursor: default; }
+main { padding: 16px; max-width: 1500px; margin: 0 auto; }
+.banner { background: var(--bad); color: #fff; padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 12px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; min-width: 0; }
+.card h2 { font-size: 15px; margin: 0; display: flex; align-items: center; gap: 8px; }
+.sub { color: var(--muted); font-size: 12px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; background: var(--muted); flex: none; }
+.dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); } .dot.warn { background: var(--warn); }
+.meter { height: 8px; background: var(--bar); border-radius: 4px; overflow: hidden; margin: 4px 0 2px; }
+.meter > div { height: 100%; background: var(--accent); }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin-top: 8px; font-size: 13px; }
+.kv span:nth-child(odd) { color: var(--muted); }
+.srv { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; }
+.srv .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 4px 0; }
+.mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+.chip { background: var(--chip); border-radius: 10px; padding: 1px 8px; font-size: 12px; }
+table { border-collapse: collapse; width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; }
+.tw { overflow-x: auto; }
+.ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); } .muted { color: var(--muted); }
+section { margin-bottom: 22px; }
+section > h3 { font-size: 14px; margin: 0 0 8px; }
+.form { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; margin: 8px 0; }
+.form label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+.checks { display: flex; gap: 10px; flex-wrap: wrap; }
+dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--ink); max-width: min(900px, 95vw); width: 100%; }
+dialog::backdrop { background: rgba(0,0,0,.4); }
+pre { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; max-height: 60vh; overflow: auto; margin: 8px 0; }
+.prog { height: 6px; background: var(--bar); border-radius: 3px; overflow: hidden; width: 120px; display: inline-block; vertical-align: middle; }
+.prog > div { height: 100%; background: var(--accent); }
+.toast { position: fixed; bottom: 16px; right: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; max-width: 420px; box-shadow: 0 4px 16px rgba(0,0,0,.15); z-index: 20; }
+@media (max-width: 600px) { main { padding: 10px; } .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>rllm fleet</h1>
+  <nav id="nav"></nav>
+  <span class="grow"></span>
+  <span class="sub" id="updated"></span>
+  <input id="token" type="password" placeholder="agent token" size="18" autocomplete="off">
+</header>
+<main>
+  <div id="banners"></div>
+  <div id="view"></div>
+</main>
+<dialog id="dlg"><div id="dlgbody"></div><div style="text-align:right"><button class="s" onclick="dlg.close()">Close</button></div></dialog>
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const gib = (b) => b == null ? "–" : (b / 1073741824).toFixed(b >= 10 * 1073741824 ? 0 : 1) + " GiB";
+const gb = (b) => b == null ? "–" : (b / 1e9).toFixed(1) + " GB";
+const ago = (s) => s == null ? "–" : s < 90 ? s + " s" : s < 5400 ? Math.round(s / 60) + " min" : s < 172800 ? Math.round(s / 3600) + " h" : Math.round(s / 86400) + " d";
+const when = (t) => t ? new Date(t * 1000).toLocaleString() : "–";
+let token = ""; try { token = localStorage.getItem("rllm-agent-token") || ""; } catch (e) {}
+// A link may carry the token in its fragment (never sent to the server):
+// #token=...[&tab=...]. Keep it and take it out of the address bar.
+if (location.hash.startsWith("#token=")) {
+  const q = new URLSearchParams(location.hash.slice(1));
+  token = q.get("token") || "";
+  try { localStorage.setItem("rllm-agent-token", token); } catch (e) {}
+  history.replaceState(null, "", location.pathname + (q.get("tab") ? "#" + q.get("tab") : ""));
+}
+$("#token").value = token;
+$("#token").addEventListener("change", e => { token = e.target.value.trim(); try { localStorage.setItem("rllm-agent-token", token); } catch (e) {} refresh(true); });
+
+async function api(path, body) {
+  const r = await fetch(path, { method: body === undefined ? "GET" : "POST", headers: { "Authorization": "Bearer " + token, ...(body === undefined ? {} : { "Content-Type": "application/json" }) }, body: body === undefined ? undefined : JSON.stringify(body) });
+  let j = null; try { j = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+  return j;
+}
+const host = (h, path, body) => api("/fleet/" + encodeURIComponent(h) + path, body);
+
+function toast(msg, bad) {
+  const t = document.createElement("div"); t.className = "toast"; t.innerHTML = `<span class="${bad ? "bad" : ""}">${esc(msg)}</span>`;
+  document.body.appendChild(t); setTimeout(() => t.remove(), bad ? 9000 : 4000);
+}
+async function act(label, fn) {
+  try { const r = await fn(); toast(label + ": " + (r && (r.ok || (r.job ? "started job " + r.job : "")) || "done")); refresh(true); return r; }
+  catch (e) { toast(label + ": " + e.message, true); }
+}
+const dlg = $("#dlg");
+function show(html) { $("#dlgbody").innerHTML = html; if (!dlg.open) dlg.showModal(); }
+
+// State
+let fleet = { self: "", peers: [], suites: [] }, status = {}, modelsBy = {}, testHistory = {}, power = {};
+const tabs = ["Machines", "Models", "Deploy", "Tests", "Power", "Jobs"];
+let tab = location.hash.slice(1) || "Machines";
+function navDraw() { $("#nav").innerHTML = tabs.map(t => `<button class="${t === tab ? "on" : ""}" onclick="go('${t}')">${t}</button>`).join(""); }
+function go(t) { tab = t; location.hash = t; navDraw(); draw(true); if (t === "Power") loadPower(); if (t === "Tests") loadHistory(); if (t === "Models") loadModels().then(() => draw(true)); }
+navDraw();
+
+async function refresh(all) {
+  if (!token) { $("#view").innerHTML = `<div class="card">Enter the agent token (from <span class="mono">~/.config/rllm/agent.json</span>) at the top right.</div>`; return; }
+  try { fleet = await api("/api/fleet"); } catch (e) { $("#view").innerHTML = `<div class="card bad">${esc(e.message)}</div>`; return; }
+  await Promise.all(fleet.peers.map(async p => {
+    try { status[p.name] = await host(p.name, "/api/status"); status[p.name].online = true; }
+    catch (e) { status[p.name] = { online: false, error: e.message }; }
+  }));
+  if (all || tab === "Models" || !Object.keys(modelsBy).length) await loadModels();
+  $("#updated").textContent = "updated " + new Date().toLocaleTimeString();
+  draw(all);
+}
+async function loadModels() {
+  await Promise.all(fleet.peers.map(async p => { try { modelsBy[p.name] = await host(p.name, "/api/models"); } catch (e) { modelsBy[p.name] = null; } }));
+}
+async function loadHistory() {
+  await Promise.all(fleet.peers.map(async p => { try { testHistory[p.name] = await host(p.name, "/api/tests/history"); } catch (e) { testHistory[p.name] = []; } }));
+  draw(true);
+}
+async function loadPower() {
+  await Promise.all(fleet.peers.map(async p => { try { power[p.name] = await host(p.name, "/api/power"); } catch (e) { power[p.name] = { error: e.message }; } }));
+  draw(true);
+}
+
+function banners() {
+  const out = [];
+  for (const p of fleet.peers) {
+    const s = status[p.name];
+    if (!s || !s.online) continue;
+    const l = s.llama;
+    if (l && (l.processes.length || l.service_active)) {
+      out.push(`<div class="banner"><b>llama-server running on ${esc(p.name)}</b><span>${l.processes.map(x => esc(x.args.split(" ").find(a => a.endsWith(".gguf")) || "llama-server")).join(", ")}</span><span class="grow"></span><button class="s" onclick="act('stop llama-server on ${esc(p.name)}', () => host('${esc(p.name)}', '/api/llama/stop', {}))">Stop and disable</button></div>`);
+    }
+    for (const v of s.servers || []) if (v.state.startsWith("failed"))
+      out.push(`<div class="banner" style="background:var(--warn)"><b>${esc(p.name)}: server on :${v.port} ${esc(v.state)}</b><span class="grow"></span><button class="s" onclick="showLog('${esc(p.name)}', ${v.port})">Log</button><button class="s" onclick="act('clear', () => host('${esc(p.name)}', '/api/servers/stop', {port: ${v.port}}))">Clear</button></div>`);
+  }
+  $("#banners").innerHTML = out.join("");
+}
+
+function majorityBuild() {
+  const c = {};
+  for (const p of fleet.peers) { const h = status[p.name]?.binaries?.rllm_sha256; if (h) c[h] = (c[h] || 0) + 1; }
+  return Object.entries(c).sort((a, b) => b[1] - a[1])[0]?.[0];
+}
+
+function machineCard(p) {
+  const s = status[p.name];
+  if (!s || !s.online) return `<div class="card"><h2><span class="dot bad"></span>${esc(p.name)}</h2><div class="sub">${esc(p.addr)}</div><p class="bad">${esc(s ? s.error : "loading")}</p></div>`;
+  const h = s.host, g = h.gpu || {};
+  const used = g.mem_total ? g.mem_used / g.mem_total : 0;
+  const build = s.binaries?.rllm_sha256, maj = majorityBuild();
+  const srv = (s.servers || []).map(v => `
+    <div class="row"><span class="dot ${v.state === "running" ? (v.healthy ? "ok" : "warn") : "bad"}"></span>
+      <b>:${v.port}</b><span class="mono">${esc(v.model || "?")}</span>
+      <span class="chip">${esc(v.healthy ? "ready" : v.state)}</span>
+      ${v.tok_per_s != null ? `<span class="chip">${v.tok_per_s.toFixed(1)} tok/s</span>` : ""}
+      ${v.draft_accept != null ? `<span class="chip">MTP ${(v.draft_accept * 100).toFixed(0)}%</span>` : ""}
+      ${v.requests_running ? `<span class="chip">${v.requests_running} running</span>` : ""}
+      ${v.requests_finished != null ? `<span class="sub">${v.requests_finished} done</span>` : ""}
+      <span class="sub">${ago(v.uptime_s)}${v.managed ? "" : " · started by hand"}</span>
+      <span class="grow"></span>
+      ${v.managed ? `<button class="s" onclick="showLog('${esc(p.name)}', ${v.port})">Log</button>` : ""}
+      <button class="danger" onclick="if(confirm('Stop the server on ${esc(p.name)}:${v.port}?')) act('stop :${v.port}', () => host('${esc(p.name)}', '/api/servers/stop', {port: ${v.port}}))">Stop</button>
+    </div>`).join("");
+  const running = (s.jobs || []).filter(j => j.state === "running");
+  return `<div class="card">
+    <h2><span class="dot ok"></span>${esc(p.name)} <span class="sub">${esc(h.vendor)} ${esc(h.product)}</span></h2>
+    <div class="sub">${esc(p.addr)} · up ${ago(h.uptime_s)} · ${esc(h.device)}</div>
+    <div style="margin-top:8px">GPU memory ${gib(g.mem_used)} of ${gib(g.mem_total)}</div>
+    <div class="meter"><div style="width:${(used * 100).toFixed(1)}%"></div></div>
+    <div class="kv">
+      <span>Free for a new server</span><span>${gib(s.usable_bytes)}</span>
+      <span>Power / clock</span><span>${g.socket_watts != null ? g.socket_watts.toFixed(0) + " W" : "–"} · ${g.gfx_mhz != null ? g.gfx_mhz + " MHz" : "–"} · ${g.busy_pct != null ? g.busy_pct + "% busy" : ""}</span>
+      <span>GPU temp</span><span>${g.temp_c != null ? g.temp_c.toFixed(0) + " °C" : "–"}</span>
+      <span>RAM available</span><span>${gib(h.ram_available)} of ${gib(h.ram_total)}</span>
+      <span>Disk free</span><span>${gib(h.disk_free)}</span>
+      <span>Build</span><span class="mono ${build && maj && build !== maj ? "warn" : ""}">${build ? build.slice(0, 12) : "–"}${build && maj && build !== maj ? " (differs)" : ""}</span>
+    </div>
+    <div class="srv">${srv || `<span class="sub">no servers</span>`}
+      <div class="row"><button class="b" onclick="startDialog('${esc(p.name)}')">Start a server</button>
+      <button class="s" onclick="staleDialog('${esc(p.name)}')">Leftover processes</button></div>
+    </div>
+    ${running.map(j => `<div class="sub">${esc(j.title)} <span class="prog"><div style="width:${((j.progress || 0) * 100).toFixed(0)}%"></div></span></div>`).join("")}
+  </div>`;
+}
+
+function machines() { return `<div class="grid">${fleet.peers.map(machineCard).join("")}</div>`; }
+
+async function showLog(h, port) {
+  try { const r = await host(h, `/api/servers/${port}/log`); show(`<h3>${esc(h)} :${port}</h3><pre class="mono">${esc(r.log)}</pre>`); }
+  catch (e) { toast(e.message, true); }
+}
+async function staleDialog(h) {
+  try {
+    const r = await host(h, "/api/stale");
+    show(`<h3>Leftover processes on ${esc(h)}</h3><pre class="mono">${esc(r.output)}</pre>
+      <button class="danger" onclick="act('clean up ${esc(h)}', () => host('${esc(h)}', '/api/stale/kill', {services: false})).then(() => staleDialog('${esc(h)}'))">Stop leftovers</button>
+      <span class="sub">rllm servers on other ports are kept.</span>`);
+  } catch (e) { toast(e.message, true); }
+}
+
+function startDialog(h) {
+  const ms = (modelsBy[h] || []).filter(m => !m.error);
+  if (!ms.length) { toast(h + " has no models", true); return; }
+  const used = new Set((status[h]?.servers || []).map(s => s.port));
+  let port = 8096; while (used.has(port)) port++;
+  show(`<h3>Start a server on ${esc(h)}</h3>
+    <div class="form">
+      <label>Model<select id="f_model">${ms.map(m => `<option>${esc(m.name)}</option>`).join("")}</select></label>
+      <label>Port<input id="f_port" type="number" value="${port}" min="1024" max="65535" style="width:90px"></label>
+      <label>Context<input id="f_ctx" type="number" value="32768" min="256" step="1024" style="width:100px"></label>
+      <label>Parallel<input id="f_par" type="number" value="8" min="1" max="8" style="width:70px"></label>
+      <label>KV cache<select id="f_kv"><option>q8</option><option>f16</option></select></label>
+      <label>MTP<select id="f_mtp"><option value="1">on</option><option value="0">off</option></select></label>
+    </div>
+    <div id="f_plan" class="sub">…</div>
+    <p><button class="b" id="f_go">Start</button> <label class="sub"><input type="checkbox" id="f_force"> start even if the estimate says it won't fit</label></p>`);
+  const req = () => ({ model: $("#f_model").value, port: +$("#f_port").value, ctx: +$("#f_ctx").value, parallel: +$("#f_par").value, kv_type: $("#f_kv").value, mtp: $("#f_mtp").value === "1", force: $("#f_force").checked });
+  const planIt = async () => {
+    try { const p = await host(h, "/api/servers/plan", req()); $("#f_plan").innerHTML = `<span class="${p.fits ? "ok" : "bad"}">${p.fits ? "Fits" : "Won't fit"}</span>: ${esc(p.detail)}`; }
+    catch (e) { $("#f_plan").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
+  };
+  ["#f_model", "#f_ctx", "#f_par", "#f_kv", "#f_mtp"].forEach(s => $(s).addEventListener("change", planIt));
+  planIt();
+  $("#f_go").onclick = async () => { const r = await act("start on " + h, () => host(h, "/api/servers/start", req())); if (r) dlg.close(); };
+}
+
+function modelsView() {
+  const names = [...new Set(Object.values(modelsBy).flatMap(l => (l || []).map(m => m.name)))].sort();
+  const hosts = fleet.peers.map(p => p.name);
+  const info = n => { for (const h of hosts) { const m = (modelsBy[h] || []).find(m => m.name === n); if (m) return m; } };
+  const rows = names.map(n => {
+    const m = info(n), have = hosts.filter(h => (modelsBy[h] || []).some(x => x.name === n)), missing = hosts.filter(h => !have.includes(h) && status[h]?.online);
+    return `<tr><td class="mono">${esc(n)}<div class="sub">${esc(m.title || "")} · ${esc(m.arch)}${m.mtp ? " · MTP" : ""} · ${gb(m.size)} file · ${gib(m.weights_bytes)} on GPU</div></td>
+      ${hosts.map(h => `<td>${have.includes(h) ? `<span class="ok">✓</span>` : `<span class="muted">–</span>`}</td>`).join("")}
+      <td>${missing.length ? `<button class="s" onclick="copyDialog('${esc(n)}')">Copy…</button>` : ""}</td></tr>`;
+  }).join("");
+  return `<section><h3>Models</h3><div class="tw"><table><tr><th>Model</th>${hosts.map(h => `<th>${esc(h)}</th>`).join("")}<th></th></tr>${rows}</table></div>
+    <p class="sub">Copies go over the LAN from a machine that has the model, two streams per copy, checked against the source's SHA-256.</p></section>
+    <section><h3>Fetch from Hugging Face</h3>
+    <div class="form"><label>File URL (…/resolve/main/…gguf)<input id="hf_url" size="70" placeholder="https://huggingface.co/org/repo/resolve/main/model.gguf"></label>
+      <label>To<select id="hf_host">${hosts.filter(h => status[h]?.online).map(h => `<option>${esc(h)}</option>`).join("")}</select></label>
+      <button class="b" onclick="hfFetch()">Fetch</button></div>
+    <p class="sub">Downloads once, in 8 parallel ranges, checked against Hugging Face's SHA-256. Then copy it to the other machines over the LAN.</p></section>`;
+}
+function hfFetch() {
+  const url = $("#hf_url").value.trim(), h = $("#hf_host").value;
+  const name = url.split("/").pop().split("?")[0];
+  if (!name.endsWith(".gguf")) { toast("the URL should end in .gguf", true); return; }
+  act("fetch " + name + " on " + h, () => host(h, "/api/models/fetch", { name, url }));
+}
+function copyDialog(n) {
+  const hosts = fleet.peers.map(p => p.name).filter(h => status[h]?.online);
+  const have = hosts.filter(h => (modelsBy[h] || []).some(x => x.name === n));
+  show(`<h3>Copy ${esc(n)}</h3><div class="form"><label>From<select id="c_src">${have.map(h => `<option>${esc(h)}</option>`).join("")}</select></label></div>
+    <div class="checks">${hosts.filter(h => !have.includes(h)).map(h => `<label><input type="checkbox" class="c_t" value="${esc(h)}" checked> ${esc(h)}</label>`).join("")}</div>
+    <p><button class="b" onclick="act('copy ${esc(n)}', () => api('/api/fleet/distribute', {model: '${esc(n)}', source: $('#c_src').value, targets: [...document.querySelectorAll('.c_t:checked')].map(x => x.value)})).then(r => r && dlg.close())">Copy</button></p>`);
+}
+
+function deployView() {
+  const hosts = fleet.peers.map(p => p.name), maj = majorityBuild();
+  const rows = hosts.map(h => { const b = status[h]?.binaries || {};
+    return `<tr><td>${esc(h)}</td><td class="mono ${b.rllm_sha256 && b.rllm_sha256 !== maj ? "warn" : ""}">${b.rllm_sha256 ? b.rllm_sha256.slice(0, 16) : "–"}</td><td>${when(b.rllm_modified)}</td>
+      <td><button class="s" onclick="if(confirm('Restore the binaries ${esc(h)} had before its last deploy?')) act('rollback ${esc(h)}', () => host('${esc(h)}', '/api/deploy/rollback', {}))">Roll back</button></td></tr>`; }).join("");
+  return `<section><h3>Builds</h3><div class="tw"><table><tr><th>Machine</th><th>rllm (SHA-256)</th><th>Installed</th><th></th></tr>${rows}</table></div></section>
+    <section><h3>Rolling deploy</h3><div class="form"><label>Source build<select id="d_src">${hosts.filter(h => status[h]?.online).map(h => `<option>${esc(h)}</option>`).join("")}</select></label></div>
+    <div class="checks">${hosts.filter(h => status[h]?.online).map(h => `<label><input type="checkbox" class="d_t" value="${esc(h)}" checked> ${esc(h)}</label>`).join("")}</div>
+    <p><button class="b" onclick="if(confirm('Deploy to the checked machines, one at a time?')) act('rolling deploy', () => api('/api/fleet/deploy', {source: $('#d_src').value, targets: [...document.querySelectorAll('.d_t:checked')].map(x => x.value)}))">Deploy</button></p>
+    <p class="sub">One machine at a time: it pulls rllm, parity and gpu_tests from the source, checks their SHA-256, runs the new parity tests on its own GPU, and installs only if they pass (the old binaries are kept for rollback). The first failure stops the rollout. Running servers keep their binary until restarted.</p></section>`;
+}
+
+function testsView() {
+  const hosts = fleet.peers.map(p => p.name).filter(h => status[h]?.online);
+  const names = [...new Set(Object.values(modelsBy).flatMap(l => (l || []).map(m => m.name)))].sort();
+  const rows = fleet.peers.flatMap(p => (testHistory[p.name] || []).filter(r => r.kind === "test" || r.kind === "deploy").map(r => ({ h: p.name, ...r })))
+    .sort((a, b) => (b.finished || 0) - (a.finished || 0)).slice(0, 60)
+    .map(r => `<tr><td>${esc(r.h)}</td><td>${esc(r.title)}</td><td class="${r.state === "ok" ? "ok" : "bad"}">${esc(r.state)}</td><td>${esc(r.summary)}</td><td class="sub">${when(r.finished)}</td></tr>`).join("");
+  return `<section><h3>Run tests</h3><div class="form">
+      <label>Suite<select id="t_suite">${(fleet.suites || []).map(s => `<option>${esc(s)}</option>`).join("")}</select></label>
+      <label>Model<select id="t_model"><option value="">(none)</option>${names.map(n => `<option>${esc(n)}</option>`).join("")}</select></label></div>
+    <div class="checks">${hosts.map(h => `<label><input type="checkbox" class="t_t" value="${esc(h)}" checked> ${esc(h)}</label>`).join("")}</div>
+    <p><button class="b" onclick="act('tests', () => api('/api/fleet/tests', {suite: $('#t_suite').value, model: $('#t_model').value || null, targets: [...document.querySelectorAll('.t_t:checked')].map(x => x.value)}))">Run</button> <button class="s" onclick="loadHistory()">Refresh results</button></p>
+    <p class="sub">parity: GPU kernels against the CPU · model: the GPU model tests · bench: pp512/tg128 · perplexity: wikitext-2, 32 chunks · mtp: greedy output with and without MTP must match · full: all of them. Model suites need the model's memory free. Schedules are set in each agent's config.</p></section>
+    <section><h3>Results</h3><div class="tw"><table><tr><th>Machine</th><th>Run</th><th></th><th>Result</th><th>Finished</th></tr>${rows || `<tr><td colspan="5" class="sub">none yet</td></tr>`}</table></div></section>`;
+}
+
+function powerView() {
+  const rows = fleet.peers.map(p => {
+    const w = power[p.name] || {}, g = status[p.name]?.host?.gpu || {};
+    return `<tr><td>${esc(p.name)}<div class="sub">${esc(status[p.name]?.host?.product || "")}</div></td>
+      <td>${g.socket_watts != null ? g.socket_watts.toFixed(0) + " W" : "–"} · ${g.gfx_mhz ?? "–"} MHz (max ${g.gfx_max_mhz ?? "–"})</td>
+      <td>${esc(w.boot_service || "none")}<div class="sub mono">${esc(w.boot_limits || "")}</div></td>
+      <td class="mono">${esc(w.current || (w.can_apply === false ? "needs sudo for ryzenadj" : "–"))}</td>
+      <td>${w.ryzenadj_installed ? `<select id="pw_${esc(p.name)}"><option>balanced</option><option>performance</option></select>
+        <button class="s" onclick="act('power ${esc(p.name)}', () => host('${esc(p.name)}', '/api/power/apply', {profile: $('#pw_${esc(p.name)}').value}))" ${w.can_apply ? "" : "disabled"}>Apply</button>
+        ${w.can_apply ? "" : `<div class="sub">allow it: <span class="mono">${esc(w.sudoers_hint)}</span></div>`}` : `<span class="sub">ryzenadj not installed</span>`}</td></tr>`;
+  }).join("");
+  return `<section><h3>Power</h3><div class="tw"><table><tr><th>Machine</th><th>Now</th><th>At boot (ryzenadj.service)</th><th>Current limits</th><th>Profile</th></tr>${rows}</table></div>
+    <p class="sub">balanced: 85/85/100 W, performance: 120/120/140 W (sustained/slow/fast). Applied until reboot; the boot profile is ryzenadj.service's. <button class="s" onclick="loadPower()">Refresh</button></p></section>`;
+}
+
+function jobsView() {
+  const rows = fleet.peers.flatMap(p => (status[p.name]?.jobs || []).map(j => ({ h: p.name, ...j })))
+    .sort((a, b) => b.started - a.started)
+    .map(j => `<tr><td>${esc(j.h)}</td><td>${esc(j.title)}</td><td class="${j.state === "ok" ? "ok" : j.state === "failed" ? "bad" : ""}">${esc(j.state)} ${j.state === "running" ? `<span class="prog"><div style="width:${((j.progress || 0) * 100).toFixed(0)}%"></div></span>` : ""}</td>
+      <td>${esc(j.summary || (j.log || []).slice(-1)[0] || "")}</td><td class="sub">${when(j.started)}</td><td><button class="s" onclick="jobLog('${esc(j.h)}', ${j.id})">Log</button></td></tr>`).join("");
+  return `<section><h3>Jobs</h3><div class="tw"><table><tr><th>Machine</th><th>Job</th><th>State</th><th>Latest</th><th>Started</th><th></th></tr>${rows || `<tr><td colspan="6" class="sub">none</td></tr>`}</table></div></section>`;
+}
+async function jobLog(h, id) {
+  try { const j = await host(h, "/api/jobs/" + id); show(`<h3>${esc(h)}: ${esc(j.title)}</h3><div class="${j.state === "failed" ? "bad" : ""}">${esc(j.state)} ${esc(j.summary)}</div><pre class="mono">${esc((j.log || []).join("\n"))}</pre>`); }
+  catch (e) { toast(e.message, true); }
+}
+
+// Views with forms redraw only when asked (switching to them, after an
+// action, new data), so a poll doesn't reset what's being filled in.
+const FORM_VIEWS = ["Models", "Deploy", "Tests", "Power"];
+function draw(force) {
+  if (!token || !fleet.peers.length) return;
+  banners();
+  const v = { Machines: machines, Models: modelsView, Deploy: deployView, Tests: testsView, Power: powerView, Jobs: jobsView }[tab] || machines;
+  if (FORM_VIEWS.includes(tab) && $("#view").dataset.tab === tab && !force) return;
+  $("#view").dataset.tab = tab;
+  $("#view").innerHTML = v();
+}
+
+refresh(true).then(() => { if (tab === "Tests") loadHistory(); if (tab === "Power") loadPower(); });
+setInterval(() => { if (!dlg.open) refresh(); }, 4000);
+setInterval(() => { if (tab === "Tests") loadHistory(); }, 30000);
+</script>
+</body>
+</html>

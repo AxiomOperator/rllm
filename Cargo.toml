@@ -17,6 +17,7 @@ rllm-kv = { path = "crates/rllm-kv" }
 rllm-model = { path = "crates/rllm-model" }
 rllm-tokenizer = { path = "crates/rllm-tokenizer" }
 rllm-server = { path = "crates/rllm-server" }
+rllm-agent = { path = "crates/rllm-agent" }
 
 anyhow = "1"
 thiserror = "2"
@@ -35,6 +36,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "server-graceful"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 tokio-stream = "0.1"
 tower-http = { version = "0.6", features = ["cors"] }
+tower = { version = "0.5", features = ["util"] }
 base64 = "0.22"
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 

@@ -153,6 +153,24 @@ pub enum Source {
     Url(String),
 }
 
+/// curl's failure, said plainly: which host couldn't be reached and why.
+fn curl_error(url: &str, out: &str) -> anyhow::Error {
+    let host = url.split('/').nth(2).unwrap_or(url);
+    let msg = out.lines().find(|l| l.starts_with("curl:")).unwrap_or(out).trim();
+    let code: Option<u32> = msg.strip_prefix("curl: (").and_then(|r| r.split(')').next()).and_then(|c| c.parse().ok());
+    match code {
+        Some(6) => anyhow::anyhow!("can't resolve {host} from this machine ({msg})"),
+        Some(7) => anyhow::anyhow!("{host} refused the connection from this machine ({msg})"),
+        Some(28) if msg.contains("Connection timed out") => anyhow::anyhow!(
+            "can't reach {host} from this machine: no answer in {CONNECT_TIMEOUT} s. Is it reachable from here, not only over a VPN on your own computer? ({msg})"
+        ),
+        _ => anyhow::anyhow!("{url}: {msg}"),
+    }
+}
+
+/// Seconds to wait for a TCP connection.
+const CONNECT_TIMEOUT: u32 = 15;
+
 fn is_hf(url: &str) -> bool {
     url.starts_with("https://huggingface.co/") && url.contains("/resolve/")
 }
@@ -161,8 +179,13 @@ fn is_hf(url: &str) -> bool {
 /// a GET for byte 0 that answers 206 with a Content-Range total, or a 200
 /// with a Content-Length (one stream then).
 async fn url_meta(url: &str) -> Result<(u64, bool)> {
-    let (ok, out) = sys::run("curl", &["-sSL", "--max-time", "60", "-r", "0-0", "-D", "-", "-o", "/dev/null", url]).await?;
-    ensure!(ok, "{url}: {}", out.trim());
+    let ct = CONNECT_TIMEOUT.to_string();
+    let (ok, out) = sys::run("curl", &["-sSL", "--connect-timeout", &ct, "--max-time", "60", "-r", "0-0", "-D", "-", "-o", "/dev/null", url]).await?;
+    // A server that ignores the range sends the whole file: the headers
+    // are all that's needed, so running out of time after them is fine.
+    if !ok && !(out.contains("curl: (28) Operation timed out") && out.contains("HTTP/")) {
+        return Err(curl_error(url, &out));
+    }
     // The headers of every hop; the last response is the file's.
     let last = out.split("\r\n\r\n").map(str::trim_start).filter(|b| b.starts_with("HTTP/")).last().unwrap_or("");
     let code: u16 = last.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
@@ -193,8 +216,11 @@ async fn hf_meta(url: &str) -> Result<(u64, String)> {
         None => (String::new(), path),
     };
     let api = format!("https://huggingface.co/api/models/{repo_rev}/tree/{rev}{dir}");
-    let (ok, body) = sys::run("curl", &["-sSfL", "--max-time", "30", &api]).await?;
-    ensure!(ok, "Hugging Face API: {body}");
+    let ct = CONNECT_TIMEOUT.to_string();
+    let (ok, body) = sys::run("curl", &["-sSfL", "--connect-timeout", &ct, "--max-time", "30", &api]).await?;
+    if !ok {
+        return Err(curl_error(&api, &body)).context("asking the Hugging Face API");
+    }
     let v: serde_json::Value = serde_json::from_str(&body).context("Hugging Face API answer")?;
     for e in v.as_array().into_iter().flatten() {
         if e["path"].as_str().is_some_and(|p| p.ends_with(fname)) {
@@ -218,6 +244,10 @@ fn file_len(p: &Path) -> u64 {
     std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
 
+/// curl gives up (and the attempt is retried) on no connection in 15 s or
+/// under 64 KB/s for a minute: a hung transfer doesn't hang the job.
+const STALL: [&str; 6] = ["--connect-timeout", "15", "--speed-limit", "65536", "--speed-time", "60"];
+
 /// Fetch byte range [start, end] of `url` into `part`, resuming; an attempt
 /// is kept only if the server answered 206 for exactly the requested offset.
 async fn fetch_range(url: &str, auth: Option<&str>, part: &Path, start: u64, end: u64, ranged: bool) -> Result<()> {
@@ -229,7 +259,7 @@ async fn fetch_range(url: &str, auth: Option<&str>, part: &Path, start: u64, end
         let mut c = Command::new("curl");
         if !ranged {
             // No ranges: the whole file in one go, from the start each try.
-            let out = c.args(["-sSL", "--max-time", "21600", "-o"]).arg(&tryf).args(["-w", "%{http_code}", url]).output().await.context("running curl")?;
+            let out = c.kill_on_drop(true).args(STALL).args(["-sSL", "--max-time", "21600", "-o"]).arg(&tryf).args(["-w", "%{http_code}", url]).output().await.context("running curl")?;
             let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if code == "200" && file_len(&tryf) == len {
                 tokio::fs::rename(&tryf, part).await?;
@@ -241,12 +271,13 @@ async fn fetch_range(url: &str, auth: Option<&str>, part: &Path, start: u64, end
             }
             continue;
         }
-        c.args(["-sSL", "--max-time", "1800", "-o"]).arg(&tryf).args(["-w", "%{http_code}", "-r", &format!("{}-{}", start + got, end)]);
+        c.kill_on_drop(true).args(STALL).args(["-sSL", "--max-time", "1800", "-o"]).arg(&tryf).args(["-w", "%{http_code}", "-r", &format!("{}-{}", start + got, end)]);
         if let Some(a) = auth {
             c.args(["-H", &format!("Authorization: Bearer {a}")]);
         }
         let out = c.arg(url).output().await.context("running curl")?;
         let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
         let n = file_len(&tryf);
         if code == "206" && got + n <= len && n > 0 && got == 0 {
             // The first attempt: it is the part.
@@ -259,7 +290,7 @@ async fn fetch_range(url: &str, auth: Option<&str>, part: &Path, start: u64, end
             failures = 0;
         } else {
             failures += 1;
-            ensure!(failures < 50, "range {start}-{end}: giving up after 50 failed attempts (last HTTP {code})");
+            ensure!(failures < 50, "range {start}-{end}: giving up after 50 failed attempts (last: HTTP {code} {why})");
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
         let _ = tokio::fs::remove_file(&tryf).await;
@@ -324,8 +355,45 @@ async fn sha256_watched(ctx: &JobCtx, path: &Path, size: u64, p0: f64, p1: f64) 
     Ok(h)
 }
 
+/// Removes a fetch's scratch files if it's dropped unfinished (cancelled).
+/// A failed fetch keeps its parts, so a retry resumes them.
+struct Scratch {
+    dir: PathBuf,
+    name: String,
+    done: bool,
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let (dir, prefix) = (self.dir.clone(), format!(".{}.", self.name));
+        let clean = move || {
+            for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if e.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        };
+        clean();
+        // Again once the aborted range tasks have stopped writing.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            clean();
+        });
+    }
+}
+
 /// Download `name` into `dir` from `src`, verify, and move it into place.
 pub async fn fetch(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sha: Option<String>) -> Result<String> {
+    let mut scratch = Scratch { dir: dir.clone(), name: name.clone(), done: false };
+    let r = fetch_inner(ctx, dir, name, src, want_sha).await;
+    scratch.done = true;
+    r
+}
+
+async fn fetch_inner(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sha: Option<String>) -> Result<String> {
     sys::safe_name(&name)?;
     let dest = dir.join(&name);
     ensure!(!dest.exists(), "{} already exists", dest.display());
@@ -385,6 +453,7 @@ pub async fn fetch(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sh
     let parts: Vec<PathBuf> = (0..n).map(|i| dir.join(format!(".{name}.part{i}"))).collect();
     let started = std::time::Instant::now();
     let mut tasks = Vec::new();
+    let mut guard = crate::jobs::Tasks::default();
     for (i, part) in parts.iter().enumerate() {
         let start = i as u64 * chunk;
         if start >= size {
@@ -392,7 +461,9 @@ pub async fn fetch(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sh
         }
         let end = (start + chunk).min(size) - 1;
         let (url, auth, part) = (url.clone(), auth.clone(), part.clone());
-        tasks.push(tokio::spawn(async move { fetch_range(&url, auth.as_deref(), &part, start, end, ranged).await }));
+        let t = tokio::spawn(async move { fetch_range(&url, auth.as_deref(), &part, start, end, ranged).await });
+        guard.add(&t);
+        tasks.push(t);
     }
     // Progress while the ranges download.
     let watch = {
@@ -411,6 +482,7 @@ pub async fn fetch(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sh
             }
         })
     };
+    guard.add(&watch);
     let mut err = None;
     for t in tasks {
         if let Err(e) = t.await.map_err(anyhow::Error::from).and_then(|r| r) {

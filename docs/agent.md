@@ -62,7 +62,9 @@ hostname), `peers`, `bin_dir` (default `~/rllm-bin`: `rllm`, `parity`,
   ranges if the server serves ranges (one stream if not), and checked
   against Hugging Face's LFS SHA-256 for a Hugging Face `.../resolve/...`
   URL, otherwise against the SHA-256 given with the request (or by size
-  only, the computed hash then shown). Each range
+  only, the computed hash then shown). An unreachable host fails after
+  15 s, and a range that stalls (under 64 KB/s for a minute) is retried.
+  Each range
   attempt goes to its own scratch file and is kept only on an HTTP 206 for
   exactly the requested offset; nothing replaces the file until the hash
   matches.
@@ -115,6 +117,7 @@ binary directories.
 | POST | `/api/deploy`, `/api/deploy/rollback` | `{source}` |
 | POST | `/api/tests/run` | `{suite, model}` |
 | GET | `/api/tests/history`, `/api/jobs`, `/api/jobs/{id}` | |
+| POST | `/api/jobs/{id}/cancel` | stops a running job: its processes are killed, a fetch's partial files removed, and a fleet job cancels the peers' jobs it started |
 | GET | `/api/fleet` | peers |
 | POST | `/api/fleet/deploy`, `/api/fleet/distribute`, `/api/fleet/tests` | across machines |
 | any | `/fleet/{name}/{path}` | forwarded to that machine's agent |

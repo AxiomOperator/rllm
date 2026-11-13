@@ -271,9 +271,17 @@ function xfer(j) {
   let line;
   if (j.state === "ok") line = `<span class="ok">done</span> ${esc(j.summary)}`;
   else if (j.state === "failed") line = `<span class="bad">failed</span> ${esc(j.summary)}`;
-  else if (t.phase === "preparing") line = `${PHASE.preparing}: ${esc(j.log?.slice(-1)[0] || "")}`;
+  else if (j.state === "cancelled") line = `<span class="muted">cancelled</span>`;
+  else if (t.phase === "preparing") line = `${PHASE.preparing} (${dur(Date.now() / 1000 - j.started)}): ${esc(j.log?.slice(-1)[0] || "")}`;
   else line = `${PHASE[t.phase] || esc(t.phase)} ${pct}% · ${gb(t.done)} / ${gb(t.total)}${t.rate > 0 ? " · " + rate(t.rate) : ""}${eta != null ? " · " + dur(eta) + " left" : ""}`;
   return { pct, bar, line, eta };
+}
+function cancelBtn(h, id, what) {
+  return `<button class="s" onclick="cancelJob('${esc(h)}', ${id}, '${esc(what).replace(/'/g, "")}')">Cancel</button>`;
+}
+function cancelJob(h, id, what) {
+  if (!confirm(`Cancel ${what} on ${h}?`)) return;
+  act("cancel " + what + " on " + h, () => host(h, `/api/jobs/${id}/cancel`, {}));
 }
 function transfersHtml() {
   const xs = transfers();
@@ -283,25 +291,29 @@ function transfersHtml() {
     return `<tr><td class="mono">${esc(j.transfer.model)}</td><td>${esc(j.h)}</td><td>${esc(fleet.peers.find(p => p.addr === j.transfer.source)?.name || j.transfer.source)}</td>
       <td>${j.state === "running" ? x.bar : ""}<div class="sub">${x.line}</div></td>
       <td class="sub">${dur((j.finished || now) - j.started)}${j.state === "running" ? " elapsed" : ""}</td>
-      <td><button class="s" onclick="jobLog('${esc(j.h)}', ${j.id})">Log</button></td></tr>`; }).join("")}</table></div>`;
+      <td style="white-space:nowrap">${j.state === "running" ? cancelBtn(j.h, j.id, j.transfer.model) + " " : ""}<button class="s" onclick="jobLog('${esc(j.h)}', ${j.id})">Log</button></td></tr>`; }).join("")}</table></div>`;
 }
+// The newest transfer per (machine, model); xs is running first, then newest.
+function latest(xs) { const seen = new Set(); return xs.filter(j => { const k = j.h + "|" + j.transfer.model; return !seen.has(k) && seen.add(k); }); }
 function modelsTableHtml() {
   const hosts = fleet.peers.map(p => p.name), xs = transfers();
-  const names = [...new Set([...Object.values(modelsBy).flatMap(l => (l || []).map(m => m.name)), ...xs.filter(j => j.state === "running").map(j => j.transfer.model)])].sort();
+  const names = [...new Set([...Object.values(modelsBy).flatMap(l => (l || []).map(m => m.name)), ...latest(xs).filter(j => j.state === "running" || j.state === "failed").map(j => j.transfer.model)])].sort();
   const info = n => { for (const h of hosts) { const m = (modelsBy[h] || []).find(m => m.name === n); if (m) return m; } };
   const rows = names.map(n => {
     const m = info(n), have = hosts.filter(h => (modelsBy[h] || []).some(x => x.name === n));
-    const live = h => xs.find(j => j.h === h && j.transfer.model === n && (j.state === "running" || (j.state === "failed" && !have.includes(h))));
+    // The newest transfer of this model to h, if running or failed.
+    const live = h => { const j = xs.find(j => j.h === h && j.transfer.model === n); return j && (j.state === "running" || (j.state === "failed" && !have.includes(h))) ? j : null; };
     const missing = hosts.filter(h => !have.includes(h) && status[h]?.online && live(h)?.state !== "running");
     const cell = h => {
       if (have.includes(h)) return `<span class="ok">✓</span>`;
       const j = live(h);
       if (!j) return `<span class="muted">–</span>`;
-      if (j.state === "failed") return `<span class="bad">failed</span> <button class="s" onclick="jobLog('${esc(h)}', ${j.id})">Log</button>`;
+      if (j.state === "failed") return `<div class="xcell"><span class="bad">failed</span> <button class="s" onclick="jobLog('${esc(h)}', ${j.id})">Log</button><div class="sub bad">${esc(j.summary.length > 90 ? j.summary.slice(0, 90) + "…" : j.summary)}</div></div>`;
       const x = xfer(j), t = j.transfer;
-      return `<div class="xcell">${x.bar}<div class="sub">${t.phase === "downloading" ? `${x.pct}%${t.rate > 0 ? " · " + rate(t.rate) : ""}` : PHASE[t.phase] || esc(t.phase)}${t.phase !== "preparing" && t.phase !== "downloading" ? " " + x.pct + "%" : ""}${x.eta != null ? " · " + dur(x.eta) + " left" : ""}</div></div>`;
+      if (t.phase === "preparing") return `<div class="xcell">${x.bar}<div class="sub">preparing ${dur(Date.now() / 1000 - j.started)} · <a href="#" onclick="cancelJob('${esc(h)}', ${j.id}, '${esc(n)}'); return false">cancel</a></div></div>`;
+      return `<div class="xcell">${x.bar}<div class="sub">${t.phase === "downloading" ? `${x.pct}%${t.rate > 0 ? " · " + rate(t.rate) : ""}` : PHASE[t.phase] || esc(t.phase)}${t.phase !== "preparing" && t.phase !== "downloading" ? " " + x.pct + "%" : ""}${x.eta != null ? " · " + dur(x.eta) + " left" : ""} · <a href="#" onclick="cancelJob('${esc(h)}', ${j.id}, '${esc(n)}'); return false">cancel</a></div></div>`;
     };
-    const desc = m ? `${esc(m.title || "")} · ${esc(m.arch)}${m.mtp ? " · MTP" : ""} · ${gb(m.size)} file · ${gib(m.weights_bytes)} on GPU` : "downloading";
+    const desc = m ? `${esc(m.title || "")} · ${esc(m.arch)}${m.mtp ? " · MTP" : ""} · ${gb(m.size)} file · ${gib(m.weights_bytes)} on GPU` : xs.some(j => j.transfer.model === n && j.state === "running") ? "downloading" : "not on any machine";
     return `<tr><td class="mono">${esc(n)}<div class="sub">${desc}</div></td>
       ${hosts.map(h => `<td>${cell(h)}</td>`).join("")}
       <td>${missing.length && have.length ? `<button class="s" onclick="copyDialog('${esc(n)}')">Copy…</button>` : ""}</td></tr>`;
@@ -391,8 +403,8 @@ function powerView() {
 function jobsView() {
   const rows = fleet.peers.flatMap(p => (status[p.name]?.jobs || []).map(j => ({ h: p.name, ...j })))
     .sort((a, b) => b.started - a.started)
-    .map(j => `<tr><td>${esc(j.h)}</td><td>${esc(j.title)}</td><td class="${j.state === "ok" ? "ok" : j.state === "failed" ? "bad" : ""}">${esc(j.state)} ${j.state === "running" ? `<span class="prog"><div style="width:${((j.progress || 0) * 100).toFixed(0)}%"></div></span>` : ""}</td>
-      <td>${esc(j.summary || (j.log || []).slice(-1)[0] || "")}</td><td class="sub">${when(j.started)}</td><td><button class="s" onclick="jobLog('${esc(j.h)}', ${j.id})">Log</button></td></tr>`).join("");
+    .map(j => `<tr><td>${esc(j.h)}</td><td>${esc(j.title)}</td><td class="${j.state === "ok" ? "ok" : j.state === "failed" ? "bad" : j.state === "cancelled" ? "muted" : ""}">${esc(j.state)} ${j.state === "running" ? `<span class="prog"><div style="width:${((j.progress || 0) * 100).toFixed(0)}%"></div></span>` : ""}</td>
+      <td>${esc(j.summary || (j.log || []).slice(-1)[0] || "")}</td><td class="sub">${when(j.started)}</td><td style="white-space:nowrap">${j.state === "running" ? cancelBtn(j.h, j.id, j.title) + " " : ""}<button class="s" onclick="jobLog('${esc(j.h)}', ${j.id})">Log</button></td></tr>`).join("");
   return `<section><h3>Jobs</h3><div class="tw"><table><tr><th>Machine</th><th>Job</th><th>State</th><th>Latest</th><th>Started</th><th></th></tr>${rows || `<tr><td colspan="6" class="sub">none</td></tr>`}</table></div></section>`;
 }
 async function jobLog(h, id) {

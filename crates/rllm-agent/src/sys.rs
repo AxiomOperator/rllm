@@ -242,7 +242,7 @@ pub fn procs_named(name: &str) -> Vec<Proc> {
 
 /// Run a command, capturing stdout+stderr. Err on spawn failure only.
 pub async fn run(cmd: &str, args: &[&str]) -> Result<(bool, String)> {
-    let out = Command::new(cmd).args(args).output().await.with_context(|| format!("running {cmd}"))?;
+    let out = Command::new(cmd).args(args).kill_on_drop(true).output().await.with_context(|| format!("running {cmd}"))?;
     let mut s = String::from_utf8_lossy(&out.stdout).to_string();
     s.push_str(&String::from_utf8_lossy(&out.stderr));
     Ok((out.status.success(), s))

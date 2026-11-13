@@ -429,6 +429,31 @@ async fn job(State(st): S, UrlPath(id): UrlPath<u64>) -> R<Json<Value>> {
     Ok(Json(json!(st.jobs.get(id).context("no such job")?)))
 }
 
+async fn cancel_job(State(st): S, UrlPath(id): UrlPath<u64>) -> R<Json<Value>> {
+    check!(st.jobs.cancel(id), "job {id} isn't running");
+    Ok(Json(json!({"ok": format!("cancelled job {id}")})))
+}
+
+/// Cancels a peer's job if the local job waiting on it is dropped
+/// (cancelled) before the peer's finished.
+struct PeerJob {
+    addr: String,
+    token: String,
+    id: u64,
+    live: bool,
+}
+
+impl Drop for PeerJob {
+    fn drop(&mut self) {
+        if self.live {
+            let (addr, token, id) = (self.addr.clone(), self.token.clone(), self.id);
+            tokio::spawn(async move {
+                let _ = http::request(&addr, "POST", &format!("/api/jobs/{id}/cancel"), Some(&token), Some(b"{}"), Duration::from_secs(10)).await;
+            });
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The fleet
 
@@ -460,6 +485,7 @@ async fn remote_job(ctx: &JobCtx, peer: &Peer, token: &str, path: &str, body: Va
     let v: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
     ensure!(r.status == 200, "{}: {}", peer.name, v["error"].as_str().unwrap_or("request failed"));
     let id = v["job"].as_u64().context("no job id")?;
+    let mut guard = PeerJob { addr: peer.addr.clone(), token: token.to_string(), id, live: true };
     let mut seen = 0usize;
     loop {
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -468,6 +494,7 @@ async fn remote_job(ctx: &JobCtx, peer: &Peer, token: &str, path: &str, body: Va
             // An agent restarting onto a new binary drops its jobs: a
             // deploy that got that far has installed.
             Err(e) if path == "/api/deploy" => {
+                guard.live = false;
                 ctx.log(format!("{}: agent restarting ({e:#})", peer.name));
                 tokio::time::sleep(Duration::from_secs(8)).await;
                 return Ok("installed; agent restarted".into());
@@ -485,8 +512,14 @@ async fn remote_job(ctx: &JobCtx, peer: &Peer, token: &str, path: &str, body: Va
             ctx.progress(v.iter().sum::<f64>() / v.len().max(1) as f64);
         }
         match j["state"].as_str() {
-            Some("ok") => return Ok(j["summary"].as_str().unwrap_or("").to_string()),
-            Some("failed") => bail!("{}: {}", peer.name, j["summary"].as_str().unwrap_or("failed")),
+            Some("ok") => {
+                guard.live = false;
+                return Ok(j["summary"].as_str().unwrap_or("").to_string());
+            }
+            Some(s @ ("failed" | "cancelled")) => {
+                guard.live = false;
+                bail!("{}: {}", peer.name, if s == "cancelled" { "cancelled" } else { j["summary"].as_str().unwrap_or("failed") });
+            }
             _ => {}
         }
     }
@@ -536,10 +569,13 @@ async fn fleet_distribute(State(st): S, Json(r): Json<FleetDistribute>) -> R<Jso
     let title = format!("copy {} from {} to {} machine(s)", r.model, r.source, targets.len());
     let id = st.jobs.spawn("fleet", title, move |ctx: JobCtx| async move {
         let mut tasks = Vec::new();
+        let mut guard = jobs::Tasks::default();
         let all = Arc::new(std::sync::Mutex::new(vec![0.0; targets.len()]));
         for (i, t) in targets.into_iter().enumerate() {
             let (ctx, token, body, share) = (ctx.clone(), token.clone(), json!({"name": r.model, "peer": r.source}), Some((all.clone(), i)));
-            tasks.push(tokio::spawn(async move { (t.name.clone(), remote_job(&ctx, &t, &token, "/api/models/fetch", body, share).await) }));
+            let h = tokio::spawn(async move { (t.name.clone(), remote_job(&ctx, &t, &token, "/api/models/fetch", body, share).await) });
+            guard.add(&h);
+            tasks.push(h);
         }
         let mut lines = Vec::new();
         let mut failed = false;
@@ -574,9 +610,12 @@ async fn fleet_tests(State(st): S, Json(r): Json<FleetTests>) -> R<Json<Value>> 
     let title = format!("{} on {} machine(s)", r.suite, targets.len());
     let id = st.jobs.spawn("fleet", title, move |ctx: JobCtx| async move {
         let mut tasks = Vec::new();
+        let mut guard = jobs::Tasks::default();
         for t in targets {
             let (ctx, token, body) = (ctx.clone(), token.clone(), json!({"suite": r.suite, "model": r.model}));
-            tasks.push(tokio::spawn(async move { (t.name.clone(), remote_job(&ctx, &t, &token, "/api/tests/run", body, None).await) }));
+            let h = tokio::spawn(async move { (t.name.clone(), remote_job(&ctx, &t, &token, "/api/tests/run", body, None).await) });
+            guard.add(&h);
+            tasks.push(h);
         }
         let (mut lines, mut failed) = (Vec::new(), false);
         for t in tasks {
@@ -643,6 +682,7 @@ fn router(st: Arc<AppState>) -> Router {
         .route("/tests/history", get(history))
         .route("/jobs", get(jobs))
         .route("/jobs/{id}", get(job))
+        .route("/jobs/{id}/cancel", post(cancel_job))
         .route("/fleet", get(fleet))
         .route("/fleet/deploy", post(fleet_deploy))
         .route("/fleet/distribute", post(fleet_distribute))

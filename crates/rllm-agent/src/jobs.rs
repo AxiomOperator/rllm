@@ -18,6 +18,7 @@ pub enum JobState {
     Running,
     Ok,
     Failed,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -58,6 +59,8 @@ pub fn now() -> u64 {
 struct Inner {
     next: u64,
     jobs: VecDeque<Job>,
+    /// Running jobs' cancel switches.
+    cancels: std::collections::HashMap<u64, tokio::sync::oneshot::Sender<()>>,
 }
 
 /// The agent's job registry.
@@ -65,6 +68,25 @@ struct Inner {
 pub struct Jobs {
     inner: Arc<Mutex<Inner>>,
     history: PathBuf,
+}
+
+/// Aborts spawned tasks when dropped, so cancelling a job stops the tasks
+/// it spawned (a dropped JoinHandle would leave them running).
+#[derive(Default)]
+pub struct Tasks(Vec<tokio::task::AbortHandle>);
+
+impl Tasks {
+    pub fn add<T>(&mut self, h: &tokio::task::JoinHandle<T>) {
+        self.0.push(h.abort_handle());
+    }
+}
+
+impl Drop for Tasks {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
 }
 
 /// A running job's handle: everything it reports goes through here.
@@ -76,7 +98,7 @@ pub struct JobCtx {
 
 impl Jobs {
     pub fn new(history: PathBuf) -> Self {
-        Self { inner: Arc::new(Mutex::new(Inner { next: 1, jobs: VecDeque::new() })), history }
+        Self { inner: Arc::new(Mutex::new(Inner { next: 1, ..Default::default() })), history }
     }
 
     /// Start `f` as a job; returns its id at once.
@@ -85,6 +107,7 @@ impl Jobs {
         F: FnOnce(JobCtx) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = anyhow::Result<String>> + Send + 'static,
     {
+        let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
         let id = {
             let mut g = self.inner.lock().unwrap();
             let id = g.next;
@@ -110,14 +133,26 @@ impl Jobs {
                     None => break,
                 }
             }
+            g.cancels.insert(id, cancel);
             id
         };
         let ctx = JobCtx { jobs: self.clone(), id };
         tokio::spawn(async move {
-            let r = f(ctx.clone()).await;
+            // Cancelling drops the job's future: its child processes are
+            // killed (kill_on_drop) and its guards clean up.
+            let r = tokio::select! {
+                r = f(ctx.clone()) => Some(r),
+                Ok(()) = cancelled => None,
+            };
             ctx.finish(r);
         });
         id
+    }
+
+    /// Cancel a running job; false if it isn't running.
+    pub fn cancel(&self, id: u64) -> bool {
+        let tx = self.inner.lock().unwrap().cancels.remove(&id);
+        tx.is_some_and(|tx| tx.send(()).is_ok())
     }
 
     pub fn list(&self) -> Vec<Job> {
@@ -166,17 +201,24 @@ impl JobCtx {
         self.jobs.update(self.id, |j| f(j.transfer.get_or_insert_with(Transfer::default)));
     }
 
-    fn finish(&self, r: anyhow::Result<String>) {
+    /// `None`: cancelled.
+    fn finish(&self, r: Option<anyhow::Result<String>>) {
+        self.jobs.inner.lock().unwrap().cancels.remove(&self.id);
         let mut done = None;
         self.jobs.update(self.id, |j| {
             j.finished = Some(now());
             match r {
-                Ok(s) => {
+                None => {
+                    j.state = JobState::Cancelled;
+                    j.summary = "cancelled".into();
+                    j.log.push_back("cancelled".into());
+                }
+                Some(Ok(s)) => {
                     j.state = JobState::Ok;
                     j.progress = Some(1.0);
                     j.summary = s;
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     j.state = JobState::Failed;
                     j.summary = format!("{e:#}");
                     j.log.push_back(format!("error: {e:#}"));

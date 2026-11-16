@@ -101,7 +101,10 @@ pub enum GenEvent {
 
 pub enum Job {
     Generate { prompt: Vec<u32>, params: GenParams, events: tmpsc::UnboundedSender<GenEvent>, cancel: Arc<AtomicBool> },
-    Embed { inputs: Vec<Vec<u32>>, reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>> },
+    /// Final hidden states of each input: mean-pooled and L2-normalized
+    /// (embeddings), or with `rows` every token's row, `[tokens, hidden]`
+    /// (a decision head reads them).
+    Embed { inputs: Vec<Vec<u32>>, rows: bool, reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>> },
 }
 
 /// Facts about the loaded model, reported once the engine is ready.
@@ -606,9 +609,11 @@ struct EmbedJob {
     /// Vectors of the inputs done so far.
     out: Vec<Vec<f32>>,
     /// The input in progress (`inputs[out.len()]`): its temporary cache and
-    /// the sum of its final hidden states so far.
+    /// the sum of its final hidden states so far (`rows`: the rows themselves).
     seq: SeqKv,
     sum: Vec<f32>,
+    /// Return every token's hidden state instead of the pooled vector.
+    rows: bool,
 }
 
 struct Scheduler<'a, 'm, B: Backend> {
@@ -781,8 +786,8 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                     cancel,
                 });
             }
-            Job::Embed { inputs, reply } => {
-                self.embeds.push_back(EmbedJob { out: Vec::with_capacity(inputs.len()), inputs, reply, seq: SeqKv::default(), sum: Vec::new() })
+            Job::Embed { inputs, rows, reply } => {
+                self.embeds.push_back(EmbedJob { out: Vec::with_capacity(inputs.len()), inputs, reply, seq: SeqKv::default(), sum: Vec::new(), rows })
             }
         }
     }
@@ -1444,14 +1449,22 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                 Ok(h) => h,
                 Err(e) => break 'run Err(format!("{e:#}")),
             };
-            let d = h.len() / part.len();
-            job.sum.resize(d, 0.0);
-            for row in h.chunks_exact(d) {
-                for (a, &b) in job.sum.iter_mut().zip(row) {
-                    *a += b;
+            if job.rows {
+                job.sum.extend_from_slice(&h);
+            } else {
+                let d = h.len() / part.len();
+                job.sum.resize(d, 0.0);
+                for row in h.chunks_exact(d) {
+                    for (a, &b) in job.sum.iter_mut().zip(row) {
+                        *a += b;
+                    }
                 }
             }
-            if job.seq.len == ids.len() {
+            if job.seq.len == ids.len() && job.rows {
+                job.seq.free(&mut self.pool.alloc);
+                job.out.push(std::mem::take(&mut job.sum));
+                Metrics::add(&self.metrics.embedded_tokens, ids.len());
+            } else if job.seq.len == ids.len() {
                 // Mean-pooled (the mean's scale drops out), L2-normalized.
                 let n = ids.len();
                 job.seq.free(&mut self.pool.alloc);

@@ -1,3 +1,4 @@
+pub mod clef;
 pub mod gemma4;
 pub mod generate;
 pub mod loader;
@@ -229,7 +230,7 @@ pub enum AnyHostCache<B: Backend> {
 /// Whether the model in `g` keeps recurrent state per sequence (no prefix
 /// reuse or speculative decoding), from its metadata.
 pub fn is_recurrent(g: &Gguf) -> bool {
-    g.get_str("general.architecture").is_ok_and(|a| a == "qwen35" || a == "qwen35moe")
+    g.get_str("general.architecture").is_ok_and(|a| a == "qwen35" || a == "qwen35moe" || a == "clef")
 }
 
 /// What sizing decisions need to know about a model file, read from its
@@ -286,7 +287,7 @@ impl ModelProfile {
                 let kv = vec![one(swa.max(1), c.n_kv_heads, c.head_dim_swa), one(global.max(1), c.n_kv_heads, c.head_dim_global)];
                 Ok(Self { arch: "gemma4".into(), n_layers: c.n_layers, hidden: c.hidden, ffn: c.ffn, vocab: c.vocab, max_context: c.max_context, weight_bytes, repack_bytes, state_bytes_per_seq: 0, mtp: false, moe_bytes_per_token: 0, kv })
             }
-            "qwen35" | "qwen35moe" => {
+            "qwen35" | "qwen35moe" | "clef" => {
                 let c = Qwen35Config::from_gguf(g)?;
                 // The MTP block keeps a KV layer of its own in the same cache.
                 let kv = vec![one(c.n_attn_layers() + c.mtp as usize, c.n_kv_heads, c.head_dim)];
@@ -294,7 +295,7 @@ impl ModelProfile {
                 let moe_bytes_per_token = c.moe_bytes_per_token();
                 Ok(Self { arch: c.arch.clone(), n_layers: c.n_layers, hidden: c.hidden, ffn: c.ffn, vocab: c.vocab, max_context: c.max_context, weight_bytes, repack_bytes, state_bytes_per_seq, mtp: c.mtp, moe_bytes_per_token, kv })
             }
-            other => bail!("unsupported architecture {other:?} (supported: qwen3, llama, gemma4, qwen35, qwen35moe)"),
+            other => bail!("unsupported architecture {other:?} (supported: qwen3, llama, gemma4, qwen35, qwen35moe, clef)"),
         }
     }
 
@@ -322,8 +323,8 @@ impl<B: Backend> AnyModel<B> {
         let model = match g.get_str("general.architecture")? {
             "qwen3" | "llama" => Self::Qwen3(Qwen3::load(backend, g)?),
             "gemma4" => Self::Gemma4(Gemma4::load(backend, g)?),
-            "qwen35" | "qwen35moe" => Self::Qwen35(Qwen35::load(backend, g)?),
-            other => bail!("unsupported architecture {other:?} (supported: qwen3, llama, gemma4, qwen35, qwen35moe)"),
+            "qwen35" | "qwen35moe" | "clef" => Self::Qwen35(Qwen35::load(backend, g)?),
+            other => bail!("unsupported architecture {other:?} (supported: qwen3, llama, gemma4, qwen35, qwen35moe, clef)"),
         };
         if !backend.keeps_host_weights() {
             // Every tensor is on the device now: release the file's pages

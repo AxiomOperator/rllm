@@ -145,6 +145,7 @@ fn usage(prompt: usize, completion: usize) -> Value {
 }
 
 pub async fn create(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResult<Response> {
+    state.generation_allowed()?;
     // Tokenizing (up to the body limit) is CPU work: off the async workers.
     let s = state.clone();
     let mut req = util::blocking(move || parse(&s, &body)).await?;

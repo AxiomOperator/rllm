@@ -147,6 +147,7 @@ fn usage(prompt: usize, cached: usize, completion: usize, reasoning: usize) -> V
 }
 
 pub async fn create(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResult<Response> {
+    state.generation_allowed()?;
     // Rendering and tokenizing the prompt is CPU work: off the async workers.
     let s = state.clone();
     let mut req = util::blocking(move || parse(&s, &body)).await?;

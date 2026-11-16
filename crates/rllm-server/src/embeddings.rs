@@ -76,7 +76,7 @@ pub async fn create(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResul
     };
     let prompt_tokens: usize = inputs.iter().map(Vec::len).sum();
     let (reply, rx) = oneshot::channel();
-    state.engine.submit(Job::Embed { inputs, reply }).map_err(|e| ApiError::unavailable(format!("{e:#}")))?;
+    state.engine.submit(Job::Embed { inputs, rows: false, reply }).map_err(|e| ApiError::unavailable(format!("{e:#}")))?;
     let vectors = rx.await.map_err(|_| ApiError::server("the engine stopped unexpectedly"))?.map_err(ApiError::server)?;
     let mut data = Vec::with_capacity(vectors.len());
     for (i, mut v) in vectors.into_iter().enumerate() {

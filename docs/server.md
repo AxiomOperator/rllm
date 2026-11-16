@@ -108,6 +108,7 @@ implement, return OpenAI's `404 Invalid URL (METHOD /path)` error.
 | `GET /responses/{id}/input_items` | Paginated input items. |
 | `POST /responses/input_tokens` | Prompt token count for a Responses request. |
 | `POST /embeddings` | String, string-array and token inputs; `dimensions`; `float` or `base64`. |
+| `POST /systemone` | Typed decisions, for a decision model (Clef) only; see [Decision models](#decision-models-clef). |
 | `GET /health` | `ok` (outside `/v1`, no auth). |
 | `GET /metrics` | Prometheus metrics (outside `/v1`; behind the API key if one is set). |
 | `POST /tokenize`, `POST /detokenize`, `POST /apply-template` | llama.cpp-style helpers (outside `/v1`): `{"content", "add_special", "with_pieces"}` → `{"tokens"}`; `{"tokens"}` → `{"content"}`; `{"messages", "tools"?}` → `{"prompt"}`. |
@@ -324,6 +325,74 @@ Measured on the Strix Halo (Radeon 8060S), Qwen3.8-27B Q8_0: perplexity 5.5955
 with 81% of drafted tokens accepted. Qwen3.5-0.8B Q8_0:
 perplexity 15.4846 (llama.cpp 15.4933); logits within llama.cpp's own noise
 on the laptop's CPU and CUDA backends, at any prefill chunk size.
+
+## Decision models (Clef)
+
+[Clef](https://huggingface.co/Cloudflare/clef) (GGUF architecture `clef`,
+e.g. `ggml-org/Clef-GGUF`) is a Qwen3.8-27B with a decision head instead of
+text output: given a state and typed questions it returns a probability for
+every allowed answer of every question, from one forward pass. rllm runs its
+backbone as a dense Qwen3.5 (everything above applies) and the head
+(`crates/rllm-model/src/clef.rs`, a port of llama.cpp's `src/models/clef.cpp`)
+on the CPU. Text only: there is no vision encoder, so requests with images
+are refused. The model has no text output, so the generation endpoints
+(chat, completions, responses) answer 400, as llama.cpp's server does.
+
+`POST /v1/systemone` takes the same request as llama.cpp's server and returns
+the same answers:
+
+```json
+{"state": "I was charged twice for my plan this month.",
+ "questions": {
+   "route":   {"type": "choice", "instructions": "Which team handles this?",
+               "criteria": {"billing": "Payments, refunds", "tech": "Bugs, outages", "sales": null}},
+   "urgent":  {"type": "noul", "instructions": "Does the customer need an answer today?"},
+   "anger":   {"type": "score", "instructions": "How upset is the customer?",
+               "criteria": ["calm", "annoyed", "angry"]}}}
+```
+
+```json
+{"model": "Clef-Q4_K_M",
+ "answers": {
+   "route":  {"type": "choice", "choice": "billing", "probabilities": {"billing": 0.97, …}, "confidence": 0.95},
+   "urgent": {"type": "noul", "noul": 0.62},
+   "anger":  {"type": "score", "score": 0.9, "legend": {"0": "calm", …}, "probabilities": {…}, "confidence": 0.7}},
+ "usage": {"input_tokens": 310, "output_tokens": 0}}
+```
+
+- `choice`: `criteria` maps option keys to descriptions (or null); the
+  options are shown to the model sorted by key. `confidence` is how far the
+  top probability is above uniform (0 = uniform, 1 = certain).
+- `score`: `criteria` lists 2 to 10 levels, lowest first; `score` is the
+  expected level (0-based), `confidence` 1 minus the spread around the mode
+  relative to a uniform distribution's.
+- `noul` (yes/no): `criteria` may describe `"true"` and `"false"`; `noul` is
+  the probability of true.
+- `state`, `instructions` and descriptions may be text or any JSON (shown to
+  the model as compact JSON with sorted keys). `model` is optional. At most
+  255 options per question.
+
+All questions go into one prompt, rendered with the model's
+`tokenizer.chat_template.systemone` template; each question's instructions
+and each option are tagged spans. The engine runs the prompt like an
+embedding request (a chunk at a time between generation steps) and returns
+every token's final hidden state; the head mean-pools the spans, attends
+over the whole prompt, and scores each option. Probabilities are a softmax
+over each question's option scores (with the temperatures and score biases
+from `clef.decision.*` metadata, if the file has any).
+
+Checked: the head's scores match an independent float64 numpy
+implementation of llama.cpp's graph, reading the same GGUF weights, to
+within 1.3e-6 (`cargo run --release -p rllm-model --example clef_head`
+writes the inputs and scores). The rendered prompt and its spans are
+checked against the template with the real tokenizer
+(`RLLM_CLEF_GGUF=… cargo test -p rllm-server prompt_of_a_real_model`).
+Against llama.cpp's server (CPU) on the same two requests (7 questions):
+identical prompt token counts (461 and 353), the same answers, and
+probabilities within 0.0022 of llama.cpp's (rllm on the Strix Halo GPU).
+On the Strix Halo (Clef Q4_K_M, sharing the GPU with another server), a
+461-token request with 4 questions takes 1.43 s, and clear-cut questions get
+the expected answers at 0.97–0.99 probability.
 
 ## Batch-invariant mode
 

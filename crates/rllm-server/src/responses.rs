@@ -598,6 +598,7 @@ impl Drop for Unfinished {
 }
 
 pub async fn create(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResult<Response> {
+    state.generation_allowed()?;
     // Rendering and tokenizing (several times for truncation "auto") is CPU
     // work: keep it off the async workers.
     let s = state.clone();

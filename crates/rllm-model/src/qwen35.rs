@@ -88,8 +88,9 @@ pub struct Qwen35Config {
 impl Qwen35Config {
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
         let arch = g.get_str("general.architecture")?;
-        if arch != "qwen35" && arch != "qwen35moe" {
-            bail!("unsupported architecture {arch:?} (expected qwen35 or qwen35moe)");
+        // Clef (a decision model) is a dense Qwen3.5 under its own name.
+        if arch != "qwen35" && arch != "qwen35moe" && arch != "clef" {
+            bail!("unsupported architecture {arch:?} (expected qwen35, qwen35moe or clef)");
         }
         let k = |s: &str| format!("{arch}.{s}");
         let dim = |s: &str| meta_usize(g, &k(s), MAX_DIM, false);

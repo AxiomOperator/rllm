@@ -20,6 +20,7 @@
 
 mod chat;
 mod completions;
+mod decision;
 mod embeddings;
 mod engine;
 
@@ -110,6 +111,8 @@ where
 {
     let gguf = Arc::new(Gguf::open(&cfg.model).with_context(|| format!("open {}", cfg.model.display()))?);
     let tok = Arc::new(Tokenizer::from_gguf(&gguf)?);
+    // A decision model (Clef): its head runs on the CPU after the backbone.
+    let decision = decision::Decider::load(&gguf)?.map(Arc::new);
     let format = output::Format::detect(tok.chat_template().unwrap_or(""));
     let t0 = Instant::now();
     let vocab = Arc::new(engine::Vocab::build(&tok));
@@ -200,6 +203,7 @@ where
         metrics,
         log: cfg.log,
         save_lock: Mutex::new(()),
+        decision,
     });
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
@@ -311,6 +315,7 @@ fn router(state: Arc<AppState>, cors_origins: &[String], loopback: bool) -> Rout
         .route("/responses/{id}/cancel", post(responses::cancel))
         .route("/responses/{id}/input_items", get(responses::input_items))
         .route("/embeddings", post(embeddings::create))
+        .route("/systemone", post(decision::create))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     let extras = Router::new()
         .route("/metrics", get(extras::metrics))

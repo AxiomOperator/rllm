@@ -37,9 +37,20 @@ pub struct AppState {
     /// Held while the store file is written, so the periodic and the
     /// shutdown save never write it at the same time.
     pub save_lock: Mutex<()>,
+    /// The decision head, if the model is a decision model (`/v1/systemone`).
+    pub decision: Option<Arc<crate::decision::Decider>>,
 }
 
 impl AppState {
+    /// A decision model (Clef) has no text output: generation endpoints are
+    /// refused (as llama.cpp's server does), only `/v1/systemone` answers.
+    pub fn generation_allowed(&self) -> ApiResult<()> {
+        if self.decision.is_some() {
+            return Err(ApiError::invalid("This model is a decision model without text generation, use /v1/systemone", None));
+        }
+        Ok(())
+    }
+
     /// Check a request's `model` and return the id to report.
     pub fn resolve_model(&self, requested: Option<&Value>) -> ApiResult<String> {
         let Some(name) = requested.and_then(Value::as_str) else {

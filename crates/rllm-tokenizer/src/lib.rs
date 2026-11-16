@@ -469,6 +469,64 @@ fn spm_merges(tokens: &[String], types: &[i64], g: &Gguf) -> Result<Vec<(String,
 }
 
 /// `strftime` for the formats chat templates use (%d %e %m %b %B %y %Y %H %M %S %A %a %j %%), UTC.
+/// Render a template that isn't a chat template (e.g. a decision model's
+/// `tokenizer.chat_template.systemone`) with the variables in `ctx`.
+/// Its `tojson` works like llama.cpp's (and Python's `json.dumps`): it
+/// takes `separators=[item, key]` (default `", "`, `": "`) and writes
+/// non-ASCII text as is. Object keys come out sorted (as llama.cpp's
+/// decision server sorts request JSON before rendering).
+pub fn render_template(source: &str, ctx: &serde_json::Value) -> Result<String> {
+    let mut env = minijinja::Environment::new();
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env.add_filter("tojson", tojson);
+    env.add_function("raise_exception", |msg: String| -> std::result::Result<String, minijinja::Error> {
+        Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
+    });
+    env.add_template("t", source)?;
+    Ok(env.get_template("t")?.render(minijinja::Value::from_serialize(ctx))?)
+}
+
+/// `tojson` with Python's `separators` (see [`render_template`]).
+fn tojson(value: &minijinja::Value, kwargs: minijinja::value::Kwargs) -> std::result::Result<minijinja::Value, minijinja::Error> {
+    let seps: Option<Vec<String>> = kwargs.get("separators")?;
+    let _: Option<minijinja::Value> = kwargs.get("ensure_ascii")?;
+    let indent: Option<minijinja::Value> = kwargs.get("indent")?;
+    kwargs.assert_all_used()?;
+    let err = |e: &dyn std::fmt::Display| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, format!("tojson: {e}"));
+    if indent.is_some_and(|i| !i.is_none()) {
+        return Err(err(&"indent is not supported"));
+    }
+    let (item, key) = match seps.as_deref() {
+        None => (", ".to_string(), ": ".to_string()),
+        Some([i, k]) => (i.clone(), k.clone()),
+        Some(_) => return Err(err(&"separators must be [item, key]")),
+    };
+    let mut out = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, Separators { item: item.as_bytes(), key: key.as_bytes() });
+    serde::Serialize::serialize(value, &mut ser).map_err(|e| err(&e))?;
+    Ok(minijinja::Value::from_safe_string(String::from_utf8(out).map_err(|e| err(&e))?))
+}
+
+/// Compact JSON with the given separators.
+struct Separators<'a> {
+    item: &'a [u8],
+    key: &'a [u8],
+}
+
+impl serde_json::ser::Formatter for Separators<'_> {
+    fn begin_array_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W, first: bool) -> std::io::Result<()> {
+        if first { Ok(()) } else { w.write_all(self.item) }
+    }
+
+    fn begin_object_key<W: ?Sized + std::io::Write>(&mut self, w: &mut W, first: bool) -> std::io::Result<()> {
+        if first { Ok(()) } else { w.write_all(self.item) }
+    }
+
+    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(self.key)
+    }
+}
+
 fn strftime_utc(fmt: &str, now: std::time::SystemTime) -> String {
     const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
     const DAYS: [&str; 7] = ["Thursday", "Friday", "Saturday", "Sunday", "Monday", "Tuesday", "Wednesday"];
@@ -556,5 +614,19 @@ mod strftime_tests {
         let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_722_000_309);
         assert_eq!(super::strftime_utc("%d %b %Y", t), "26 Jul 2024");
         assert_eq!(super::strftime_utc("%A %B %e, %H:%M:%S (%j) %%", t), "Friday July 26, 13:25:09 (208) %");
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    #[test]
+    fn tojson_takes_python_separators() {
+        let ctx = serde_json::json!({"v": {"b": [1, "é<x>"], "a": null}});
+        let r = |t: &str| super::render_template(t, &ctx).unwrap();
+        assert_eq!(r("{{ v | tojson(separators=[',', ':']) }}"), r#"{"a":null,"b":[1,"é<x>"]}"#);
+        assert_eq!(r("{{ v | tojson }}"), r#"{"a": null, "b": [1, "é<x>"]}"#);
+        // Maps come out with sorted keys (minijinja without preserve_order),
+        // dict literals included: decision templates rely on sorted keys.
+        assert_eq!(r("{{ {'z': 1, 'a': v.a} | tojson(separators=[',', ':']) }}"), r#"{"a":null,"z":1}"#);
     }
 }

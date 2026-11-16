@@ -1029,6 +1029,8 @@ name = "rllm-model"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libm",
+ "rayon",
  "rllm-core",
  "rllm-cuda",
  "rllm-gguf",
@@ -1069,6 +1071,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "rllm-gguf",
+ "serde",
  "serde_json",
  "tokenizers",
 ]

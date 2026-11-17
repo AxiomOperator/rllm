@@ -17,5 +17,5 @@ mod gpu;
 
 pub use backend::{
     CudaBackend as HipBackend, CudaBuf as HipBuf, CudaHostKv as HipHostKv, CudaKvCache as HipKvCache,
-    CudaWeight as HipWeight, DeviceInfo, device_count, probe_devices,
+    CudaWeight as HipWeight, DeviceInfo, device_count, probe_devices, set_gdn_chunked_for_tests,
 };

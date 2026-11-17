@@ -118,12 +118,12 @@ pub struct Plan {
 const RUNTIME_BYTES: u64 = 3 << 29; // 1.5 GiB: activations, logits, graphs (rllm tune measures 0.2-1.3)
 
 pub fn plan(m: &ModelInfo, ctx: u64, parallel: u64, kv: KvType, kv_tokens: Option<u64>, usable: u64) -> Plan {
-    // Recurrent models run without a prefix cache, so a bigger pool than
-    // every slot's full context is never used.
     let kv_tokens = kv_tokens.unwrap_or(ctx * parallel);
     let per_tok = if kv == KvType::Q8 { m.kv_bytes_per_token_q8 } else { m.kv_bytes_per_token_f16 };
-    // State slots: parallel plus spares; MTP snapshots about as many again.
-    let state = m.state_bytes_per_seq * (parallel + 2) * if m.mtp { 2 } else { 1 };
+    // State slots: parallel plus spares, and as many prefix-cache
+    // checkpoints as parallel (serve's default); MTP snapshots about as
+    // many again as the sequences'.
+    let state = m.state_bytes_per_seq * ((parallel + 2) * if m.mtp { 2 } else { 1 } + if m.recurrent { parallel } else { 0 });
     let need = m.weights_bytes + kv_tokens * per_tok + state + RUNTIME_BYTES;
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     Plan {
@@ -180,7 +180,7 @@ fn is_hf(url: &str) -> bool {
 /// with a Content-Length (one stream then).
 async fn url_meta(url: &str) -> Result<(u64, bool)> {
     let ct = CONNECT_TIMEOUT.to_string();
-    let (ok, out) = sys::run("curl", &["-sSL", "--connect-timeout", &ct, "--max-time", "60", "-r", "0-0", "-D", "-", "-o", "/dev/null", url]).await?;
+    let (ok, out) = sys::curl(&["-sSL", "--connect-timeout", &ct, "--max-time", "60", "-r", "0-0", "-D", "-", "-o", "/dev/null", url], None).await?;
     // A server that ignores the range sends the whole file: the headers
     // are all that's needed, so running out of time after them is fine.
     if !ok && !(out.contains("curl: (28) Operation timed out") && out.contains("HTTP/")) {
@@ -217,13 +217,13 @@ async fn hf_meta(url: &str) -> Result<(u64, String)> {
     };
     let api = format!("https://huggingface.co/api/models/{repo_rev}/tree/{rev}{dir}");
     let ct = CONNECT_TIMEOUT.to_string();
-    let (ok, body) = sys::run("curl", &["-sSfL", "--connect-timeout", &ct, "--max-time", "30", &api]).await?;
+    let (ok, body) = sys::curl(&["-sSfL", "--connect-timeout", &ct, "--max-time", "30", &api], None).await?;
     if !ok {
         return Err(curl_error(&api, &body)).context("asking the Hugging Face API");
     }
     let v: serde_json::Value = serde_json::from_str(&body).context("Hugging Face API answer")?;
     for e in v.as_array().into_iter().flatten() {
-        if e["path"].as_str().is_some_and(|p| p.ends_with(fname)) {
+        if e["path"].as_str().is_some_and(|p| p.rsplit('/').next() == Some(fname)) {
             let size = e["size"].as_u64().context("no size")?;
             let sha = e["lfs"]["oid"].as_str().context("no LFS sha256 (not an LFS file?)")?.to_string();
             return Ok((size, sha));
@@ -248,6 +248,12 @@ fn file_len(p: &Path) -> u64 {
 /// under 64 KB/s for a minute: a hung transfer doesn't hang the job.
 const STALL: [&str; 6] = ["--connect-timeout", "15", "--speed-limit", "65536", "--speed-time", "60"];
 
+/// Whether a `Content-Range` header value starts at byte `from`
+/// (`bytes <from>-<to>/<total>`).
+fn range_starts_at(content_range: &str, from: u64) -> bool {
+    content_range.trim().strip_prefix("bytes ").and_then(|r| r.split('-').next()).and_then(|s| s.trim().parse::<u64>().ok()) == Some(from)
+}
+
 /// Fetch byte range [start, end] of `url` into `part`, resuming; an attempt
 /// is kept only if the server answered 206 for exactly the requested offset.
 async fn fetch_range(url: &str, auth: Option<&str>, part: &Path, start: u64, end: u64, ranged: bool) -> Result<()> {
@@ -256,10 +262,12 @@ async fn fetch_range(url: &str, auth: Option<&str>, part: &Path, start: u64, end
     let mut failures = 0;
     while file_len(part) < len {
         let got = file_len(part);
-        let mut c = Command::new("curl");
+        let mut c = sys::curl_command(auth);
         if !ranged {
             // No ranges: the whole file in one go, from the start each try.
-            let out = c.kill_on_drop(true).args(STALL).args(["-sSL", "--max-time", "21600", "-o"]).arg(&tryf).args(["-w", "%{http_code}", url]).output().await.context("running curl")?;
+            // curl stops a body bigger than announced (a disk-filling server).
+            c.args(STALL).args(["-sSL", "--max-time", "21600", "--max-filesize", &len.to_string(), "-o"]).arg(&tryf).args(["-w", "%{http_code}", url]);
+            let out = sys::curl_output(c, auth).await?;
             let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if code == "200" && file_len(&tryf) == len {
                 tokio::fs::rename(&tryf, part).await?;
@@ -271,12 +279,16 @@ async fn fetch_range(url: &str, auth: Option<&str>, part: &Path, start: u64, end
             }
             continue;
         }
-        c.kill_on_drop(true).args(STALL).args(["-sSL", "--max-time", "1800", "-o"]).arg(&tryf).args(["-w", "%{http_code}", "-r", &format!("{}-{}", start + got, end)]);
-        if let Some(a) = auth {
-            c.args(["-H", &format!("Authorization: Bearer {a}")]);
-        }
-        let out = c.arg(url).output().await.context("running curl")?;
-        let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let want = len - got;
+        c.args(STALL)
+            .args(["-sSL", "--max-time", "1800", "--max-filesize", &want.to_string(), "-o"])
+            .arg(&tryf)
+            .args(["-w", "%{http_code} %header{content-range}", "-r", &format!("{}-{}", start + got, end)])
+            .arg(url);
+        let out = sys::curl_output(c, auth).await?;
+        let w = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let (code, content_range) = w.split_once(' ').unwrap_or((w.as_str(), ""));
+        let code = if code == "206" && !range_starts_at(content_range, start + got) { format!("206 for the wrong range ({content_range:?})") } else { code.to_string() };
         let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
         let n = file_len(&tryf);
         if code == "206" && got + n <= len && n > 0 && got == 0 {
@@ -385,16 +397,51 @@ impl Drop for Scratch {
     }
 }
 
+/// Fetches in progress: destination path -> disk bytes reserved for it
+/// (one fetch per destination; the free-space check counts the others).
+static ACTIVE: Mutex<Option<HashMap<PathBuf, u64>>> = Mutex::new(None);
+
+/// A destination claimed in [`ACTIVE`], released when dropped.
+struct Claim(PathBuf);
+
+impl Claim {
+    fn new(dest: PathBuf) -> Result<Self> {
+        let mut g = ACTIVE.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        ensure!(!m.contains_key(&dest), "{} is already being downloaded", dest.display());
+        m.insert(dest.clone(), 0);
+        Ok(Claim(dest))
+    }
+    /// Reserve `bytes` for this fetch; returns what the others reserve.
+    fn reserve(&self, bytes: u64) -> u64 {
+        let mut g = ACTIVE.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        m.insert(self.0.clone(), bytes);
+        m.iter().filter(|(k, _)| **k != self.0).map(|(_, v)| *v).sum()
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if let Some(m) = ACTIVE.lock().unwrap().as_mut() {
+            m.remove(&self.0);
+        }
+    }
+}
+
 /// Download `name` into `dir` from `src`, verify, and move it into place.
 pub async fn fetch(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sha: Option<String>) -> Result<String> {
+    sys::safe_name(&name)?;
+    // Claimed before the scratch guard, so a refused duplicate never
+    // deletes the running fetch's parts.
+    let claim = Claim::new(dir.join(&name))?;
     let mut scratch = Scratch { dir: dir.clone(), name: name.clone(), done: false };
-    let r = fetch_inner(ctx, dir, name, src, want_sha).await;
+    let r = fetch_inner(ctx, dir, name, src, want_sha, &claim).await;
     scratch.done = true;
     r
 }
 
-async fn fetch_inner(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sha: Option<String>) -> Result<String> {
-    sys::safe_name(&name)?;
+async fn fetch_inner(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_sha: Option<String>, claim: &Claim) -> Result<String> {
     let dest = dir.join(&name);
     ensure!(!dest.exists(), "{} already exists", dest.display());
     std::fs::create_dir_all(&dir)?;
@@ -415,6 +462,7 @@ async fn fetch_inner(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_
         }
         Source::Url(u) => {
             ensure!(u.starts_with("http://") || u.starts_with("https://"), "only http(s) URLs");
+            sys::check_fetch_target(u).await?;
             ctx.log(format!("asking {u} for the file's size"));
             let (size, ranged) = url_meta(u).await?;
             if !ranged {
@@ -435,8 +483,6 @@ async fn fetch_inner(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_
             (format!("http://{addr}/api/files/models/{name}"), Some(token.clone()), size, Some(want_sha.unwrap_or(sha)), true)
         }
     };
-    let (free, _) = sys::disk_space(&dir);
-    ensure!(free > size + (2 << 30), "not enough disk: {} GiB free, {} GiB needed", free >> 30, size >> 30);
     let sha = sha.map(|h| h.trim().to_ascii_lowercase());
     if let Some(h) = &sha {
         ensure!(h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()), "not a SHA-256: {h:?}");
@@ -451,6 +497,32 @@ async fn fetch_inner(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_
     let n: u64 = if !ranged { 1 } else if matches!(src, Source::Peer(..)) { 2 } else { 8 };
     let chunk = size.div_ceil(n);
     let parts: Vec<PathBuf> = (0..n).map(|i| dir.join(format!(".{name}.part{i}"))).collect();
+    // Parts left by a failed attempt are resumed only if they were cut the
+    // same way from the same file; otherwise their bytes would be joined at
+    // the wrong offsets.
+    let origin = dir.join(format!(".{name}.origin"));
+    let this = format!("{url}\n{size}\n{n}\n");
+    if std::fs::read_to_string(&origin).ok().as_deref() != Some(this.as_str()) {
+        for p in &parts {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(try_path(p));
+        }
+        std::fs::write(&origin, &this)?;
+    }
+    // Disk: the file plus one part (parts are deleted as they are joined),
+    // less what earlier attempts already wrote, plus 2 GiB to spare, after
+    // what other running fetches have reserved.
+    let have: u64 = parts.iter().map(|p| file_len(p)).sum();
+    let need = (size + chunk).saturating_sub(have) + (2 << 30);
+    let others = claim.reserve(need);
+    let (free, _) = sys::disk_space(&dir);
+    ensure!(
+        free > need + others,
+        "not enough disk: {} GiB free, {} GiB needed{}",
+        free >> 30,
+        need >> 30,
+        if others > 0 { format!(" plus {} GiB reserved by other downloads", others >> 30) } else { String::new() }
+    );
     let started = std::time::Instant::now();
     let mut tasks = Vec::new();
     let mut guard = crate::jobs::Tasks::default();
@@ -514,6 +586,11 @@ async fn fetch_inner(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_
                 continue;
             }
             let mut f = tokio::fs::File::open(p).await?;
+            // Unlinked now (the open handle keeps it readable): its space is
+            // freed as soon as it is copied, so the join never holds the
+            // whole file twice.
+            out.flush().await?;
+            std::fs::remove_file(p)?;
             loop {
                 let n = f.read(&mut buf).await?;
                 if n == 0 {
@@ -534,9 +611,7 @@ async fn fetch_inner(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_
         }
         out.flush().await?;
     }
-    for p in &parts {
-        let _ = std::fs::remove_file(p);
-    }
+    let _ = std::fs::remove_file(&origin);
     ensure!(file_len(&tmp) == size, "joined file is {} bytes, expected {size}", file_len(&tmp));
     ctx.log(if sha.is_some() { "verifying SHA-256" } else { "computing SHA-256" });
     ctx.transfer(|t| {
@@ -555,4 +630,28 @@ async fn fetch_inner(ctx: JobCtx, dir: PathBuf, name: String, src: Source, want_
     sys::remember_sha256(&dest, &got);
     let check = if sha.is_some() { "SHA-256 verified".to_string() } else { format!("SHA-256 {got} (not checked: none given)") };
     Ok(format!("{name}: {:.1} GB in {secs:.0} s, {check}", size as f64 / 1e9))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_range_offsets() {
+        assert!(range_starts_at("bytes 100-199/1000", 100));
+        assert!(!range_starts_at("bytes 0-199/1000", 100));
+        assert!(!range_starts_at("", 0));
+    }
+
+    #[test]
+    fn one_fetch_per_destination() {
+        let a = Claim::new("/tmp/x/claim-test.gguf".into()).unwrap();
+        assert!(Claim::new("/tmp/x/claim-test.gguf".into()).is_err());
+        let b = Claim::new("/tmp/x/claim-test2.gguf".into()).unwrap();
+        a.reserve(10);
+        assert_eq!(b.reserve(5), 10);
+        drop(a);
+        assert_eq!(b.reserve(5), 0);
+        assert!(Claim::new("/tmp/x/claim-test.gguf".into()).is_ok());
+    }
 }

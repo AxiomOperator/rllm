@@ -82,6 +82,9 @@ pre { white-space: pre-wrap; word-break: break-word; background: var(--bg); bord
 <script>
 "use strict";
 const $ = (s) => document.querySelector(s);
+// A value as a JavaScript string literal, escaped for an HTML attribute
+// (inline handlers: the browser decodes entities before running them).
+const js = (s) => esc(JSON.stringify(String(s ?? "")));
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const gib = (b) => b == null ? "–" : (b / 1073741824).toFixed(b >= 10 * 1073741824 ? 0 : 1) + " GiB";
 const gb = (b) => b == null ? "–" : (b / 1e9).toFixed(1) + " GB";
@@ -122,7 +125,7 @@ function show(html) { $("#dlgbody").innerHTML = html; if (!dlg.open) dlg.showMod
 let fleet = { self: "", peers: [], suites: [] }, status = {}, modelsBy = {}, testHistory = {}, power = {};
 const tabs = ["Machines", "Models", "Deploy", "Tests", "Power", "Jobs"];
 let tab = location.hash.slice(1) || "Machines";
-function navDraw() { $("#nav").innerHTML = tabs.map(t => `<button class="${t === tab ? "on" : ""}" onclick="go('${t}')">${t}</button>`).join(""); }
+function navDraw() { $("#nav").innerHTML = tabs.map(t => `<button class="${t === tab ? "on" : ""}" onclick="go(${js(t)})">${t}</button>`).join(""); }
 function go(t) { tab = t; location.hash = t; navDraw(); draw(true); if (t === "Power") loadPower(); if (t === "Tests") loadHistory(); if (t === "Models") loadModels().then(() => draw(true)); }
 navDraw();
 
@@ -156,10 +159,10 @@ function banners() {
     if (!s || !s.online) continue;
     const l = s.llama;
     if (l && (l.processes.length || l.service_active)) {
-      out.push(`<div class="banner"><b>llama-server running on ${esc(p.name)}</b><span>${l.processes.map(x => esc(x.args.split(" ").find(a => a.endsWith(".gguf")) || "llama-server")).join(", ")}</span><span class="grow"></span><button class="s" onclick="act('stop llama-server on ${esc(p.name)}', () => host('${esc(p.name)}', '/api/llama/stop', {}))">Stop and disable</button></div>`);
+      out.push(`<div class="banner"><b>llama-server running on ${esc(p.name)}</b><span>${l.processes.map(x => esc(x.args.split(" ").find(a => a.endsWith(".gguf")) || "llama-server")).join(", ")}</span><span class="grow"></span><button class="s" onclick="act(${js("stop llama-server on " + p.name)}, () => host(${js(p.name)}, '/api/llama/stop', {}))">Stop and disable</button></div>`);
     }
     for (const v of s.servers || []) if (v.state.startsWith("failed"))
-      out.push(`<div class="banner" style="background:var(--warn)"><b>${esc(p.name)}: server on :${v.port} ${esc(v.state)}</b><span class="grow"></span><button class="s" onclick="showLog('${esc(p.name)}', ${v.port})">Log</button><button class="s" onclick="act('clear', () => host('${esc(p.name)}', '/api/servers/stop', {port: ${v.port}}))">Clear</button></div>`);
+      out.push(`<div class="banner" style="background:var(--warn)"><b>${esc(p.name)}: server on :${v.port} ${esc(v.state)}</b><span class="grow"></span><button class="s" onclick="showLog(${js(p.name)}, ${+v.port})">Log</button><button class="s" onclick="act('clear', () => host(${js(p.name)}, '/api/servers/stop', {port: ${+v.port}}))">Clear</button></div>`);
   }
   $("#banners").innerHTML = out.join("");
 }
@@ -186,8 +189,8 @@ function machineCard(p) {
       ${v.requests_finished != null ? `<span class="sub">${v.requests_finished} done</span>` : ""}
       <span class="sub">${ago(v.uptime_s)}${v.managed ? "" : " · started by hand"}</span>
       <span class="grow"></span>
-      ${v.managed ? `<button class="s" onclick="showLog('${esc(p.name)}', ${v.port})">Log</button>` : ""}
-      <button class="danger" onclick="if(confirm('Stop the server on ${esc(p.name)}:${v.port}?')) act('stop :${v.port}', () => host('${esc(p.name)}', '/api/servers/stop', {port: ${v.port}}))">Stop</button>
+      ${v.managed ? `<button class="s" onclick="showLog(${js(p.name)}, ${+v.port})">Log</button>` : ""}
+      <button class="danger" onclick="if(confirm(${js("Stop the server on " + p.name + ":" + v.port + "?")})) act(${js("stop :" + v.port)}, () => host(${js(p.name)}, '/api/servers/stop', {port: ${+v.port}}))">Stop</button>
     </div>`).join("");
   const running = (s.jobs || []).filter(j => j.state === "running");
   return `<div class="card">
@@ -204,8 +207,8 @@ function machineCard(p) {
       <span>Build</span><span class="mono ${build && maj && build !== maj ? "warn" : ""}">${build ? build.slice(0, 12) : "–"}${build && maj && build !== maj ? " (differs)" : ""}</span>
     </div>
     <div class="srv">${srv || `<span class="sub">no servers</span>`}
-      <div class="row"><button class="b" onclick="startDialog('${esc(p.name)}')">Start a server</button>
-      <button class="s" onclick="staleDialog('${esc(p.name)}')">Leftover processes</button></div>
+      <div class="row"><button class="b" onclick="startDialog(${js(p.name)})">Start a server</button>
+      <button class="s" onclick="staleDialog(${js(p.name)})">Leftover processes</button></div>
     </div>
     ${running.map(j => `<div class="sub">${esc(j.title)} <span class="prog"><div style="width:${((j.progress || 0) * 100).toFixed(0)}%"></div></span></div>`).join("")}
   </div>`;
@@ -221,7 +224,7 @@ async function staleDialog(h) {
   try {
     const r = await host(h, "/api/stale");
     show(`<h3>Leftover processes on ${esc(h)}</h3><pre class="mono">${esc(r.output)}</pre>
-      <button class="danger" onclick="act('clean up ${esc(h)}', () => host('${esc(h)}', '/api/stale/kill', {services: false})).then(() => staleDialog('${esc(h)}'))">Stop leftovers</button>
+      <button class="danger" onclick="act(${js("clean up " + h)}, () => host(${js(h)}, '/api/stale/kill', {services: false})).then(() => staleDialog(${js(h)}))">Stop leftovers</button>
       <span class="sub">rllm servers on other ports are kept.</span>`);
   } catch (e) { toast(e.message, true); }
 }
@@ -277,7 +280,7 @@ function xfer(j) {
   return { pct, bar, line, eta };
 }
 function cancelBtn(h, id, what) {
-  return `<button class="s" onclick="cancelJob('${esc(h)}', ${id}, '${esc(what).replace(/'/g, "")}')">Cancel</button>`;
+  return `<button class="s" onclick="cancelJob(${js(h)}, ${+id}, ${js(what)})">Cancel</button>`;
 }
 function cancelJob(h, id, what) {
   if (!confirm(`Cancel ${what} on ${h}?`)) return;
@@ -291,7 +294,7 @@ function transfersHtml() {
     return `<tr><td class="mono">${esc(j.transfer.model)}</td><td>${esc(j.h)}</td><td>${esc(fleet.peers.find(p => p.addr === j.transfer.source)?.name || j.transfer.source)}</td>
       <td>${j.state === "running" ? x.bar : ""}<div class="sub">${x.line}</div></td>
       <td class="sub">${dur((j.finished || now) - j.started)}${j.state === "running" ? " elapsed" : ""}</td>
-      <td style="white-space:nowrap">${j.state === "running" ? cancelBtn(j.h, j.id, j.transfer.model) + " " : ""}<button class="s" onclick="jobLog('${esc(j.h)}', ${j.id})">Log</button></td></tr>`; }).join("")}</table></div>`;
+      <td style="white-space:nowrap">${j.state === "running" ? cancelBtn(j.h, j.id, j.transfer.model) + " " : ""}<button class="s" onclick="jobLog(${js(j.h)}, ${+j.id})">Log</button></td></tr>`; }).join("")}</table></div>`;
 }
 // The newest transfer per (machine, model); xs is running first, then newest.
 function latest(xs) { const seen = new Set(); return xs.filter(j => { const k = j.h + "|" + j.transfer.model; return !seen.has(k) && seen.add(k); }); }
@@ -308,15 +311,15 @@ function modelsTableHtml() {
       if (have.includes(h)) return `<span class="ok">✓</span>`;
       const j = live(h);
       if (!j) return `<span class="muted">–</span>`;
-      if (j.state === "failed") return `<div class="xcell"><span class="bad">failed</span> <button class="s" onclick="jobLog('${esc(h)}', ${j.id})">Log</button><div class="sub bad">${esc(j.summary.length > 90 ? j.summary.slice(0, 90) + "…" : j.summary)}</div></div>`;
+      if (j.state === "failed") return `<div class="xcell"><span class="bad">failed</span> <button class="s" onclick="jobLog(${js(h)}, ${+j.id})">Log</button><div class="sub bad">${esc(j.summary.length > 90 ? j.summary.slice(0, 90) + "…" : j.summary)}</div></div>`;
       const x = xfer(j), t = j.transfer;
-      if (t.phase === "preparing") return `<div class="xcell">${x.bar}<div class="sub">preparing ${dur(Date.now() / 1000 - j.started)} · <a href="#" onclick="cancelJob('${esc(h)}', ${j.id}, '${esc(n)}'); return false">cancel</a></div></div>`;
-      return `<div class="xcell">${x.bar}<div class="sub">${t.phase === "downloading" ? `${x.pct}%${t.rate > 0 ? " · " + rate(t.rate) : ""}` : PHASE[t.phase] || esc(t.phase)}${t.phase !== "preparing" && t.phase !== "downloading" ? " " + x.pct + "%" : ""}${x.eta != null ? " · " + dur(x.eta) + " left" : ""} · <a href="#" onclick="cancelJob('${esc(h)}', ${j.id}, '${esc(n)}'); return false">cancel</a></div></div>`;
+      if (t.phase === "preparing") return `<div class="xcell">${x.bar}<div class="sub">preparing ${dur(Date.now() / 1000 - j.started)} · <a href="#" onclick="cancelJob(${js(h)}, ${+j.id}, ${js(n)}); return false">cancel</a></div></div>`;
+      return `<div class="xcell">${x.bar}<div class="sub">${t.phase === "downloading" ? `${x.pct}%${t.rate > 0 ? " · " + rate(t.rate) : ""}` : PHASE[t.phase] || esc(t.phase)}${t.phase !== "preparing" && t.phase !== "downloading" ? " " + x.pct + "%" : ""}${x.eta != null ? " · " + dur(x.eta) + " left" : ""} · <a href="#" onclick="cancelJob(${js(h)}, ${+j.id}, ${js(n)}); return false">cancel</a></div></div>`;
     };
     const desc = m ? `${esc(m.title || "")} · ${esc(m.arch)}${m.mtp ? " · MTP" : ""} · ${gb(m.size)} file · ${gib(m.weights_bytes)} on GPU` : xs.some(j => j.transfer.model === n && j.state === "running") ? "downloading" : "not on any machine";
     return `<tr><td class="mono">${esc(n)}<div class="sub">${desc}</div></td>
       ${hosts.map(h => `<td>${cell(h)}</td>`).join("")}
-      <td>${missing.length && have.length ? `<button class="s" onclick="copyDialog('${esc(n)}')">Copy…</button>` : ""}</td></tr>`;
+      <td>${missing.length && have.length ? `<button class="s" onclick="copyDialog(${js(n)})">Copy…</button>` : ""}</td></tr>`;
   }).join("");
   return `<table><tr><th>Model</th>${hosts.map(h => `<th>${esc(h)}</th>`).join("")}<th></th></tr>${rows}</table>`;
 }
@@ -355,14 +358,14 @@ function copyDialog(n) {
   const have = hosts.filter(h => (modelsBy[h] || []).some(x => x.name === n));
   show(`<h3>Copy ${esc(n)}</h3><div class="form"><label>From<select id="c_src">${have.map(h => `<option>${esc(h)}</option>`).join("")}</select></label></div>
     <div class="checks">${hosts.filter(h => !have.includes(h)).map(h => `<label><input type="checkbox" class="c_t" value="${esc(h)}" checked> ${esc(h)}</label>`).join("")}</div>
-    <p><button class="b" onclick="act('copy ${esc(n)}', () => api('/api/fleet/distribute', {model: '${esc(n)}', source: $('#c_src').value, targets: [...document.querySelectorAll('.c_t:checked')].map(x => x.value)})).then(r => r && dlg.close())">Copy</button></p>`);
+    <p><button class="b" onclick="act(${js("copy " + n)}, () => api('/api/fleet/distribute', {model: ${js(n)}, source: $('#c_src').value, targets: [...document.querySelectorAll('.c_t:checked')].map(x => x.value)})).then(r => r && dlg.close())">Copy</button></p>`);
 }
 
 function deployView() {
   const hosts = fleet.peers.map(p => p.name), maj = majorityBuild();
   const rows = hosts.map(h => { const b = status[h]?.binaries || {};
     return `<tr><td>${esc(h)}</td><td class="mono ${b.rllm_sha256 && b.rllm_sha256 !== maj ? "warn" : ""}">${b.rllm_sha256 ? b.rllm_sha256.slice(0, 16) : "–"}</td><td>${when(b.rllm_modified)}</td>
-      <td><button class="s" onclick="if(confirm('Restore the binaries ${esc(h)} had before its last deploy?')) act('rollback ${esc(h)}', () => host('${esc(h)}', '/api/deploy/rollback', {}))">Roll back</button></td></tr>`; }).join("");
+      <td><button class="s" onclick="if(confirm(${js("Restore the binaries " + h + " had before its last deploy?")})) act(${js("rollback " + h)}, () => host(${js(h)}, '/api/deploy/rollback', {}))">Roll back</button></td></tr>`; }).join("");
   return `<section><h3>Builds</h3><div class="tw"><table><tr><th>Machine</th><th>rllm (SHA-256)</th><th>Installed</th><th></th></tr>${rows}</table></div></section>
     <section><h3>Rolling deploy</h3><div class="form"><label>Source build<select id="d_src">${hosts.filter(h => status[h]?.online).map(h => `<option>${esc(h)}</option>`).join("")}</select></label></div>
     <div class="checks">${hosts.filter(h => status[h]?.online).map(h => `<label><input type="checkbox" class="d_t" value="${esc(h)}" checked> ${esc(h)}</label>`).join("")}</div>
@@ -393,7 +396,7 @@ function powerView() {
       <td>${esc(w.boot_service || "none")}<div class="sub mono">${esc(w.boot_limits || "")}</div></td>
       <td>${w.limits_w ? `${w.limits_w.map(x => x.toFixed(0)).join(" / ")} W <span class="chip">${esc(w.active_profile)}</span>` : `<span class="sub">${!w.ryzenadj_installed ? "–" : w.can_apply === false ? "needs sudo for ryzenadj" : "–"}</span>`}</td>
       <td>${w.ryzenadj_installed ? `<select id="pw_${esc(p.name)}">${["balanced", "performance"].map(o => `<option value="${o}" ${o === w.active_profile ? "selected" : ""}>${o}${o === w.active_profile ? " (active)" : ""}</option>`).join("")}</select>
-        <button class="s" onclick="act('power ${esc(p.name)}', () => host('${esc(p.name)}', '/api/power/apply', {profile: $('#pw_${esc(p.name)}').value}))" ${w.can_apply ? "" : "disabled"}>Apply</button>
+        <button class="s" onclick="act(${js("power " + p.name)}, () => host(${js(p.name)}, '/api/power/apply', {profile: document.getElementById(${js("pw_" + p.name)}).value}))" ${w.can_apply ? "" : "disabled"}>Apply</button>
         ${w.can_apply ? "" : `<div class="sub">allow it: <span class="mono">${esc(w.sudoers_hint)}</span></div>`}` : `<span class="sub">ryzenadj not installed</span>`}</td></tr>`;
   }).join("");
   return `<section><h3>Power</h3><div class="tw"><table><tr><th>Machine</th><th>Now</th><th>At boot (ryzenadj.service)</th><th>Current limits (sustained / slow / fast)</th><th>Profile</th></tr>${rows}</table></div>
@@ -404,7 +407,7 @@ function jobsView() {
   const rows = fleet.peers.flatMap(p => (status[p.name]?.jobs || []).map(j => ({ h: p.name, ...j })))
     .sort((a, b) => b.started - a.started)
     .map(j => `<tr><td>${esc(j.h)}</td><td>${esc(j.title)}</td><td class="${j.state === "ok" ? "ok" : j.state === "failed" ? "bad" : j.state === "cancelled" ? "muted" : ""}">${esc(j.state)} ${j.state === "running" ? `<span class="prog"><div style="width:${((j.progress || 0) * 100).toFixed(0)}%"></div></span>` : ""}</td>
-      <td>${esc(j.summary || (j.log || []).slice(-1)[0] || "")}</td><td class="sub">${when(j.started)}</td><td style="white-space:nowrap">${j.state === "running" ? cancelBtn(j.h, j.id, j.title) + " " : ""}<button class="s" onclick="jobLog('${esc(j.h)}', ${j.id})">Log</button></td></tr>`).join("");
+      <td>${esc(j.summary || (j.log || []).slice(-1)[0] || "")}</td><td class="sub">${when(j.started)}</td><td style="white-space:nowrap">${j.state === "running" ? cancelBtn(j.h, j.id, j.title) + " " : ""}<button class="s" onclick="jobLog(${js(j.h)}, ${+j.id})">Log</button></td></tr>`).join("");
   return `<section><h3>Jobs</h3><div class="tw"><table><tr><th>Machine</th><th>Job</th><th>State</th><th>Latest</th><th>Started</th><th></th></tr>${rows || `<tr><td colspan="6" class="sub">none</td></tr>`}</table></div></section>`;
 }
 async function jobLog(h, id) {

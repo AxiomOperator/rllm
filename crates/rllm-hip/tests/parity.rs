@@ -1,6 +1,7 @@
 //! Every HIP op against the CPU reference backend on random inputs (the
 //! same tests as rllm-cuda's).
 
+use rllm_hip::set_gdn_chunked_for_tests;
 use rllm_hip::HipBackend as GpuBackend;
 
 const VENDOR: &str = "HIP";

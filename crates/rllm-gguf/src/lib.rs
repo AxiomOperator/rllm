@@ -137,14 +137,56 @@ pub struct TensorInfo {
     /// Dimensions in GGUF order: `dims[0]` is the innermost (contiguous) axis.
     pub dims: Vec<u64>,
     pub dtype: DType,
-    /// Absolute byte offset of the tensor data in the file.
+    /// Byte offset of the tensor data in its buffer (for a GGUF file: in the
+    /// file).
     pub offset: usize,
     pub size: usize,
+    /// Which of the container's buffers holds the data (a GGUF file has
+    /// one; a checkpoint assembled with [`Gguf::from_parts`], one per shard
+    /// plus any tensors built at load).
+    pub buffer: usize,
 }
 
 impl TensorInfo {
     pub fn numel(&self) -> u64 {
         self.dims.iter().product()
+    }
+}
+
+/// Bytes tensors are read from: a memory-mapped file (whose pages
+/// [`Gguf::release`] can give back), or memory built at load.
+pub struct Backing {
+    data: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    map: Option<Arc<Mmap>>,
+    /// Kept to drop the file's page cache (see [`Gguf::release`]).
+    file: Option<File>,
+}
+
+impl Backing {
+    /// A file mapped read-only.
+    pub fn map_file(path: impl AsRef<Path>) -> Result<Self> {
+        let file = File::open(path)?;
+        // SAFETY: the file is opened read-only. Modifying it while mapped is
+        // undefined behaviour, same as for every other mmap-based model loader.
+        let map = Arc::new(unsafe { Mmap::map(&file)? });
+        Ok(Self { data: map.clone(), map: Some(map), file: Some(file) })
+    }
+
+    /// Bytes in memory (tensors converted at load).
+    pub fn owned(bytes: Vec<u8>) -> Self {
+        Self { data: Arc::new(bytes), map: None, file: None }
+    }
+
+    pub fn len(&self) -> usize {
+        (*self.data).as_ref().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        (*self.data).as_ref()
     }
 }
 
@@ -154,24 +196,39 @@ pub struct Gguf {
     pub tensors: Vec<TensorInfo>,
     meta_index: HashMap<String, usize>,
     tensor_index: HashMap<String, usize>,
-    mmap: Arc<Mmap>,
-    /// Kept to drop the file's page cache (see [`Self::release`]).
-    file: Option<File>,
+    buffers: Vec<Backing>,
 }
 
 impl Gguf {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let file = File::open(path)?;
-        // SAFETY: the file is opened read-only. Modifying it while mapped is
-        // undefined behaviour, same as for every other mmap-based model loader.
-        let mmap = unsafe { Mmap::map(&file)? };
-        let mut g = Self::parse(Arc::new(mmap))?;
-        g.file = Some(file);
-        Ok(g)
+        Self::parse(Backing::map_file(path)?)
     }
 
-    fn parse(mmap: Arc<Mmap>) -> Result<Self> {
-        let mut r = Reader { buf: &mmap, pos: 0 };
+    /// A container assembled from parts (another checkpoint format seen as
+    /// GGUF: its metadata keys and tensor names). Tensors are checked
+    /// against their buffers as a file's would be.
+    pub fn from_parts(metadata: Vec<(String, Value)>, tensors: Vec<TensorInfo>, buffers: Vec<Backing>) -> Result<Self> {
+        let mut meta_index: HashMap<String, usize> = HashMap::with_capacity(metadata.len());
+        for (i, (k, _)) in metadata.iter().enumerate() {
+            if meta_index.insert(k.clone(), i).is_some() {
+                return Err(Error::Malformed(format!("duplicate metadata key {k:?}")));
+            }
+        }
+        for t in &tensors {
+            let numel = t.dims.iter().try_fold(1u64, |a, &d| a.checked_mul(d));
+            let expect = numel.map(|n| n / t.dtype.block_size() as u64 * t.dtype.block_bytes() as u64);
+            let fits = buffers.get(t.buffer).is_some_and(|b| t.offset.checked_add(t.size).is_some_and(|e| e <= b.len()));
+            if expect != Some(t.size as u64) || !fits || t.dims.first().copied().unwrap_or(1) % t.dtype.block_size() as u64 != 0 {
+                return Err(Error::TensorBounds(t.name.clone()));
+            }
+        }
+        let tensor_index = index_tensors(&tensors)?;
+        Ok(Self { version: 3, metadata, tensors, meta_index, tensor_index, buffers })
+    }
+
+    fn parse(backing: Backing) -> Result<Self> {
+        let mmap = backing.bytes();
+        let mut r = Reader { buf: mmap, pos: 0 };
         if r.u32("magic")? != MAGIC {
             return Err(Error::BadMagic);
         }
@@ -247,14 +304,9 @@ impl Gguf {
                 return Err(Error::TensorBounds(name));
             }
             let offset = (data_start + offset) as usize;
-            tensors.push(TensorInfo { name, dims, dtype, offset, size: size as usize });
+            tensors.push(TensorInfo { name, dims, dtype, offset, size: size as usize, buffer: 0 });
         }
-        let mut tensor_index = HashMap::with_capacity(tensors.len());
-        for (i, t) in tensors.iter().enumerate() {
-            if tensor_index.insert(t.name.clone(), i).is_some() {
-                return Err(Error::Malformed(format!("duplicate tensor {:?}", t.name)));
-            }
-        }
+        let tensor_index = index_tensors(&tensors)?;
         // Tensors' data must not overlap (empty tensors take no space).
         let mut by_offset: Vec<&TensorInfo> = tensors.iter().filter(|t| t.size > 0).collect();
         by_offset.sort_by_key(|t| t.offset);
@@ -262,7 +314,7 @@ impl Gguf {
             return Err(Error::Malformed(format!("tensors {:?} and {:?} overlap", w[0].name, w[1].name)));
         }
 
-        Ok(Self { version, metadata, tensors, meta_index, tensor_index, mmap, file: None })
+        Ok(Self { version, metadata, tensors, meta_index, tensor_index, buffers: vec![backing] })
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
@@ -297,14 +349,15 @@ impl Gguf {
         self.tensor(name).ok_or_else(|| Error::MissingTensor(name.into()))
     }
 
-    /// Raw bytes of a tensor, borrowed from the mapping.
+    /// Raw bytes of a tensor, borrowed from its buffer.
     pub fn tensor_data(&self, info: &TensorInfo) -> &[u8] {
-        &self.mmap[info.offset..info.offset + info.size]
+        &self.buffers[info.buffer].bytes()[info.offset..info.offset + info.size]
     }
 
-    /// Shared handle to the underlying mapping, for zero-copy weight views.
-    pub fn mmap(&self) -> &Arc<Mmap> {
-        &self.mmap
+    /// Shared handle to the buffer holding `info`'s data (its bytes are at
+    /// `info.offset..info.offset + info.size`), for zero-copy weight views.
+    pub fn tensor_owner(&self, info: &TensorInfo) -> Arc<dyn AsRef<[u8]> + Send + Sync> {
+        self.buffers[info.buffer].data.clone()
     }
 
     /// Give back the memory holding tensor `name`'s bytes: its pages leave
@@ -316,12 +369,15 @@ impl Gguf {
     /// (pages at the range's edges, shared with neighbours, included).
     pub fn release(&self, name: &str) {
         let Some(info) = self.tensor(name) else { return };
+        let b = &self.buffers[info.buffer];
+        // Memory built at load stays (other tensors may share it).
+        let Some(map) = &b.map else { return };
         #[cfg(unix)]
         {
             // SAFETY: sysconf has no preconditions.
             let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
             let start = info.offset / page * page;
-            let end = (info.offset + info.size).div_ceil(page).saturating_mul(page).min(self.mmap.len());
+            let end = (info.offset + info.size).div_ceil(page).saturating_mul(page).min(map.len());
             if end <= start {
                 return;
             }
@@ -330,14 +386,24 @@ impl Gguf {
             // table entries (later reads fault the data back in from the
             // file); posix_fadvise only advises the kernel's page cache.
             unsafe {
-                libc::madvise(self.mmap.as_ptr().add(start) as *mut libc::c_void, end - start, libc::MADV_DONTNEED);
-                if let Some(f) = &self.file {
+                libc::madvise(map.as_ptr().add(start) as *mut libc::c_void, end - start, libc::MADV_DONTNEED);
+                if let Some(f) = &b.file {
                     use std::os::fd::AsRawFd;
                     libc::posix_fadvise(f.as_raw_fd(), start as libc::off_t, (end - start) as libc::off_t, libc::POSIX_FADV_DONTNEED);
                 }
             }
         }
     }
+}
+
+fn index_tensors(tensors: &[TensorInfo]) -> Result<HashMap<String, usize>> {
+    let mut tensor_index = HashMap::with_capacity(tensors.len());
+    for (i, t) in tensors.iter().enumerate() {
+        if tensor_index.insert(t.name.clone(), i).is_some() {
+            return Err(Error::Malformed(format!("duplicate tensor {:?}", t.name)));
+        }
+    }
+    Ok(tensor_index)
 }
 
 /// A few metadata values read cheaply with [`peek`].
@@ -671,5 +737,48 @@ mod tests {
         }
         // Too many dims.
         assert!(matches!(parse(&file(1, 0, &tensor("w", &[1; 9], 0, 0))), Err(Error::Malformed(_))));
+    }
+}
+
+#[cfg(test)]
+mod parts_tests {
+    use super::*;
+
+    fn f32_tensor(name: &str, dims: Vec<u64>, buffer: usize, offset: usize) -> TensorInfo {
+        let size = dims.iter().product::<u64>() as usize * 4;
+        TensorInfo { name: name.into(), dims, dtype: DType::F32, offset, size, buffer }
+    }
+
+    #[test]
+    fn assembled_containers_read_from_their_buffers() {
+        let a: Vec<u8> = (0..16u8).collect();
+        let b: Vec<u8> = (100..132u8).collect();
+        let g = Gguf::from_parts(
+            vec![("general.architecture".into(), Value::String("qwen3".into()))],
+            vec![f32_tensor("x", vec![2, 2], 0, 0), f32_tensor("y", vec![4], 1, 16)],
+            vec![Backing::owned(a), Backing::owned(b)],
+        )
+        .unwrap();
+        assert_eq!(g.get_str("general.architecture").unwrap(), "qwen3");
+        assert_eq!(g.tensor_data(g.tensor("x").unwrap()), &(0..16u8).collect::<Vec<_>>()[..]);
+        assert_eq!(g.tensor_data(g.tensor("y").unwrap())[0], 116);
+        let y = g.tensor("y").unwrap();
+        assert_eq!((*g.tensor_owner(y)).as_ref().len(), 32);
+        g.release("y"); // owned memory: a no-op
+    }
+
+    #[test]
+    fn assembled_tensors_are_bounds_checked() {
+        let bad = [
+            f32_tensor("past_end", vec![4], 0, 4),
+            f32_tensor("no_buffer", vec![1], 1, 0),
+            TensorInfo { name: "wrong_size".into(), dims: vec![4], dtype: DType::F32, offset: 0, size: 8, buffer: 0 },
+        ];
+        for t in bad {
+            let name = t.name.clone();
+            assert!(Gguf::from_parts(Vec::new(), vec![t], vec![Backing::owned(vec![0; 16])]).is_err(), "{name}");
+        }
+        let dup = vec![f32_tensor("t", vec![1], 0, 0), f32_tensor("t", vec![1], 0, 4)];
+        assert!(Gguf::from_parts(Vec::new(), dup, vec![Backing::owned(vec![0; 16])]).is_err());
     }
 }

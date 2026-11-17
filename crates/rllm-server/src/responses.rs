@@ -414,15 +414,13 @@ impl OutputBuilder {
                 self.pending_lp.clear();
                 let i = self.open_item("reasoning", events);
                 self.reasoning.push_str(&t);
-                let cur = self.items[i]["content"][0]["text"].as_str().unwrap_or("").to_owned();
-                self.items[i]["content"][0]["text"] = json!(cur + &t);
+                append_text(&mut self.items[i]["content"][0]["text"], &t);
                 events.push(json!({ "type": "response.reasoning_text.delta", "item_id": self.items[i]["id"], "output_index": i, "content_index": 0, "delta": t }));
             }
             Piece::Content(t) => {
                 let i = self.open_item("message", events);
                 self.content.push_str(&t);
-                let cur = self.items[i]["content"][0]["text"].as_str().unwrap_or("").to_owned();
-                self.items[i]["content"][0]["text"] = json!(cur + &t);
+                append_text(&mut self.items[i]["content"][0]["text"], &t);
                 let lp = if self.logprobs { logprobs_json(&std::mem::take(&mut self.pending_lp)) } else { Vec::new() };
                 if self.logprobs {
                     self.items[i]["content"][0]["logprobs"].as_array_mut().unwrap().extend(lp.iter().cloned());
@@ -713,4 +711,13 @@ pub async fn input_tokens(State(state): State<Arc<AppState>>, body: Bytes) -> Ap
     }
     let (prompt, ..) = util::blocking(move || build(&state, &m)).await?;
     Ok(Json(json!({ "object": "response.input_tokens", "input_tokens": prompt.ids.len() })))
+}
+
+/// Append to a JSON string in place (rebuilding it per piece is quadratic
+/// over a long output).
+fn append_text(v: &mut Value, t: &str) {
+    match v {
+        Value::String(s) => s.push_str(t),
+        other => *other = Value::String(t.to_owned()),
+    }
 }

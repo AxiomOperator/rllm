@@ -28,7 +28,11 @@ use crate::{Batch, Model, StepOut};
 pub struct Gemma4Config {
     pub n_layers: usize,
     pub hidden: usize,
+    /// The widest layer's FFN (sizes the scratch buffers).
     pub ffn: usize,
+    /// Each layer's FFN width: one value, or per layer (double-wide MLPs:
+    /// the KV-sharing layers of Gemma 4 E2B/E4B are twice as wide).
+    pub ffn_layers: Vec<usize>,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub head_dim_global: usize,
@@ -73,7 +77,18 @@ impl Gemma4Config {
             // last sliding (n-2) layer; check the layout actually matches that.
             bail!("unexpected layer layout for KV sharing");
         }
-        for key in ["feed_forward_length", "attention.head_count", "attention.head_count_kv"] {
+        // feed_forward_length: one value, or one per layer.
+        let ffn_layers: Vec<usize> = match g.get(&k("feed_forward_length")).and_then(|v| v.as_array()) {
+            Some(a) => a
+                .iter()
+                .map(|v| v.as_u64().map(|x| x as usize).filter(|&x| (1..=MAX_DIM).contains(&x)).with_context(|| format!("feed_forward_length: unexpected entry {}", v.summary())))
+                .collect::<Result<_>>()?,
+            None => vec![u("feed_forward_length")?; n_layers],
+        };
+        if ffn_layers.len() != n_layers {
+            bail!("feed_forward_length has {} entries for {n_layers} layers", ffn_layers.len());
+        }
+        for key in ["attention.head_count", "attention.head_count_kv"] {
             if g.get(&k(key)).is_some_and(|v| v.as_array().is_some()) {
                 bail!("per-layer {key} not supported yet");
             }
@@ -101,7 +116,8 @@ impl Gemma4Config {
         let cfg = Self {
             n_layers,
             hidden: u("embedding_length")?,
-            ffn: u("feed_forward_length")?,
+            ffn: ffn_layers.iter().copied().max().unwrap_or(0),
+            ffn_layers,
             n_heads: u("attention.head_count")?,
             n_kv_heads: u("attention.head_count_kv")?,
             head_dim_global,
@@ -183,6 +199,7 @@ impl Gemma4Config {
             let p = |s: &str| format!("blk.{i}.{s}.weight");
             let hd = c.head_dim(i);
             let (qw, kvw) = (c.n_heads * hd, c.n_kv_heads * hd);
+            let f = c.ffn_layers[i];
             for (name, dims) in [
                 ("attn_norm", &[d][..]),
                 ("attn_q", &[d, qw]),
@@ -190,9 +207,9 @@ impl Gemma4Config {
                 ("attn_output", &[qw, d]),
                 ("post_attention_norm", &[d]),
                 ("ffn_norm", &[d]),
-                ("ffn_gate", &[d, c.ffn]),
-                ("ffn_up", &[d, c.ffn]),
-                ("ffn_down", &[c.ffn, d]),
+                ("ffn_gate", &[d, f]),
+                ("ffn_up", &[d, f]),
+                ("ffn_down", &[f, d]),
                 ("post_ffw_norm", &[d]),
             ] {
                 check_shape(g, &p(name), dims)?;
@@ -486,11 +503,11 @@ impl<B: Backend> Gemma4<B> {
             // x in ple_gate below (fused backends can't update it in place).
             let ffn = (&l.gate, &l.up, &l.down, Activation::GeluTanh);
             if let Some(xn) = xn.as_mut().filter(|_| l.ple_gate.is_some()) {
-                b.norm_add_gated_ffn(&h, &l.post_attn_norm, &x, xn, n, d, c.rms_eps, 1.0, &l.ffn_norm, ffn, &mut q, &mut attn, &mut gate, &mut up, c.ffn)?;
+                b.norm_add_gated_ffn(&h, &l.post_attn_norm, &x, xn, n, d, c.rms_eps, 1.0, &l.ffn_norm, ffn, &mut q, &mut attn, &mut gate, &mut up, c.ffn_layers[li])?;
                 std::mem::swap(&mut x, xn);
             } else {
                 b.rms_norm_add(&h, &l.post_attn_norm, &mut x, n, d, c.rms_eps, 1.0, Some((&l.ffn_norm, &mut q, &[&l.gate, &l.up])))?;
-                b.gated_ffn(&q, &l.gate, &l.up, &l.down, Activation::GeluTanh, &mut attn, &mut gate, &mut up, n, c.ffn)?;
+                b.gated_ffn(&q, &l.gate, &l.up, &l.down, Activation::GeluTanh, &mut attn, &mut gate, &mut up, n, c.ffn_layers[li])?;
             }
 
             // Per-layer embedding branch:

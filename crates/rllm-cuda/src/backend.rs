@@ -88,7 +88,52 @@ unsafe impl gpu::DeviceRepr for QOut {}
 const MMQ_BN: usize = 64;
 
 /// Must match MV_TARGETS in kernels.cu.
-const MATVEC_TARGETS: usize = 3;
+/// Weights one matvec launch takes (mirrors MV_TARGETS in kernels.cu): four,
+/// for the GDN (qkv, z, alpha, beta) and gated-attention (q, gate, k, v)
+/// input projections.
+const MATVEC_TARGETS: usize = 4;
+
+/// With `RLLM_GDN_CHUNKED=1`, Gated DeltaNet steps of more than this many
+/// tokens without snapshots run the chunked recurrence (`gdn_chunk`);
+/// decode and verification steps always run `gdn_scan`, so a token's
+/// numbers don't depend on whether it was verified with drafts or decoded
+/// alone (the batch-invariant decode step limit).
+const GDN_SCAN_MAX_TOKENS: usize = 8;
+
+/// MoE prefill uses 32-pair expert tiles while the experts average fewer
+/// pairs than this (RLLM_MOE_TILE32_ROWS overrides). On gfx1151 with
+/// Qwen3.6-35B-A3B (256 experts, 8 per token): pp512 1441 -> 1603 tok/s,
+/// pp1024 1716 -> 1827, no change from pp2048.
+const MOE_TILE32_ROWS: usize = 48;
+
+/// Threads of a moe_matvec_glu block (one 32-row unit; each warp takes
+/// 32 / (threads / 32) of its rows).
+const MOE_GLU_THREADS: u32 = 1024;
+
+/// Lanes per value column in gdn_scan (mirrors GDN_SCAN_LANES in kernels.cu).
+const GDN_SCAN_LANES: u32 = 4;
+
+/// The chunked GDN recurrence is opt-in: on gfx1151 (Qwen3.6-35B-A3B) it
+/// measured slower than the column-split scan (pp512 1256 vs 1431 tok/s,
+/// pp4096 1440 vs 1714): without matrix cores its chunk products cost about
+/// twice the scan's work per token. Kept for measuring on other GPUs.
+/// Tests run both recurrences (see `set_gdn_chunked_for_tests`).
+static FORCE_CHUNKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn force_chunked() -> bool {
+    FORCE_CHUNKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Make prompt-sized GDN steps use the chunked recurrence (parity tests).
+#[doc(hidden)]
+pub fn set_gdn_chunked_for_tests(on: bool) {
+    FORCE_CHUNKED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn gdn_chunked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RLLM_GDN_CHUNKED").is_ok_and(|v| v == "1"))
+}
 
 /// Mirrors `struct MvTarget` / `MvTargets` in kernels.cu (raw device pointers).
 #[repr(C)]
@@ -192,6 +237,9 @@ impl Fmt {
             Fmt::F32 => (4 * k, 0, 0),
             Fmt::F16 | Fmt::BF16 => (2 * k, 0, 0),
             Fmt::Q8 => (k, 0, k / 32 * 2),
+            // Scales per 256 values (see q4_dm, iq4_scale and q6_scale in
+            // kernels.cu, and why they stay padded): Q4/Q5 20 bytes, IQ4 16,
+            // Q6 32.
             Fmt::Q4 => (k / 2, 0, k / 256 * 20),
             Fmt::Q5 => (k / 2, k / 8, k / 256 * 20),
             Fmt::IQ4 => (k / 2, 0, k / 32 * 2),
@@ -292,6 +340,13 @@ struct Flags {
     mmq: Option<bool>,
     mmq_min: usize,
     no_fused_quant: bool,
+    /// RLLM_MOE_GROUP=1: multi-token MoE decode grouped by expert (an
+    /// expert chosen by several tokens streamed once). Off by default: on
+    /// gfx1151 (Qwen3.6-35B-A3B) the sorting launches cost more than the
+    /// shared reads save (8-way decode 169 vs 176 tok/s, MTP 74.9 vs 77.5).
+    moe_group: bool,
+    /// RLLM_NO_MOE_TILE32: MoE prefill always in 64-pair tiles.
+    no_moe_tile32: bool,
     no_glu_mmq: bool,
     bf16_via_f16: bool,
     no_fa: bool,
@@ -310,6 +365,8 @@ static FLAGS: std::sync::LazyLock<Flags> = std::sync::LazyLock::new(|| {
         },
         mmq_min: std::env::var("RLLM_MMQ_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(4 << 20),
         no_fused_quant: set("RLLM_NO_FUSED_QUANT"),
+        moe_group: set("RLLM_MOE_GROUP"),
+        no_moe_tile32: set("RLLM_NO_MOE_TILE32"),
         no_glu_mmq: set("RLLM_NO_GLU_MMQ"),
         bf16_via_f16: set("RLLM_BF16_VIA_F16") || gpu::BF16_VIA_F16,
         no_fa: set("RLLM_NO_FA"),
@@ -389,6 +446,10 @@ pub struct CudaBackend {
     /// (buffer pointer, length, in `glu_scratch`) whose int8 form is held in
     /// scratch, written by the producing kernel. Cleared by every other launch.
     prequant: Mutex<Option<(u64, usize, bool)>>,
+    /// Normalized q and k a GDN conv wrote for its output buffer: (conv
+    /// output pointer, its length, the q/k buffer). Taken by the next
+    /// gated_delta_net on that buffer, which then skips gdn_prep.
+    gdn_qk: Mutex<Option<(u64, usize, CudaBuf)>>,
     /// Producers only emit int8 copies when a consumer will use them: in
     /// decode-sized steps (quantized weights then always take the int8 matvec)
     /// and only if any quantized matrix was uploaded.
@@ -459,6 +520,17 @@ impl CudaWeight {
 /// `#[repr(C)]` with the pointer first: passing `&CudaBuf` as a kernel argument
 /// hands the kernel exactly that pointer.
 #[repr(C)]
+/// moe_ffn_add_norm's residual add and norm (device pointers).
+#[derive(Clone, Copy)]
+struct MoeFuse {
+    x: u64,
+    w: u64,
+    out: u64,
+    eps: f32,
+    qo: QOut,
+    has_next: i32,
+}
+
 pub struct CudaBuf {
     ptr: u64,
     len: usize,
@@ -655,6 +727,397 @@ pub fn probe_devices() -> Vec<DeviceInfo> {
 }
 
 impl CudaBackend {
+    /// moe_ffn; with `fuse`, the combine is added to a residual and normed
+    /// (moe_ffn_add_norm) instead of written to `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_ffn_impl(&self, x: &CudaBuf, logits: &CudaBuf, moe: &MoeFfn<CudaWeight>, shared: Option<(&CudaBuf, &CudaBuf)>, out: &mut CudaBuf, m: usize, fuse: Option<MoeFuse>) -> Result<()> {
+        self.in_step(|| {
+
+            let MoeFfn { gate, up, down, n_expert: ne, n_used: k, n_ff, norm_topk, scale } = *moe;
+            let d = gate.cols;
+            if k == 0 || k > ne.min(32) || ne > 1024 || gate.rows != ne * n_ff || up.rows != ne * n_ff || up.cols != d || down.rows != ne * d || down.cols != n_ff {
+                return Err(Error::Shape(format!(
+                    "moe_ffn: {ne} experts (top {k}) of {n_ff}: gate {}x{}, up {}x{}, down {}x{} (at most 1024 experts, 32 per token)",
+                    gate.rows, gate.cols, up.rows, up.cols, down.rows, down.cols
+                )));
+            }
+            if !n_ff.is_multiple_of(32) || !d.is_multiple_of(32) {
+                return Err(Error::Shape(format!("moe_ffn: widths {d} and {n_ff} must be multiples of 32")));
+            }
+            // Quantized experts run on int8 activations; float ones (f32, f16,
+            // bf16) on f32 activations with f32 accumulation. Rows must split
+            // into 8-value vector loads.
+            if !n_ff.is_multiple_of(8) || !d.is_multiple_of(8) {
+                return Err(Error::Shape(format!("moe_ffn: widths {d} and {n_ff} must be multiples of 8")));
+            }
+            check_len("moe_ffn x", x.len(), m * d)?;
+            check_len("moe_ffn logits", logits.len(), m * ne)?;
+            check_len("moe_ffn out", out.len(), m * d)?;
+            if let Some((y, g)) = shared {
+                check_len("moe_ffn shared", y.len(), m * d)?;
+                check_len("moe_ffn shared gate", g.len(), m)?;
+            }
+            if m == 0 {
+                return Ok(());
+            }
+            let grouped = m > MATVEC_MAX_M;
+            if grouped && !self.mmq {
+                // No int8 MMA: run decode-sized pieces.
+                for t0 in (0..m).step_by(MATVEC_MAX_M) {
+                    let n = MATVEC_MAX_M.min(m - t0);
+                    let view = |b: &CudaBuf, w: usize| CudaBuf { ptr: b.ptr + (t0 * w * 4) as u64, len: n * w, _owner: None };
+                    let mut o = view(out, d);
+                    let sv = shared.map(|(y, g)| (view(y, d), view(g, 1)));
+                    self.moe_ffn(&view(x, d), &view(logits, ne), moe, sv.as_ref().map(|(y, g)| (y, g)), &mut o, n)?;
+                }
+                return Ok(());
+            }
+            let np = m * k;
+            let (mi, nei, ki, di, nffi) = (m as i32, ne as i32, k as i32, d as i32, n_ff as i32);
+            // Routing: one warp per token.
+            let (ids, wts) = (self.alloc(np)?, self.alloc(np)?);
+            let (norm, one) = (norm_topk as i32, 1i32);
+            launch!(self, "moe_route", grid_1d(m * WARP as usize, 128)?, [logits, &mi, &nei, &ki, &norm, &scale, &ids, &wts])?;
+            // Each projection runs on int8 activations (quantized experts) or
+            // on f32 ones (float experts); the hidden rows feed the down
+            // projection as int8 or f32 to match it.
+            let down_q = down.fmt.quantized();
+            let int8_in = gate.fmt.quantized() || up.fmt.quantized();
+            let (xq, xd, xs) = if int8_in {
+                let (xq, xd, xs) = (self.alloc((m * d).div_ceil(4))?, self.alloc(m * d / 32)?, self.alloc(m * d / 32)?);
+                let nu = (m * d / 32) as i64;
+                launch!(self, "quantize_q8", grid_1d(m * d / 32 * 8, 256)?, [x, &xq, &xd, &xs, &nu])?;
+                (Some(xq), Some(xd), Some(xs))
+            } else {
+                (None, None, None)
+            };
+            let (hq, hd, hs) = if down_q {
+                (Some(self.alloc((np * n_ff).div_ceil(4))?), Some(self.alloc(np * n_ff / 32)?), Some(self.alloc(np * n_ff / 32)?))
+            } else {
+                (None, None, None)
+            };
+            let qo = match (&hq, &hd, &hs) {
+                (Some(q), Some(d), Some(s)) => QOut { q: q.ptr, d: d.ptr, s: s.ptr, on: 1 },
+                _ => QOut::default(),
+            };
+            let y = self.alloc(np * d)?;
+            let target = |w: &CudaWeight| {
+                let (sq, sh, ss) = w.strides();
+                MvTarget {
+                    qs: w.qs.device_ptr(&self.stream).0,
+                    qh: w.qh().device_ptr(&self.stream).0,
+                    sc: w.sc().device_ptr(&self.stream).0,
+                    qs_row: sq,
+                    qh_row: sh,
+                    sc_row: ss,
+                    ..Default::default()
+                }
+            };
+            let ptr = |b: &Option<CudaBuf>| b.as_ref().map_or(0u64, |b| b.ptr);
+            let (xq_p, xd_p, xs_p) = (ptr(&xq), ptr(&xd), ptr(&xs));
+            let null = 0u64;
+            let fused = gate.fmt == up.fmt && gate.fmt.quantized();
+            let len = (np * n_ff) as i64;
+            // f32 hidden rows (written for a float down projection).
+            let h32: Option<CudaBuf>;
+            let write_h = (!down_q) as i32;
+            if !grouped && m > 1 && fused && down_q && FLAGS.moe_group {
+                // Decode with several tokens (a batch, a speculative
+                // verification): the pairs sorted by expert, so an expert
+                // chosen by several tokens is streamed once for all of them.
+                let max_tiles = np;
+                let (counts, offsets, cursor) = (self.alloc(ne)?, self.alloc(ne)?, self.alloc(ne)?);
+                let (tiles, pos, rowmap) = (self.alloc(1 + 3 * max_tiles)?, self.alloc(np)?, self.alloc(np)?);
+                if !self.replaying() {
+                    // SAFETY: `counts` holds `ne` 4-byte values.
+                    unsafe { gpu::memset_zero_async(counts.ptr, ne * 4, &self.stream) }.map_err(err)?;
+                }
+                let (npi, rows_per_tile) = (np as i32, MATVEC_MAX_M as i32);
+                launch!(self, "moe_count", grid_1d(np, 256)?, [&ids, &npi, &counts])?;
+                let scan = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (ne.next_power_of_two().max(32) as u32, 1, 1), shared_mem_bytes: 0 };
+                launch!(self, "moe_scan", scan, [&counts, &nei, &rows_per_tile, &offsets, &cursor, &tiles])?;
+                launch!(self, "moe_place", grid_1d(np, 256)?, [&ids, &npi, &ki, &offsets, &cursor, &pos, &rowmap])?;
+                // The pairs' int8 inputs in expert order.
+                let (xg, xdg) = (self.alloc((np * d).div_ceil(4))?, self.alloc(np * d / 32)?);
+                let gcfg = LaunchConfig { grid_dim: (np as u32, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+                launch!(self, "gather_q8_rows", gcfg, [&xq_p, &xd_p, &rowmap, &di, &xg, &xdg])?;
+                let (tg, tu) = (target(gate), target(up));
+                let cfg = LaunchConfig { grid_dim: ((n_ff / 32) as u32, max_tiles as u32, 1), block_dim: (MOE_GLU_THREADS, 1, 1), shared_mem_bytes: 0 };
+                let null_out = 0u64;
+                launch!(self, format!("moe_matvec_glu_grp_{}", gate.fmt.suffix()), cfg, [&tg, &tu, &tiles, &xg, &xdg, &di, &nffi, &qo, &null_out, &write_h])?;
+                let td = target(down);
+                let (hq_p, hd_p) = (ptr(&hq), ptr(&hd));
+                let dcfg = LaunchConfig { grid_dim: (d.div_ceil(MATVEC_WARPS as usize) as u32, max_tiles as u32, 1), block_dim: (MATVEC_WARPS * WARP, 1, 1), shared_mem_bytes: 0 };
+                launch!(self, format!("moe_matvec_grp_{}", down.fmt.suffix()), dcfg, [&td, &tiles, &hq_p, &hd_p, &nffi, &di, &y])?;
+                return self.moe_finish(&y, &wts, Some(&pos), shared, out, m, k, d, fuse);
+            }
+            if !grouped {
+                // Decode: per (token, expert) pair, reading only the chosen experts.
+                let float_cfg = |n: usize| LaunchConfig { grid_dim: (n.div_ceil(8) as u32, np as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                let quant_cfg = |n: usize| LaunchConfig { grid_dim: (n.div_ceil(MATVEC_WARPS as usize) as u32, np as u32, 1), block_dim: (MATVEC_WARPS * WARP, 1, 1), shared_mem_bytes: 0 };
+                if fused {
+                    let (tg, tu) = (target(gate), target(up));
+                    let h = if down_q { None } else { Some(self.alloc(np * n_ff)?) };
+                    let hp = ptr(&h);
+                    let threads = std::env::var("RLLM_MOE_GLU_THREADS").ok().and_then(|v| v.parse::<u32>().ok()).filter(|t| [256, 512, 1024].contains(t)).unwrap_or(MOE_GLU_THREADS);
+                    let cfg = LaunchConfig { grid_dim: ((n_ff / 32) as u32, np as u32, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+                    launch!(self, format!("moe_matvec_glu_{}", gate.fmt.suffix()), cfg, [&tg, &tu, &ids, &xq_p, &xd_p, &di, &nffi, &ki, &qo, &hp, &write_h])?;
+                    h32 = h;
+                } else {
+                    let (g, u) = (self.alloc(np * n_ff)?, self.alloc(np * n_ff)?);
+                    for (w, o) in [(gate, &g), (up, &u)] {
+                        let t = target(w);
+                        if w.fmt.quantized() {
+                            launch!(self, format!("moe_matvec_{}", w.fmt.suffix()), quant_cfg(n_ff), [&t, &ids, &xq_p, &xd_p, &di, &nffi, &ki, o])?;
+                        } else {
+                            launch!(self, format!("moe_matvec_f_{}", w.fmt.suffix()), float_cfg(n_ff), [&t, &ids, x, &di, &nffi, &ki, o])?;
+                        }
+                    }
+                    launch!(self, "silu_mul", grid_1d(np * n_ff, 256)?, [&g, &u, &len, &qo, &write_h])?;
+                    h32 = Some(g);
+                }
+                let td = target(down);
+                if down_q {
+                    let (hq_p, hd_p) = (ptr(&hq), ptr(&hd));
+                    launch!(self, format!("moe_matvec_{}", down.fmt.suffix()), quant_cfg(d), [&td, &ids, &hq_p, &hd_p, &nffi, &di, &one, &y])?;
+                } else {
+                    let h = h32.as_ref().expect("f32 hidden for a float down projection");
+                    launch!(self, format!("moe_matvec_f_{}", down.fmt.suffix()), float_cfg(d), [&td, &ids, h, &nffi, &di, &one, &y])?;
+                }
+                return self.moe_finish(&y, &wts, None, shared, out, m, k, d, fuse);
+            }
+            // Prefill: sort the pairs by expert, then grouped GEMMs (one tile
+            // list for all experts) over the gate/up and down projections.
+            const _: () = assert!(MMQ_BN == 64, "moe_gemm_f's tile height (MOE_GF_BN) is 64");
+            // Tiles of 32 pairs when the experts average fewer than 32 rows
+            // (short prompts over many experts: 64-row tiles would be mostly
+            // empty); quantized experts only (moe_gemm_f takes 64).
+            let all_quant = gate.fmt.quantized() && up.fmt.quantized() && down_q;
+            let below = std::env::var("RLLM_MOE_TILE32_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(MOE_TILE32_ROWS);
+            let tile = if all_quant && np < below * ne && !FLAGS.no_moe_tile32 { 32 } else { MMQ_BN };
+            let id = if tile == 32 { "mmq_id32" } else { "mmq_id" };
+            let max_tiles = np.div_ceil(tile) + ne;
+            let (counts, offsets, cursor) = (self.alloc(ne)?, self.alloc(ne)?, self.alloc(ne)?);
+            let (tiles, pos, rowmap) = (self.alloc(1 + 3 * max_tiles)?, self.alloc(np)?, self.alloc(np)?);
+            if !self.replaying() {
+                // SAFETY: `counts` holds `ne` 4-byte values.
+                unsafe { gpu::memset_zero_async(counts.ptr, ne * 4, &self.stream) }.map_err(err)?;
+            }
+            let (npi, bn) = (np as i32, tile as i32);
+            launch!(self, "moe_count", grid_1d(np, 256)?, [&ids, &npi, &counts])?;
+            // One block, a thread per expert (ne <= 1024).
+            let scan = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (ne.next_power_of_two().max(32) as u32, 1, 1), shared_mem_bytes: 0 };
+            launch!(self, "moe_scan", scan, [&counts, &nei, &bn, &offsets, &cursor, &tiles])?;
+            launch!(self, "moe_place", grid_1d(np, 256)?, [&ids, &npi, &ki, &offsets, &cursor, &pos, &rowmap])?;
+            let grid = |rows: usize| LaunchConfig { grid_dim: (max_tiles as u32, rows.div_ceil(MMQ_BM) as u32, 1), block_dim: (MMQ_THREADS, 1, 1), shared_mem_bytes: 0 };
+            let float_grid = |rows: usize| LaunchConfig { grid_dim: (max_tiles as u32, rows.div_ceil(64) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            if fused {
+                let (sq, sh, ss) = gate.strides();
+                let h = if down_q { None } else { Some(self.alloc(np * n_ff)?) };
+                let hp = ptr(&h);
+                let cfg = LaunchConfig { grid_dim: (max_tiles as u32, n_ff.div_ceil(MMQ_BM / 2) as u32, 1), ..grid(n_ff) };
+                launch!(
+                    self,
+                    format!("{id}_glu_silu_{}", gate.fmt.suffix()),
+                    cfg,
+                    [&gate.qs, gate.qh(), gate.sc(), &xq_p, &xd_p, &xs_p, &hp, &nffi, &di, &sq, &sh, &ss, &up.qs, up.qh(), up.sc(), &qo, &write_h, &tiles, &rowmap]
+                )?;
+                h32 = h;
+            } else {
+                let (g, u) = (self.alloc(np * n_ff)?, self.alloc(np * n_ff)?);
+                for (w, o) in [(gate, &g), (up, &u)] {
+                    let (sq, sh, ss) = w.strides();
+                    if w.fmt.quantized() {
+                        launch!(self, format!("{id}_{}", w.fmt.suffix()), grid(n_ff), [&w.qs, w.qh(), w.sc(), &xq_p, &xd_p, &xs_p, o, &nffi, &di, &sq, &sh, &ss, &tiles, &rowmap])?;
+                    } else {
+                        launch!(self, format!("moe_gemm_f_{}", w.fmt.suffix()), float_grid(n_ff), [&w.qs, &sq, x, &rowmap, o, &nffi, &di, &tiles])?;
+                    }
+                }
+                launch!(self, "silu_mul", grid_1d(np * n_ff, 256)?, [&g, &u, &len, &qo, &write_h])?;
+                h32 = Some(g);
+            }
+            let (sq, sh, ss) = down.strides();
+            if down_q {
+                let (hq_p, hd_p, hs_p) = (ptr(&hq), ptr(&hd), ptr(&hs));
+                launch!(self, format!("{id}_{}", down.fmt.suffix()), grid(d), [&down.qs, down.qh(), down.sc(), &hq_p, &hd_p, &hs_p, &y, &di, &nffi, &sq, &sh, &ss, &tiles, &null])?;
+            } else {
+                let h = h32.as_ref().expect("f32 hidden for a float down projection");
+                launch!(self, format!("moe_gemm_f_{}", down.fmt.suffix()), float_grid(d), [&down.qs, &sq, h, &null, &y, &di, &nffi, &tiles])?;
+            }
+            self.moe_finish(&y, &wts, Some(&pos), shared, out, m, k, d, fuse)
+        })
+    }
+
+
+    /// The experts' outputs `y` weighted into `out` (moe_combine), or added
+    /// to the residual and normed in one pass (add_moe_rms_norm).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_finish(&self, y: &CudaBuf, wts: &CudaBuf, pos: Option<&CudaBuf>, shared: Option<(&CudaBuf, &CudaBuf)>, out: &mut CudaBuf, m: usize, k: usize, d: usize, fuse: Option<MoeFuse>) -> Result<()> {
+        let (mi, ki, di) = (m as i32, k as i32, d as i32);
+        let pos_p = pos.map_or(0u64, |p| p.ptr);
+        let (sh_ptr, sg_ptr) = shared.map_or((0u64, 0u64), |(y, g)| (y.ptr, g.ptr));
+        match fuse {
+            None => launch!(self, "moe_combine", grid_1d(m * d, 256)?, [y, wts, &pos_p, &*out, &mi, &ki, &di, &sh_ptr, &sg_ptr]),
+            Some(f) => {
+                let threads = (d as u32).next_power_of_two().clamp(WARP, 1024);
+                let cfg = LaunchConfig { grid_dim: (m as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+                launch!(self, "add_moe_rms_norm", cfg, [y, wts, &pos_p, &sh_ptr, &sg_ptr, &f.x, &f.w, &f.out, &ki, &di, &f.eps, &f.qo, &f.has_next])
+            }
+        }
+    }
+
+    /// conv1d_silu; with `gdn`, the q and k channels are also normalized for
+    /// the following gated_delta_net (see `gdn_qk`).
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_impl(
+        &self,
+        x: &CudaBuf,
+        w: &CudaWeight,
+        state: &mut CudaBuf,
+        runs: &SeqRuns,
+        out: &mut CudaBuf,
+        channels: usize,
+        kernel: usize,
+        snaps: Option<(&mut CudaBuf, usize)>,
+        gdn: Option<(GdnShape, f32)>,
+    ) -> Result<()> {
+        self.in_step(|| {
+            let wd = w
+                .dense
+                .as_ref()
+                .filter(|_| w.cols == channels * kernel && (2..=GDN_MAX_KERNEL).contains(&kernel) && channels > 0)
+                .ok_or_else(|| Error::Shape(format!("conv1d_silu: weight must be 1-D with {channels} x {kernel} values (kernel 2..={GDN_MAX_KERNEL})")))?;
+            let n = *runs.starts.last().unwrap_or(&0) as usize;
+            runs.check(n, state.len() / (channels * (kernel - 1)), snaps.as_ref().map_or(usize::MAX, |s| s.1))?;
+            check_len("conv1d_silu x", x.len(), n * channels)?;
+            check_len("conv1d_silu out", out.len(), n * channels)?;
+            let mut cache = self.index_cache.lock().unwrap();
+            self.sync_index(&mut cache, "gdn_starts", runs.starts)?;
+            self.sync_index(&mut cache, "gdn_slots", runs.slots)?;
+            self.sync_index(&mut cache, "gdn_fresh", runs.fresh)?;
+            let (counts, at) = snap_index(runs, snaps.as_ref().map_or(0, |s| s.1))?;
+            self.sync_index(&mut cache, "gdn_snap", &counts)?;
+            self.sync_index(&mut cache, "gdn_snap_at", &at)?;
+            let (st, sl, fr, sn, sa) =
+                (&cache["gdn_starts"].dev, &cache["gdn_slots"].dev, &cache["gdn_fresh"].dev, &cache["gdn_snap"].dev, &cache["gdn_snap_at"].dev);
+            // With the GDN's q/k normalized on the way, a block is one head's
+            // D channels (the q and k heads are the first 2 * n_k_heads).
+            let qk_shape = gdn.filter(|(g, _)| matches!(g.head_dim, 64 | 128) && channels == g.qkv_width());
+            let threads = qk_shape.map_or(128, |(g, _)| g.head_dim);
+            let qk = match qk_shape {
+                Some((g, _)) => Some(self.alloc(n * 2 * g.n_k_heads * g.head_dim)?),
+                None => None,
+            };
+            let (qk_p, qk_ch, qk_eps) = match (&qk, qk_shape) {
+                (Some(b), Some((g, e))) => (b.ptr, (2 * g.n_k_heads * g.head_dim) as i32, e),
+                _ => (0u64, 0i32, 0f32),
+            };
+            let cfg = LaunchConfig { grid_dim: (channels.div_ceil(threads) as u32, runs.n_seqs() as u32, 1), block_dim: (threads as u32, 1, 1), shared_mem_bytes: 0 };
+            let state_cfg = LaunchConfig { grid_dim: (channels.div_ceil(128) as u32, runs.n_seqs() as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+            let (c, k) = (channels as i32, kernel as i32);
+            if let Some((buf, n)) = &snaps {
+                check_len("conv1d_silu snapshots", buf.len(), n * channels * (kernel - 1))?;
+            }
+            let n_snap = snaps.as_ref().map_or(0, |s| s.1) as i32;
+            if n == runs.n_seqs() {
+                // Decode: one token per sequence, one pass.
+                match snaps {
+                    Some((buf, _)) => launch!(self, "conv1d_silu", cfg, [x, wd, state, st, sl, fr, out, &c, &k, buf, sn, sa, &n_snap, &qk_p, &qk_ch, &qk_eps])?,
+                    None => launch!(self, "conv1d_silu", cfg, [x, wd, state, st, sl, fr, out, &c, &k, out, sn, sa, &n_snap, &qk_p, &qk_ch, &qk_eps])?,
+                }
+            } else {
+                // Prompts: every (token, channel) at once (the same sums, so
+                // the same results), then the states and snapshots.
+                let par = LaunchConfig { grid_dim: (channels.div_ceil(threads) as u32, n as u32, 1), block_dim: (threads as u32, 1, 1), shared_mem_bytes: 0 };
+                let ns = runs.n_seqs() as i32;
+                launch!(self, "conv1d_silu_par", par, [x, wd, state, st, sl, fr, &ns, out, &c, &k, &qk_p, &qk_ch, &qk_eps])?;
+                match snaps {
+                    Some((buf, _)) => launch!(self, "conv1d_state", state_cfg, [x, state, st, sl, fr, &c, &k, buf, sn, sa, &n_snap])?,
+                    None => launch!(self, "conv1d_state", state_cfg, [x, state, st, sl, fr, &c, &k, out, sn, sa, &n_snap])?,
+                }
+            }
+            *self.gdn_qk.lock().unwrap() = qk.map(|b| (out.ptr, n * channels, b));
+            Ok(())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_impl(
+        &self,
+        qkv: &CudaBuf,
+        alpha: &CudaBuf,
+        beta: &CudaBuf,
+        dt_bias: &CudaWeight,
+        a: &CudaWeight,
+        state: &mut CudaBuf,
+        runs: &SeqRuns,
+        out: &mut CudaBuf,
+        shape: GdnShape,
+        eps: f32,
+        snaps: Option<(&mut CudaBuf, usize)>,
+    ) -> Result<()> {
+        self.in_step(|| {
+            let GdnShape { n_k_heads: hk, n_v_heads: hv, head_dim: d } = shape;
+            if hk == 0 || !hv.is_multiple_of(hk) || !matches!(d, 64 | 128) {
+                return Err(Error::Shape(format!("gated_delta_net: {hk} key / {hv} value heads of {d} (the GPU supports head size 64 or 128)")));
+            }
+            fn vec<'w>(w: &'w CudaWeight, what: &str, hv: usize) -> Result<&'w gpu::Slice<f32>> {
+                w.dense.as_ref().filter(|_| w.cols == hv).ok_or_else(|| Error::Shape(format!("gated_delta_net: {what} must be 1-D with {hv} values")))
+            }
+            let (dt, av) = (vec(dt_bias, "dt_bias", hv)?, vec(a, "a", hv)?);
+            let n = *runs.starts.last().unwrap_or(&0) as usize;
+            runs.check(n, state.len() / shape.state_len(), snaps.as_ref().map_or(usize::MAX, |s| s.1))?;
+            check_len("gated_delta_net qkv", qkv.len(), n * shape.qkv_width())?;
+            check_len("gated_delta_net alpha", alpha.len().min(beta.len()), n * hv)?;
+            check_len("gated_delta_net out", out.len(), n * hv * d)?;
+            let mut cache = self.index_cache.lock().unwrap();
+            self.sync_index(&mut cache, "gdn_starts", runs.starts)?;
+            self.sync_index(&mut cache, "gdn_slots", runs.slots)?;
+            self.sync_index(&mut cache, "gdn_fresh", runs.fresh)?;
+            let (counts, at) = snap_index(runs, snaps.as_ref().map_or(0, |s| s.1))?;
+            self.sync_index(&mut cache, "gdn_snap", &counts)?;
+            self.sync_index(&mut cache, "gdn_snap_at", &at)?;
+            let (st, sl, fr, sn, sa) =
+                (&cache["gdn_starts"].dev, &cache["gdn_slots"].dev, &cache["gdn_fresh"].dev, &cache["gdn_snap"].dev, &cache["gdn_snap_at"].dev);
+            let (k, v, di) = (hk as i32, hv as i32, d as i32);
+            // Normalized q and k: from the conv that produced qkv, else here
+            // (gdn_prep); then the recurrence split over value columns and
+            // rows, which computes the gates itself.
+            let stashed = self.gdn_qk.lock().unwrap().take().filter(|(p, l, _)| *p == qkv.ptr && *l == n * shape.qkv_width()).map(|s| s.2);
+            let qk = match stashed {
+                Some(b) => b,
+                None => {
+                    let qk = self.alloc(n * 2 * hk * d)?;
+                    let prep = LaunchConfig { grid_dim: (hk as u32, n as u32, 1), block_dim: (d as u32, 1, 1), shared_mem_bytes: 0 };
+                    launch!(self, "gdn_prep", prep, [qkv, &qk, &k, &v, &di, &eps])?;
+                    qk
+                }
+            };
+            let chunk_cfg = LaunchConfig { grid_dim: ((hv * d / 32) as u32, runs.n_seqs() as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+            let cfg = LaunchConfig { grid_dim: ((hv * d / 32) as u32, runs.n_seqs() as u32, 1), block_dim: (32 * GDN_SCAN_LANES, 1, 1), shared_mem_bytes: 0 };
+            // Prompt-sized steps without snapshots: chunk by chunk. Decode
+            // and verification steps (at most GDN_SCAN_MAX_TOKENS tokens, or
+            // with snapshots) go token by token, so a token's numbers don't
+            // depend on whether it was verified with drafts or decoded alone.
+            if (gdn_chunked() || force_chunked()) && snaps.is_none() && n > GDN_SCAN_MAX_TOKENS {
+                let name = if d == 64 { "gdn_chunk_d64" } else { "gdn_chunk_d128" };
+                return launch!(self, name, chunk_cfg, [&qk, qkv, alpha, beta, dt, av, state, st, sl, fr, out, &k, &v]);
+            }
+            let name = if d == 64 { "gdn_scan_d64" } else { "gdn_scan_d128" };
+            match snaps {
+                Some((buf, n)) => {
+                    check_len("gated_delta_net snapshots", buf.len(), n * shape.state_len())?;
+                    let n = n as i32;
+                    launch!(self, name, cfg, [&qk, qkv, alpha, beta, dt, av, state, st, sl, fr, out, &k, &v, buf, sn, sa, &n])
+                }
+                None => {
+                    let n = 0i32;
+                    launch!(self, name, cfg, [&qk, qkv, alpha, beta, dt, av, state, st, sl, fr, out, &k, &v, out, sn, sa, &n])
+                }
+            }
+        })
+    }
+
     pub fn new(ordinal: usize) -> Result<Self> {
         gpu::preload();
         let ctx = gpu::new_context(ordinal).map_err(err)?;
@@ -673,8 +1136,8 @@ impl CudaBackend {
         };
 
         let mut names: Vec<String> = [
-            "f32_to_f16", "f32_to_bf16", "half_to_f32", "logit_adjust", "sample_rows", "rms_norm", "add_rms_norm", "rms_norm_add", "qkv_norm_rope_store", "rms_norm_rope", "rope_neox", "silu_mul", "gelu_mul", "gelu_mul_strided", "ple_gate_f32", "gelu", "mul_inplace", "scale_inplace", "softcap_inplace", "sigmoid_mul_inplace", "conv1d_silu", "copy_span", "gated_delta_net_d64", "gated_delta_net_d128",
-            "skinny_f32", "skinny_f16", "skinny_bf16", "moe_route", "moe_count", "moe_scan", "moe_place", "moe_combine", "add_sigmoid_scaled",
+            "f32_to_f16", "f32_to_bf16", "half_to_f32", "logit_adjust", "sample_rows", "rms_norm", "add_rms_norm", "rms_norm_add", "qkv_norm_rope_store", "rms_norm_rope", "rope_neox", "silu_mul", "gelu_mul", "gelu_mul_strided", "ple_gate_f32", "gelu", "mul_inplace", "scale_inplace", "softcap_inplace", "sigmoid_mul_inplace", "rms_norm_gate", "conv1d_silu", "conv1d_silu_par", "conv1d_state", "copy_span", "copy_spans", "gdn_prep", "gdn_scan_d64", "gdn_scan_d128", "gdn_chunk_d64", "gdn_chunk_d128",
+            "skinny_f32", "skinny_f16", "skinny_bf16", "moe_route", "moe_count", "moe_scan", "moe_place", "moe_combine", "add_moe_rms_norm", "gather_q8_rows", "add_sigmoid_scaled",
             "add_inplace", "gather_rows", "gather_strided", "kv_store", "kv_store_q8", "kv_copy_blocks", "kv_dequant_blocks", "kv_rotate_q", "attn_decode_combine", "paged_attention", "attn_prefill", "attn_prefill_tc", "quantize_q8", "repack_q8_0",
             "repack_q4_k", "repack_q6_k", "repack_q3_k", "repack_q5_k", "repack_iq4_xs", "mmq_sum_splits",
             "matvec_glu_silu_f32", "matvec_glu_silu_f16", "matvec_glu_silu_bf16", "matvec_glu_gelu_f32", "matvec_glu_gelu_f16", "matvec_glu_gelu_bf16",
@@ -684,7 +1147,7 @@ impl CudaBackend {
         for fmt in Fmt::QUANT {
             for k in [
                 "mmq", "mmq_glu_silu", "mmq_glu_gelu", "matvec_glu_silu", "matvec_glu_gelu", "matvec_glu_norm_silu", "matvec_glu_norm_gelu", "moe_matvec_glu", "moe_matvec",
-                "mmq_id", "mmq_id_glu_silu",
+                "moe_matvec_glu_grp", "moe_matvec_grp", "mmq_id", "mmq_id_glu_silu", "mmq_id32", "mmq_id32_glu_silu",
             ] {
                 names.push(format!("{k}_{}", fmt.suffix()));
             }
@@ -763,6 +1226,7 @@ impl CudaBackend {
             split_part: Mutex::new(split_part),
             kv_stage: Mutex::new(kv_stage),
             prequant: Mutex::new(None),
+            gdn_qk: Mutex::new(None),
             decode_step: std::sync::atomic::AtomicBool::new(false),
             has_quant_weights: std::sync::atomic::AtomicBool::new(false),
             has_mmq_weights: std::sync::atomic::AtomicBool::new(false),
@@ -1534,6 +1998,10 @@ impl Backend for CudaBackend {
         format!("{} ({}, {})", gpu::VENDOR, self.device_name, self.arch)
     }
 
+    fn supports_gdn_head_dim(&self, head_dim: usize) -> bool {
+        matches!(head_dim, 64 | 128)
+    }
+
     fn upload(&self, t: &HostTensor) -> Result<CudaWeight> {
         // Not part of a step: the launches below must really run.
         self.abort_step();
@@ -1769,7 +2237,11 @@ impl Backend for CudaBackend {
                 .iter()
                 .flat_map(|&(r, s)| s.adjust.iter().filter(|(id, _)| (*id as usize) < vocab).map(move |&(id, d)| (r * vocab as u32 + id, d)))
                 .collect();
-            adj.sort_unstable_by_key(|a| a.0);
+            // Rows in order with sorted, distinct ids (the server's lists)
+            // need no sort.
+            if !adj.windows(2).all(|w| w[0].0 < w[1].0) {
+                adj.sort_unstable_by_key(|a| a.0);
+            }
             adj.dedup_by(|b, a| {
                 let same = a.0 == b.0;
                 if same {
@@ -1787,7 +2259,7 @@ impl Backend for CudaBackend {
             let params: Vec<u32> = rows
                 .iter()
                 .flat_map(|&(r, s)| {
-                    [s.temperature.to_bits(), s.top_k, s.top_p.to_bits(), s.seed as u32, (s.seed >> 32) as u32, s.counter as u32, (s.counter >> 32) as u32, r]
+                    [s.temperature.to_bits(), s.top_k, s.top_p.to_bits(), s.seed as u32, (s.seed >> 32) as u32, s.counter as u32, (s.counter >> 32) as u32, r, s.min_p.to_bits()]
                 })
                 .collect();
             self.sync_index(&mut cache, "sample_params", &params)?;
@@ -1802,8 +2274,9 @@ impl Backend for CudaBackend {
             // SAFETY: `sample_out` holds at least rows.len() u32s (synced above).
             unsafe { gpu::memcpy_dtoh_async(&mut host, po.device_ptr(&self.stream).0, &self.stream) }.map_err(err)?;
             self.stream.synchronize().map_err(err)?;
-            // The cached host copy no longer matches the device contents.
-            cache.get_mut("sample_out").unwrap().host.clear();
+            // (The device copy now differs from the cached zeros, but the
+            // kernel writes every entry, so the zeros needn't be uploaded
+            // again: the buffer only has to be large enough.)
             for (o, h) in out.iter_mut().zip(host) {
                 *o = h.to_bits();
             }
@@ -1852,12 +2325,16 @@ impl Backend for CudaBackend {
             let (ki, mi) = (k as i32, m as i32);
 
             // Float weights: f32 activations; same-format runs share one launch.
+            // F32 matrices with an f16 copy (MoE routers and other small
+            // projections, as prefill's GEMMs already read them) stream that
+            // copy: half the bytes.
+            let eff = |w: &CudaWeight| if w.fmt == Fmt::F32 && w.f16_copy.is_some() { Fmt::F16 } else { w.fmt };
             let float_idx: Vec<usize> = (0..ws.len()).filter(|&i| !ws[i].fmt.quantized()).collect();
             let mut i = 0;
             while i < float_idx.len() {
-                let fmt = ws[float_idx[i]].fmt;
+                let fmt = eff(ws[float_idx[i]]);
                 let mut group = vec![float_idx[i]];
-                while group.len() < MATVEC_TARGETS && i + group.len() < float_idx.len() && ws[float_idx[i + group.len()]].fmt == fmt {
+                while group.len() < MATVEC_TARGETS && i + group.len() < float_idx.len() && eff(ws[float_idx[i + group.len()]]) == fmt {
                     group.push(float_idx[i + group.len()]);
                 }
                 i += group.len();
@@ -1872,10 +2349,14 @@ impl Backend for CudaBackend {
                 let mut blocks = 0usize;
                 for (slot, &wi) in group.iter().enumerate() {
                     let w = ws[wi];
+                    let (qs, qs_row) = match &w.f16_copy {
+                        Some(h) if fmt == Fmt::F16 && w.fmt == Fmt::F32 => (h.device_ptr(&self.stream).0, Fmt::F16.strides(w.cols).0 as i64),
+                        _ => (w.qs.device_ptr(&self.stream).0, w.strides().0),
+                    };
                     targets.t[slot] = MvTarget {
-                        qs: w.qs.device_ptr(&self.stream).0,
+                        qs,
                         out: outs[wi].ptr,
-                        qs_row: w.strides().0,
+                        qs_row,
                         n: w.rows as i32,
                         block_start: blocks as i32,
                         ..Default::default()
@@ -1894,6 +2375,14 @@ impl Backend for CudaBackend {
                 launch!(self, name, cfg, [&targets, x, &ki, &mi, &kwi], prof = prof)?;
             }
             if ws.iter().all(|w| !w.fmt.quantized()) {
+                // Float matvecs only write their outputs: x's int8 copy is
+                // still good for the next consumer (the shared expert after
+                // the MoE router), which would otherwise quantize x again.
+                if let Some(glu) = prequantized
+                    && outs.iter().all(|o| o.ptr != x.ptr)
+                {
+                    *self.prequant.lock().unwrap() = Some((x.ptr, m * k, glu));
+                }
                 return Ok(());
             }
 
@@ -2491,7 +2980,25 @@ impl Backend for CudaBackend {
         self.in_step(|| {
             check_len("sigmoid_mul", x.len().min(g.len()), len)?;
             let n = len as i64;
-            launch!(self, "sigmoid_mul_inplace", grid_1d(len, 256)?, [x, g, &n])
+            let qo = self.qout(len)?;
+            launch!(self, "sigmoid_mul_inplace", grid_1d(len, 256)?, [x, g, &n, &qo])?;
+            self.set_prequant(&qo, x.ptr, len);
+            Ok(())
+        })
+    }
+
+    fn norm_gate(&self, x: &CudaBuf, w: &CudaWeight, z: &mut CudaBuf, rows: usize, width: usize, eps: f32) -> Result<()> {
+        self.in_step(|| {
+            let wd = w.dense.as_ref().filter(|_| w.cols == width).ok_or_else(|| Error::Shape("norm_gate weight must be 1-D of the row width".into()))?;
+            check_len("norm_gate x", x.len(), rows * width)?;
+            check_len("norm_gate z", z.len(), rows * width)?;
+            let threads = (width as u32).next_power_of_two().clamp(WARP, 1024);
+            let cfg = LaunchConfig { grid_dim: (rows as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+            let di = width as i32;
+            let qo = if width.is_multiple_of(32) { self.qout(rows * width)? } else { QOut::default() };
+            launch!(self, "rms_norm_gate", cfg, [x, wd, &*z, &di, &eps, &qo])?;
+            self.set_prequant(&qo, z.ptr, rows * width);
+            Ok(())
         })
     }
 
@@ -2506,39 +3013,23 @@ impl Backend for CudaBackend {
         kernel: usize,
         snaps: Option<(&mut CudaBuf, usize)>,
     ) -> Result<()> {
-        self.in_step(|| {
-            let wd = w
-                .dense
-                .as_ref()
-                .filter(|_| w.cols == channels * kernel && (2..=GDN_MAX_KERNEL).contains(&kernel) && channels > 0)
-                .ok_or_else(|| Error::Shape(format!("conv1d_silu: weight must be 1-D with {channels} x {kernel} values (kernel 2..={GDN_MAX_KERNEL})")))?;
-            let n = *runs.starts.last().unwrap_or(&0) as usize;
-            runs.check(n, state.len() / (channels * (kernel - 1)))?;
-            check_len("conv1d_silu x", x.len(), n * channels)?;
-            check_len("conv1d_silu out", out.len(), n * channels)?;
-            let mut cache = self.index_cache.lock().unwrap();
-            self.sync_index(&mut cache, "gdn_starts", runs.starts)?;
-            self.sync_index(&mut cache, "gdn_slots", runs.slots)?;
-            self.sync_index(&mut cache, "gdn_fresh", runs.fresh)?;
-            let (counts, at) = snap_index(runs, snaps.as_ref().map_or(0, |s| s.1))?;
-            self.sync_index(&mut cache, "gdn_snap", &counts)?;
-            self.sync_index(&mut cache, "gdn_snap_at", &at)?;
-            let (st, sl, fr, sn, sa) =
-                (&cache["gdn_starts"].dev, &cache["gdn_slots"].dev, &cache["gdn_fresh"].dev, &cache["gdn_snap"].dev, &cache["gdn_snap_at"].dev);
-            let cfg = LaunchConfig { grid_dim: (channels.div_ceil(128) as u32, runs.n_seqs() as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
-            let (c, k) = (channels as i32, kernel as i32);
-            match snaps {
-                Some((buf, n)) => {
-                    check_len("conv1d_silu snapshots", buf.len(), n * channels * (kernel - 1))?;
-                    let n = n as i32;
-                    launch!(self, "conv1d_silu", cfg, [x, wd, state, st, sl, fr, out, &c, &k, buf, sn, sa, &n])
-                }
-                None => {
-                    let n = 0i32;
-                    launch!(self, "conv1d_silu", cfg, [x, wd, state, st, sl, fr, out, &c, &k, out, sn, sa, &n])
-                }
-            }
-        })
+        self.conv1d_impl(x, w, state, runs, out, channels, kernel, snaps, None)
+    }
+
+    fn conv1d_silu_gdn(
+        &self,
+        x: &CudaBuf,
+        w: &CudaWeight,
+        state: &mut CudaBuf,
+        runs: &SeqRuns,
+        out: &mut CudaBuf,
+        channels: usize,
+        kernel: usize,
+        snaps: Option<(&mut CudaBuf, usize)>,
+        gdn: GdnShape,
+        eps: f32,
+    ) -> Result<()> {
+        self.conv1d_impl(x, w, state, runs, out, channels, kernel, snaps, Some((gdn, eps)))
     }
 
     fn gated_delta_net(
@@ -2555,222 +3046,51 @@ impl Backend for CudaBackend {
         eps: f32,
         snaps: Option<(&mut CudaBuf, usize)>,
     ) -> Result<()> {
-        self.in_step(|| {
-            let GdnShape { n_k_heads: hk, n_v_heads: hv, head_dim: d } = shape;
-            if hk == 0 || !hv.is_multiple_of(hk) || !matches!(d, 64 | 128) {
-                return Err(Error::Shape(format!("gated_delta_net: {hk} key / {hv} value heads of {d} (the GPU supports head size 64 or 128)")));
-            }
-            fn vec<'w>(w: &'w CudaWeight, what: &str, hv: usize) -> Result<&'w gpu::Slice<f32>> {
-                w.dense.as_ref().filter(|_| w.cols == hv).ok_or_else(|| Error::Shape(format!("gated_delta_net: {what} must be 1-D with {hv} values")))
-            }
-            let (dt, av) = (vec(dt_bias, "dt_bias", hv)?, vec(a, "a", hv)?);
-            let n = *runs.starts.last().unwrap_or(&0) as usize;
-            runs.check(n, state.len() / shape.state_len())?;
-            check_len("gated_delta_net qkv", qkv.len(), n * shape.qkv_width())?;
-            check_len("gated_delta_net alpha", alpha.len().min(beta.len()), n * hv)?;
-            check_len("gated_delta_net out", out.len(), n * hv * d)?;
-            let mut cache = self.index_cache.lock().unwrap();
-            self.sync_index(&mut cache, "gdn_starts", runs.starts)?;
-            self.sync_index(&mut cache, "gdn_slots", runs.slots)?;
-            self.sync_index(&mut cache, "gdn_fresh", runs.fresh)?;
-            let (counts, at) = snap_index(runs, snaps.as_ref().map_or(0, |s| s.1))?;
-            self.sync_index(&mut cache, "gdn_snap", &counts)?;
-            self.sync_index(&mut cache, "gdn_snap_at", &at)?;
-            let (st, sl, fr, sn, sa) =
-                (&cache["gdn_starts"].dev, &cache["gdn_slots"].dev, &cache["gdn_fresh"].dev, &cache["gdn_snap"].dev, &cache["gdn_snap_at"].dev);
-            let cfg = LaunchConfig { grid_dim: (hv as u32, runs.n_seqs() as u32, 1), block_dim: (d as u32, 1, 1), shared_mem_bytes: 0 };
-            let (k, v) = (hk as i32, hv as i32);
-            let name = if d == 64 { "gated_delta_net_d64" } else { "gated_delta_net_d128" };
-            match snaps {
-                Some((buf, n)) => {
-                    check_len("gated_delta_net snapshots", buf.len(), n * shape.state_len())?;
-                    let n = n as i32;
-                    launch!(self, name, cfg, [qkv, alpha, beta, dt, av, state, st, sl, fr, out, &k, &v, &eps, buf, sn, sa, &n])
-                }
-                None => {
-                    let n = 0i32;
-                    launch!(self, name, cfg, [qkv, alpha, beta, dt, av, state, st, sl, fr, out, &k, &v, &eps, out, sn, sa, &n])
-                }
-            }
-        })
+        self.gdn_impl(qkv, alpha, beta, dt_bias, a, state, runs, out, shape, eps, snaps)
+    }
+    fn moe_ffn(&self, x: &CudaBuf, logits: &CudaBuf, moe: &MoeFfn<CudaWeight>, shared: Option<(&CudaBuf, &CudaBuf)>, out: &mut CudaBuf, m: usize) -> Result<()> {
+        self.moe_ffn_impl(x, logits, moe, shared, out, m, None)
     }
 
-    fn moe_ffn(&self, x: &CudaBuf, logits: &CudaBuf, moe: &MoeFfn<CudaWeight>, shared: Option<(&CudaBuf, &CudaBuf)>, out: &mut CudaBuf, m: usize) -> Result<()> {
+    fn moe_ffn_add_norm(
+        &self,
+        h: &CudaBuf,
+        logits: &CudaBuf,
+        moe: &MoeFfn<CudaWeight>,
+        shared: Option<(&CudaBuf, &CudaBuf)>,
+        x: &mut CudaBuf,
+        norm: Option<(&CudaWeight, &mut CudaBuf)>,
+        m: usize,
+        width: usize,
+        eps: f32,
+    ) -> Result<()> {
         self.in_step(|| {
-            let MoeFfn { gate, up, down, n_expert: ne, n_used: k, n_ff, norm_topk, scale } = *moe;
-            let d = gate.cols;
-            if k == 0 || k > ne.min(32) || ne > 1024 || gate.rows != ne * n_ff || up.rows != ne * n_ff || up.cols != d || down.rows != ne * d || down.cols != n_ff {
-                return Err(Error::Shape(format!(
-                    "moe_ffn: {ne} experts (top {k}) of {n_ff}: gate {}x{}, up {}x{}, down {}x{} (at most 1024 experts, 32 per token)",
-                    gate.rows, gate.cols, up.rows, up.cols, down.rows, down.cols
-                )));
+            check_len("moe_ffn_add_norm x", x.len(), m * width)?;
+            // Without int8 MMA, prefill runs in decode-sized pieces: unfused.
+            if moe.gate.cols != width || (m > MATVEC_MAX_M && !self.mmq) {
+                let mut o = self.alloc(m * width)?;
+                self.moe_ffn(h, logits, moe, shared, &mut o, m)?;
+                return match norm {
+                    Some((w, out)) => self.add_rms_norm(x, &o, w, out, m, width, eps),
+                    None => self.add(x, &o, m * width),
+                };
             }
-            if !n_ff.is_multiple_of(32) || !d.is_multiple_of(32) {
-                return Err(Error::Shape(format!("moe_ffn: widths {d} and {n_ff} must be multiples of 32")));
-            }
-            // Quantized experts run on int8 activations; float ones (f32, f16,
-            // bf16) on f32 activations with f32 accumulation. Rows must split
-            // into 8-value vector loads.
-            if !n_ff.is_multiple_of(8) || !d.is_multiple_of(8) {
-                return Err(Error::Shape(format!("moe_ffn: widths {d} and {n_ff} must be multiples of 8")));
-            }
-            check_len("moe_ffn x", x.len(), m * d)?;
-            check_len("moe_ffn logits", logits.len(), m * ne)?;
-            check_len("moe_ffn out", out.len(), m * d)?;
-            if let Some((y, g)) = shared {
-                check_len("moe_ffn shared", y.len(), m * d)?;
-                check_len("moe_ffn shared gate", g.len(), m)?;
-            }
-            if m == 0 {
-                return Ok(());
-            }
-            let grouped = m > MATVEC_MAX_M;
-            if grouped && !self.mmq {
-                // No int8 MMA: run decode-sized pieces.
-                for t0 in (0..m).step_by(MATVEC_MAX_M) {
-                    let n = MATVEC_MAX_M.min(m - t0);
-                    let view = |b: &CudaBuf, w: usize| CudaBuf { ptr: b.ptr + (t0 * w * 4) as u64, len: n * w, _owner: None };
-                    let mut o = view(out, d);
-                    let sv = shared.map(|(y, g)| (view(y, d), view(g, 1)));
-                    self.moe_ffn(&view(x, d), &view(logits, ne), moe, sv.as_ref().map(|(y, g)| (y, g)), &mut o, n)?;
+            let fuse = match &norm {
+                Some((w, out)) => {
+                    let wd = w.dense.as_ref().filter(|_| w.cols == width).ok_or_else(|| Error::Shape("moe_ffn_add_norm: norm weight must be 1-D".into()))?;
+                    check_len("moe_ffn_add_norm out", out.len(), m * width)?;
+                    let qo = if width.is_multiple_of(32) { self.qout(m * width)? } else { QOut::default() };
+                    MoeFuse { x: x.ptr, w: wd.device_ptr(&self.stream).0, out: out.ptr, eps, qo, has_next: 1 }
                 }
-                return Ok(());
-            }
-            let np = m * k;
-            let (mi, nei, ki, di, nffi) = (m as i32, ne as i32, k as i32, d as i32, n_ff as i32);
-            // Routing: one warp per token.
-            let (ids, wts) = (self.alloc(np)?, self.alloc(np)?);
-            let (norm, one) = (norm_topk as i32, 1i32);
-            launch!(self, "moe_route", grid_1d(m * WARP as usize, 128)?, [logits, &mi, &nei, &ki, &norm, &scale, &ids, &wts])?;
-            // Each projection runs on int8 activations (quantized experts) or
-            // on f32 ones (float experts); the hidden rows feed the down
-            // projection as int8 or f32 to match it.
-            let down_q = down.fmt.quantized();
-            let int8_in = gate.fmt.quantized() || up.fmt.quantized();
-            let (xq, xd, xs) = if int8_in {
-                let (xq, xd, xs) = (self.alloc((m * d).div_ceil(4))?, self.alloc(m * d / 32)?, self.alloc(m * d / 32)?);
-                let nu = (m * d / 32) as i64;
-                launch!(self, "quantize_q8", grid_1d(m * d / 32 * 8, 256)?, [x, &xq, &xd, &xs, &nu])?;
-                (Some(xq), Some(xd), Some(xs))
-            } else {
-                (None, None, None)
+                None => MoeFuse { x: x.ptr, w: 0, out: 0, eps, qo: QOut::default(), has_next: 0 },
             };
-            let (hq, hd, hs) = if down_q {
-                (Some(self.alloc((np * n_ff).div_ceil(4))?), Some(self.alloc(np * n_ff / 32)?), Some(self.alloc(np * n_ff / 32)?))
-            } else {
-                (None, None, None)
-            };
-            let qo = match (&hq, &hd, &hs) {
-                (Some(q), Some(d), Some(s)) => QOut { q: q.ptr, d: d.ptr, s: s.ptr, on: 1 },
-                _ => QOut::default(),
-            };
-            let y = self.alloc(np * d)?;
-            let target = |w: &CudaWeight| {
-                let (sq, sh, ss) = w.strides();
-                MvTarget {
-                    qs: w.qs.device_ptr(&self.stream).0,
-                    qh: w.qh().device_ptr(&self.stream).0,
-                    sc: w.sc().device_ptr(&self.stream).0,
-                    qs_row: sq,
-                    qh_row: sh,
-                    sc_row: ss,
-                    ..Default::default()
-                }
-            };
-            let ptr = |b: &Option<CudaBuf>| b.as_ref().map_or(0u64, |b| b.ptr);
-            let (xq_p, xd_p, xs_p) = (ptr(&xq), ptr(&xd), ptr(&xs));
-            let null = 0u64;
-            let (sh_ptr, sg_ptr) = shared.map_or((0u64, 0u64), |(y, g)| (y.ptr, g.ptr));
-            let fused = gate.fmt == up.fmt && gate.fmt.quantized();
-            let len = (np * n_ff) as i64;
-            // f32 hidden rows (written for a float down projection).
-            let h32: Option<CudaBuf>;
-            let write_h = (!down_q) as i32;
-            if !grouped {
-                // Decode: per (token, expert) pair, reading only the chosen experts.
-                let float_cfg = |n: usize| LaunchConfig { grid_dim: (n.div_ceil(8) as u32, np as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
-                let quant_cfg = |n: usize| LaunchConfig { grid_dim: (n.div_ceil(MATVEC_WARPS as usize) as u32, np as u32, 1), block_dim: (MATVEC_WARPS * WARP, 1, 1), shared_mem_bytes: 0 };
-                if fused {
-                    let (tg, tu) = (target(gate), target(up));
-                    let h = if down_q { None } else { Some(self.alloc(np * n_ff)?) };
-                    let hp = ptr(&h);
-                    let cfg = LaunchConfig { grid_dim: ((n_ff / 32) as u32, np as u32, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 };
-                    launch!(self, format!("moe_matvec_glu_{}", gate.fmt.suffix()), cfg, [&tg, &tu, &ids, &xq_p, &xd_p, &di, &nffi, &ki, &qo, &hp, &write_h])?;
-                    h32 = h;
-                } else {
-                    let (g, u) = (self.alloc(np * n_ff)?, self.alloc(np * n_ff)?);
-                    for (w, o) in [(gate, &g), (up, &u)] {
-                        let t = target(w);
-                        if w.fmt.quantized() {
-                            launch!(self, format!("moe_matvec_{}", w.fmt.suffix()), quant_cfg(n_ff), [&t, &ids, &xq_p, &xd_p, &di, &nffi, &ki, o])?;
-                        } else {
-                            launch!(self, format!("moe_matvec_f_{}", w.fmt.suffix()), float_cfg(n_ff), [&t, &ids, x, &di, &nffi, &ki, o])?;
-                        }
-                    }
-                    launch!(self, "silu_mul", grid_1d(np * n_ff, 256)?, [&g, &u, &len, &qo, &write_h])?;
-                    h32 = Some(g);
-                }
-                let td = target(down);
-                if down_q {
-                    let (hq_p, hd_p) = (ptr(&hq), ptr(&hd));
-                    launch!(self, format!("moe_matvec_{}", down.fmt.suffix()), quant_cfg(d), [&td, &ids, &hq_p, &hd_p, &nffi, &di, &one, &y])?;
-                } else {
-                    let h = h32.as_ref().expect("f32 hidden for a float down projection");
-                    launch!(self, format!("moe_matvec_f_{}", down.fmt.suffix()), float_cfg(d), [&td, &ids, h, &nffi, &di, &one, &y])?;
-                }
-                return launch!(self, "moe_combine", grid_1d(m * d, 256)?, [&y, &wts, &null, &*out, &mi, &ki, &di, &sh_ptr, &sg_ptr]);
+            let qo = fuse.qo;
+            let mut unused = CudaBuf { ptr: x.ptr, len: x.len(), _owner: None };
+            self.moe_ffn_impl(h, logits, moe, shared, &mut unused, m, Some(fuse))?;
+            if let Some((_, out)) = norm {
+                self.set_prequant(&qo, out.ptr, m * width);
             }
-            // Prefill: sort the pairs by expert, then grouped GEMMs (one tile
-            // list for all experts) over the gate/up and down projections.
-            const _: () = assert!(MMQ_BN == 64, "moe_gemm_f's tile height (MOE_GF_BN) is 64");
-            let max_tiles = np.div_ceil(MMQ_BN) + ne;
-            let (counts, offsets, cursor) = (self.alloc(ne)?, self.alloc(ne)?, self.alloc(ne)?);
-            let (tiles, pos, rowmap) = (self.alloc(1 + 3 * max_tiles)?, self.alloc(np)?, self.alloc(np)?);
-            if !self.replaying() {
-                // SAFETY: `counts` holds `ne` 4-byte values.
-                unsafe { gpu::memset_zero_async(counts.ptr, ne * 4, &self.stream) }.map_err(err)?;
-            }
-            let (npi, bn) = (np as i32, MMQ_BN as i32);
-            launch!(self, "moe_count", grid_1d(np, 256)?, [&ids, &npi, &counts])?;
-            let single = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
-            launch!(self, "moe_scan", single, [&counts, &nei, &bn, &offsets, &cursor, &tiles])?;
-            launch!(self, "moe_place", grid_1d(np, 256)?, [&ids, &npi, &ki, &offsets, &cursor, &pos, &rowmap])?;
-            let grid = |rows: usize| LaunchConfig { grid_dim: (max_tiles as u32, rows.div_ceil(MMQ_BM) as u32, 1), block_dim: (MMQ_THREADS, 1, 1), shared_mem_bytes: 0 };
-            let float_grid = |rows: usize| LaunchConfig { grid_dim: (max_tiles as u32, rows.div_ceil(64) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
-            if fused {
-                let (sq, sh, ss) = gate.strides();
-                let h = if down_q { None } else { Some(self.alloc(np * n_ff)?) };
-                let hp = ptr(&h);
-                let cfg = LaunchConfig { grid_dim: (max_tiles as u32, n_ff.div_ceil(MMQ_BM / 2) as u32, 1), ..grid(n_ff) };
-                launch!(
-                    self,
-                    format!("mmq_id_glu_silu_{}", gate.fmt.suffix()),
-                    cfg,
-                    [&gate.qs, gate.qh(), gate.sc(), &xq_p, &xd_p, &xs_p, &hp, &nffi, &di, &sq, &sh, &ss, &up.qs, up.qh(), up.sc(), &qo, &write_h, &tiles, &rowmap]
-                )?;
-                h32 = h;
-            } else {
-                let (g, u) = (self.alloc(np * n_ff)?, self.alloc(np * n_ff)?);
-                for (w, o) in [(gate, &g), (up, &u)] {
-                    let (sq, sh, ss) = w.strides();
-                    if w.fmt.quantized() {
-                        launch!(self, format!("mmq_id_{}", w.fmt.suffix()), grid(n_ff), [&w.qs, w.qh(), w.sc(), &xq_p, &xd_p, &xs_p, o, &nffi, &di, &sq, &sh, &ss, &tiles, &rowmap])?;
-                    } else {
-                        launch!(self, format!("moe_gemm_f_{}", w.fmt.suffix()), float_grid(n_ff), [&w.qs, &sq, x, &rowmap, o, &nffi, &di, &tiles])?;
-                    }
-                }
-                launch!(self, "silu_mul", grid_1d(np * n_ff, 256)?, [&g, &u, &len, &qo, &write_h])?;
-                h32 = Some(g);
-            }
-            let (sq, sh, ss) = down.strides();
-            if down_q {
-                let (hq_p, hd_p, hs_p) = (ptr(&hq), ptr(&hd), ptr(&hs));
-                launch!(self, format!("mmq_id_{}", down.fmt.suffix()), grid(d), [&down.qs, down.qh(), down.sc(), &hq_p, &hd_p, &hs_p, &y, &di, &nffi, &sq, &sh, &ss, &tiles, &null])?;
-            } else {
-                let h = h32.as_ref().expect("f32 hidden for a float down projection");
-                launch!(self, format!("moe_gemm_f_{}", down.fmt.suffix()), float_grid(d), [&down.qs, &sq, h, &null, &y, &di, &nffi, &tiles])?;
-            }
-            launch!(self, "moe_combine", grid_1d(m * d, 256)?, [&y, &wts, &pos, &*out, &mi, &ki, &di, &sh_ptr, &sg_ptr])
+            Ok(())
         })
     }
 
@@ -2795,6 +3115,43 @@ impl Backend for CudaBackend {
             }
             let (so, dof, n) = (src_off as i64, dst_off as i64, len as i64);
             launch!(self, "copy_span", grid_1d(len, 256)?, [src, &so, dst, &dof, &n])
+        })
+    }
+
+    fn copy_layers(&self, src: Option<&[CudaBuf]>, dst: &mut [CudaBuf], src_off: usize, dst_off: usize, len: usize) -> Result<()> {
+        self.in_step(|| {
+            if let Some(src) = src {
+                if src.len() != dst.len() {
+                    return Err(Error::Shape(format!("copy_layers: {} sources for {} destinations", src.len(), dst.len())));
+                }
+                for b in src {
+                    check_len("copy_layers src", b.len(), src_off + len)?;
+                }
+            } else if src_off.max(dst_off) < src_off.min(dst_off) + len {
+                return Err(Error::Shape("copy_layers: overlapping spans".into()));
+            }
+            for b in dst.iter() {
+                check_len("copy_layers dst", b.len(), dst_off.max(if src.is_none() { src_off } else { 0 }) + len)?;
+            }
+            if len == 0 || dst.is_empty() {
+                return Ok(());
+            }
+            // (src lo, src hi, dst lo, dst hi) words of each pair's pointers.
+            let ptrs: Vec<u32> = dst
+                .iter()
+                .enumerate()
+                .flat_map(|(i, d)| {
+                    let s = src.map_or(d.ptr, |s| s[i].ptr);
+                    [s as u32, (s >> 32) as u32, d.ptr as u32, (d.ptr >> 32) as u32]
+                })
+                .collect();
+            let mut cache = self.index_cache.lock().unwrap();
+            self.sync_index(&mut cache, "copy_layers", &ptrs)?;
+            let p = &cache["copy_layers"].dev;
+            let blocks = len.div_ceil(256).min(1024) as u32;
+            let cfg = LaunchConfig { grid_dim: (blocks, dst.len() as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            let (so, dof, n) = (src_off as i64, dst_off as i64, len as i64);
+            launch!(self, "copy_spans", cfg, [p, &so, &dof, &n])
         })
     }
 
@@ -3189,6 +3546,7 @@ mod arch_tests {
     /// no GPU of that kind.
     #[test]
     fn kernels_compile_for_target_arches() {
+        let _device = super::graph_tests::device();
         if !crate::gpu::compiler_present() {
             eprintln!("skipping: no {} kernel compiler on this machine", crate::gpu::VENDOR);
             return;
@@ -3204,6 +3562,14 @@ mod arch_tests {
 #[cfg(test)]
 mod graph_tests {
     use super::*;
+
+    /// Tests here take turns on the device: another test's backend setup
+    /// (module loads, allocations) can invalidate a graph capture in flight.
+    static DEVICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(super) fn device() -> std::sync::MutexGuard<'static, ()> {
+        DEVICE.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn backend() -> Option<CudaBackend> {
         if gpu::device_count() == 0 {
@@ -3232,6 +3598,7 @@ mod graph_tests {
     /// before the next step have to really run.
     #[test]
     fn failed_graph_step_returns_to_eager() {
+        let _device = device();
         let Some(b) = backend() else { return };
         if !b.graphs_enabled {
             eprintln!("skipping: graphs disabled");
@@ -3294,6 +3661,7 @@ mod graph_tests {
 
     #[test]
     fn upload_rejects_partial_quant_blocks() {
+        let _device = device();
         let Some(b) = backend() else { return };
         for cols in [128usize, 384] {
             let bytes = vec![0u8; 4 * cols]; // whatever: the shape is checked first

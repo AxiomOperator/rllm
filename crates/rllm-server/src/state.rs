@@ -34,6 +34,9 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// Log one line per finished generation.
     pub log: bool,
+    /// Longest a generation may run before it is ended (finish reason
+    /// `length`); `None`: no limit.
+    pub request_timeout: Option<std::time::Duration>,
     /// Held while the store file is written, so the periodic and the
     /// shutdown save never write it at the same time.
     pub save_lock: Mutex<()>,

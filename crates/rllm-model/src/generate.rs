@@ -110,9 +110,14 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
         }
     }
 
+    /// Copy state slot `from` to `to` ([`Model::copy_state`]).
+    pub fn copy_state(&mut self, from: u32, to: u32) -> Result<()> {
+        self.model.copy_state(self.backend, &mut self.kv, from, to)
+    }
+
     /// One MTP draft step over `items` (sequence, token, position): the
     /// positions' KV slots must already be allocated. Logits `[items, vocab]`.
-    pub fn mtp_draft(&mut self, items: &[(&SeqKv, u32, usize)], first: bool) -> Result<Vec<f32>> {
+    pub fn mtp_draft(&mut self, items: &[(&SeqKv, u32, usize)], first: bool, greedy: bool) -> Result<crate::StepOut> {
         let bs = self.block_size;
         let tokens: Vec<u32> = items.iter().map(|i| i.1).collect();
         let positions: Vec<u32> = items.iter().map(|i| i.2 as u32).collect();
@@ -123,7 +128,7 @@ impl<'m, B: Backend, M: Model<B>> KvPool<'m, B, M> {
         }
         let tables: Vec<Vec<u32>> = items.iter().map(|i| i.0.block_table.clone()).collect();
         let states: Vec<u32> = items.iter().map(|i| i.0.state.ok_or_else(|| anyhow::anyhow!("MTP needs a recurrent state slot"))).collect::<Result<_>>()?;
-        let d = MtpBatch { tokens: &tokens, positions: &positions, slots: &slots, block_tables: &tables, state_slots: &states, first, cache_id: self.id };
+        let d = MtpBatch { tokens: &tokens, positions: &positions, slots: &slots, block_tables: &tables, state_slots: &states, first, cache_id: self.id, greedy };
         self.model.mtp_draft(self.backend, &mut self.kv, &d, bs)
     }
 

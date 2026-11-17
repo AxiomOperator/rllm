@@ -373,7 +373,8 @@ impl Tokenizer {
         });
         // Llama 3 templates put today's date in the system prompt.
         env.add_function("strftime_now", |fmt: String| strftime_utc(&fmt, std::time::SystemTime::now()));
-        env.add_template("chat", template)?;
+        let template = hf_generation_blocks(template);
+        env.add_template("chat", &template)?;
         let bos = self.bos.and_then(|b| self.inner.id_to_token(b)).unwrap_or_default();
         let eos = self.inner.id_to_token(self.eos).unwrap_or_default();
         let mut ctx = serde_json::json!({
@@ -415,8 +416,9 @@ impl StreamDecoder<'_> {
         }
         let new = text[self.emitted..].to_owned();
         self.emitted = text.len();
-        // Keep the window short so decoding stays O(1) per token.
-        if self.ids.len() > 32 {
+        // Keep the window short so decoding stays O(1) per token (a few
+        // tokens of context are enough for merges and byte sequences).
+        if self.ids.len() > 8 {
             let keep = self.ids.split_off(self.ids.len() - 4);
             self.ids = keep;
             self.emitted = self.tok.decode(&self.ids, self.skip_special)?.len();
@@ -466,6 +468,52 @@ fn spm_merges(tokens: &[String], types: &[i64], g: &Gguf) -> Result<Vec<(String,
     // Score descending; ties by the parts' ids, as the converter sorts them.
     merges.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     Ok(merges.into_iter().map(|(_, l, r, _)| (tokens[l].clone(), tokens[r].clone())).collect())
+}
+
+/// transformers' `{% generation %}` … `{% endgeneration %}` (it marks the
+/// assistant's tokens for training masks and renders its body unchanged) as
+/// `{% if true %}` … `{% endif %}`, keeping each tag's whitespace control.
+fn hf_generation_blocks(src: &str) -> std::borrow::Cow<'_, str> {
+    if !src.contains("generation") {
+        return src.into();
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(i) = rest.find("{%") {
+        out.push_str(&rest[..i]);
+        let tag = &rest[i..];
+        let Some(end) = tag.find("%}") else {
+            out.push_str(tag);
+            return out.into();
+        };
+        let inner = &tag[2..end];
+        let (open, body) = match inner.strip_prefix(['-', '+']) {
+            Some(b) => (&inner[..1], b),
+            None => ("", inner),
+        };
+        let (body, close) = match body.strip_suffix(['-', '+']) {
+            Some(b) => (b, &body[b.len()..]),
+            None => (body, ""),
+        };
+        match body.trim() {
+            "generation" => out.push_str(&format!("{{%{open} if true {close}%}}")),
+            "endgeneration" => out.push_str(&format!("{{%{open} endif {close}%}}")),
+            _ => out.push_str(&tag[..end + 2]),
+        }
+        rest = &tag[end + 2..];
+    }
+    out.push_str(rest);
+    out.into()
+}
+
+#[cfg(test)]
+mod generation_block_tests {
+    #[test]
+    fn generation_blocks_render_their_body() {
+        let t = super::hf_generation_blocks("a{%- generation %}b{{ x }}{% endgeneration -%} c{% if y %}d{% endif %}");
+        assert_eq!(t, "a{%- if true %}b{{ x }}{% endif -%} c{% if y %}d{% endif %}");
+        assert_eq!(super::hf_generation_blocks("{{ add_generation_prompt }}"), "{{ add_generation_prompt }}");
+    }
 }
 
 /// `strftime` for the formats chat templates use (%d %e %m %b %B %y %Y %H %M %S %A %a %j %%), UTC.

@@ -37,6 +37,8 @@ r = client.chat.completions.create(model="my-model", messages=[{"role": "user", 
 | `--draft-tokens` | 5 | Most tokens the draft (or prompt lookup) proposes per step. |
 | `--prompt-lookup` | off | Speculative decoding without a draft model: propose the tokens that followed the latest few tokens' earlier occurrence in the prompt or output (see [Prompt lookup](#prompt-lookup)). |
 | `--host-cache-gb` | 0 | Pinned system memory (GiB) for the prefix cache's host tier: evicted prefixes move there and come back on a hit (see [Host tier](#host-tier)). |
+| `--state-checkpoints` | `--parallel` | Models with recurrent layers (Qwen3.5/3.6): prompt checkpoints of their state kept for prefix reuse (see [Qwen3.5](#qwen35-hybrid-models)); 0 turns their prefix cache off. |
+| `--request-timeout` | 0 | End a generation still running this many seconds after it was submitted, with finish reason `length` (0: no limit). |
 | `--host-sampling` | off | Sample every token on the CPU from full logits rows instead of on the GPU (see [How requests run](#how-requests-run)). |
 | `--api-key` | `$RLLM_API_KEY`, else none | Require `Authorization: Bearer <key>`. |
 | `--cors-origin` | none | Allow browser pages from this origin to call the server (repeatable; `*` for any). Without it, responses carry no CORS headers. |
@@ -45,11 +47,32 @@ r = client.chat.completions.create(model="my-model", messages=[{"role": "user", 
 | `--prefill-chunk` | 512 | Prompt tokens per forward pass (long prompts are split, so running requests keep decoding in between). |
 | `--store-file` | none | Save stored chat completions and responses to this JSON file (every 2 s when changed, and at shutdown) and load it at start. |
 | `-q`, `--quiet` | off | Don't log a line per finished generation. |
+| `--decode-per-prefill` | 1 | Batch-invariant mode: decode steps per prompt chunk while new prompts and decoding requests both wait (more keeps decoding faster while prompts arrive, at their first token's cost). |
 
 Environment: `RLLM_API_KEY` (as `--api-key`), `RLLM_ENGINE_TIMING=1` (print
 where engine step time goes every 256 steps, draft model included), `RLLM_MTP_VOCAB=n`
 (MTP draft vocabulary size, below), `RLLM_NO_PIN=1` (see
 [Performance](#performance)).
+
+GPU kernel choices, for measuring on other hardware (defaults are the
+fastest measured on the RTX 6000 Ada and Strix Halo):
+
+- `RLLM_GDN_CHUNKED=1`: Gated DeltaNet prompt chunks run the chunked
+  recurrence (matrix products over 16-token chunks) instead of the
+  column-split scan. Same results within float rounding. Slower on both
+  GPUs, Qwen3.6-35B-A3B: gfx1151 pp512 1256 vs 1431 tok/s; RTX 6000 Ada
+  pp4096 7674 vs 8962.
+- `RLLM_MOE_GROUP=1`: MoE decode steps of several tokens sort the
+  token-expert pairs by expert, so an expert several tokens chose is read
+  once. Identical results. Slower on both GPUs: gfx1151 8-way decode 169 vs
+  176 tok/s, MTP 74.9 vs 77.5; RTX 6000 Ada 8-way 733 vs 780.
+- `RLLM_MOE_TILE32_ROWS=n` (default 48): MoE prompt chunks use 32-pair expert
+  tiles while experts average fewer than n pairs (pp512 1441 → 1603 tok/s
+  on gfx1151); `RLLM_NO_MOE_TILE32=1` always uses 64.
+- `RLLM_MOE_GLU_THREADS=256|512|1024` (default 1024): block size of the MoE
+  gate/up decode kernel.
+- `RLLM_NO_MIXED_GRAPHS=1`: mixed steps over 8 tokens run eagerly instead of
+  as replayed graphs.
 
 ## Choosing settings: `rllm tune`
 
@@ -255,8 +278,19 @@ mixture-of-experts models (`qwen35moe`, e.g. Qwen3.6-35B-A3B: 256 experts,
 8 per token, plus a shared expert) work the same way, with the MoE notes
 below. For these models:
 
-- the prefix cache and its host tier are off: the state can't be rebuilt from
-  cached KV blocks, so every prompt is computed in full;
+- the prefix cache keeps **state checkpoints**: the state can't be rebuilt
+  from cached KV blocks, so while a prompt is computed, the server copies the
+  recurrent state (and MTP's last hidden state) at the last multiple of
+  `--prefill-chunk` at least 16 tokens before the prompt's end, next to the
+  KV blocks up to there. A later request that starts with all of those
+  tokens (the next turn of the chat, an agent's next step, a repeated
+  prompt) copies the checkpoint and computes only the rest. Checkpoints sit
+  on prompt-chunk boundaries, so a resumed request computes exactly the
+  chunks a cold one would: its output is the same (checked greedy on
+  Qwen3.5-0.8B: 1536 of 1898 prompt tokens reused, first token 6.6 s
+  instead of 33 s on the CPU backend). `--state-checkpoints N` keeps up to N
+  (default `--parallel`, least recently used go first; 0 turns the prefix
+  cache off), each costing one sequence's state. There is no host tier;
 - each running request holds a state slot: `--parallel` + 2 slots are
   allocated up front (about 3 MB per DeltaNet layer per slot on the 27B model,
   0.2 GiB for 10 slots on 0.8B). `rllm tune` counts them;
@@ -407,9 +441,10 @@ step of its own would give) or one request's prompt chunk, never a mix.
 Concurrent requests then produce exactly what they produce alone, and greedy
 output with and without speculation (draft model or MTP) matches under any
 load. It costs throughput when prompts arrive while others decode, caps
-`--parallel` at 8 and turns the prefix cache off. It is on by default for
-Qwen3.5 hybrids (`qwen35`, `qwen35moe`), which have no prefix cache anyway,
-so their MTP output matches decoding without MTP under any load;
+`--parallel` at 8 and turns the block prefix cache off (Qwen3.5 hybrids'
+state checkpoints stay: they keep the chunking). It is on by default for
+Qwen3.5 hybrids (`qwen35`, `qwen35moe`), so their MTP output matches
+decoding without MTP under any load;
 `--no-batch-invariant` turns it off. Checked with
 Qwen3.6-35B-A3B on CUDA and HIP: 4 concurrent and 4 sequential requests,
 with and without MTP, all identical.

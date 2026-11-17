@@ -62,6 +62,9 @@ pub struct MtpBatch<'a> {
     pub first: bool,
     /// Identifies the KV cache (as [`Batch::cache_id`]).
     pub cache_id: u64,
+    /// Return each row's argmax (picked on the device) instead of its
+    /// logits: greedy drafting needs only the token.
+    pub greedy: bool,
 }
 
 impl MtpBatch<'_> {
@@ -70,7 +73,10 @@ impl MtpBatch<'_> {
     pub fn graph_key(&self, model_id: usize) -> Option<u64> {
         use std::hash::{Hash, Hasher};
         let n = self.tokens.len();
-        if n > 64 {
+        static OLD_RULE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // RLLM_NO_MIXED_GRAPHS=1: mixed steps over 8 tokens run eagerly (A/B).
+        let old = *OLD_RULE.get_or_init(|| std::env::var_os("RLLM_NO_MIXED_GRAPHS").is_some());
+        if n > 64 || (old && n > 8 && self.block_tables.len() != n) {
             return None;
         }
         let width = self.block_tables.iter().map(Vec::len).max().unwrap_or(0).max(1).next_power_of_two();
@@ -90,12 +96,41 @@ pub struct StepOut {
     pub ids: Vec<u32>,
 }
 
+thread_local! {
+    /// The last step's logits rows, handed back by the caller
+    /// ([`recycle_rows`]) so the next step's copy lands in memory that is
+    /// already mapped (a fresh vocabulary-sized vector per step costs page
+    /// faults).
+    static ROWS: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A vector of `n` floats for logits rows (contents unspecified: the copy
+/// from the device overwrites them).
+pub(crate) fn rows_buf(n: usize) -> Vec<f32> {
+    let mut v = ROWS.with(|r| r.take());
+    if v.len() >= n {
+        v.truncate(n);
+    } else {
+        v.resize(n, 0.0);
+    }
+    v
+}
+
+/// Give a step's logits rows back for the next step's copy.
+pub fn recycle_rows(v: Vec<f32>) {
+    ROWS.with(|r| {
+        if r.borrow().capacity() < v.capacity() {
+            *r.borrow_mut() = v;
+        }
+    });
+}
+
 /// The step's results from its logits `[m, vocab]`: rows with a sample spec
 /// are sampled on the device (only their ids are copied back), the rest are
 /// copied to the host.
 pub(crate) fn finish_logits<B: Backend>(b: &B, logits: &B::Buffer, m: usize, vocab: usize, batch: &Batch) -> Result<StepOut> {
     if batch.sample.iter().all(Option::is_none) {
-        let mut rows = vec![0f32; m * vocab];
+        let mut rows = rows_buf(m * vocab);
         b.to_host(logits, &mut rows)?;
         return Ok(StepOut { rows, ids: Vec::new() });
     }
@@ -108,7 +143,7 @@ pub(crate) fn finish_logits<B: Backend>(b: &B, logits: &B::Buffer, m: usize, voc
     if !full.is_empty() {
         let mut g = b.alloc(full.len() * vocab)?;
         b.gather_rows(logits, &full, vocab, &mut g)?;
-        rows = vec![0f32; full.len() * vocab];
+        rows = rows_buf(full.len() * vocab);
         b.to_host(&g, &mut rows)?;
     }
     Ok(StepOut { rows, ids })
@@ -123,12 +158,16 @@ impl Batch<'_> {
     /// the key: a new cache never replays steps recorded for an old one.
     pub fn graph_key(&self, model_id: usize) -> Option<u64> {
         use std::hash::{Hash, Hasher};
-        // Steps of up to 8 tokens (any mix), and pure decode steps (one token
-        // per sequence) of up to 64: larger mixed steps take prefill paths
-        // whose index arrays change size from step to step. Graphs for the
-        // bigger decode batches: +18-21% at 16-32 sequences (Qwen3-0.6B, sm_89).
+        // Steps of up to 64 tokens, any mix: decode batches (+18-21% at 16-32
+        // sequences, Qwen3-0.6B, sm_89) and speculative verification steps
+        // (several tokens per sequence). The run pattern below fixes the
+        // launch shapes of their attention and matmul paths, so steps with
+        // the same pattern replay one graph. Prompt chunks run eagerly.
         let n = self.tokens.len();
-        if n > 8 && (n > 64 || self.block_tables.len() != n) {
+        static OLD_RULE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // RLLM_NO_MIXED_GRAPHS=1: mixed steps over 8 tokens run eagerly (A/B).
+        let old = *OLD_RULE.get_or_init(|| std::env::var_os("RLLM_NO_MIXED_GRAPHS").is_some());
+        if n > 64 || (old && n > 8 && self.block_tables.len() != n) {
             return None;
         }
         let width = self.block_tables.iter().map(Vec::len).max().unwrap_or(0).max(1).next_power_of_two();
@@ -178,10 +217,19 @@ pub trait Model<B: Backend> {
         Ok(())
     }
 
-    /// One MTP draft step: logits `[sequences, vocab]` on the host.
-    fn mtp_draft(&self, b: &B, cache: &mut Self::Cache, d: &MtpBatch, block_size: usize) -> Result<Vec<f32>> {
+    /// One MTP draft step: logits `[sequences, vocab]` on the host, or with
+    /// `d.greedy` each row's argmax token.
+    fn mtp_draft(&self, b: &B, cache: &mut Self::Cache, d: &MtpBatch, block_size: usize) -> Result<StepOut> {
         let _ = (b, cache, d, block_size);
         bail!("this model has no MTP head")
+    }
+
+    /// Copy everything a sequence carries in state slot `from` besides its
+    /// KV blocks (recurrent state, MTP's pending hidden state) to slot `to`:
+    /// prefix-cache checkpoints.
+    fn copy_state(&self, b: &B, cache: &mut Self::Cache, from: u32, to: u32) -> Result<()> {
+        let _ = (b, cache, from, to);
+        bail!("this model has no recurrent state")
     }
 
     /// Host copies of cache blocks (the prefix cache's host tier).
@@ -247,8 +295,8 @@ pub struct ModelProfile {
     /// Tensor data in the file.
     pub weight_bytes: usize,
     /// How much more device memory the weights take than in the file: the
-    /// GPU backends repack K-quants (Q4_K, Q5_K, Q6_K) into aligned layouts
-    /// about 11% larger, and Q3_K into the 6-bit layout (224 bytes per 256
+    /// GPU backends repack K-quants into aligned layouts about 11% larger
+    /// (Q4_K, Q5_K, Q6_K), and Q3_K into the 6-bit layout (224 bytes per 256
     /// values instead of 110).
     pub repack_bytes: usize,
     /// Recurrent state per sequence (hybrid models; 0 otherwise).
@@ -417,10 +465,17 @@ impl<B: Backend> Model<B> for AnyModel<B> {
         }
     }
 
-    fn mtp_draft(&self, b: &B, cache: &mut AnyCache<B>, d: &MtpBatch, block_size: usize) -> Result<Vec<f32>> {
+    fn mtp_draft(&self, b: &B, cache: &mut AnyCache<B>, d: &MtpBatch, block_size: usize) -> Result<StepOut> {
         match (self, cache) {
             (Self::Qwen35(m), AnyCache::Qwen35(c)) => m.mtp_draft(b, c, d, block_size),
             _ => bail!("this model has no MTP head"),
+        }
+    }
+
+    fn copy_state(&self, b: &B, cache: &mut AnyCache<B>, from: u32, to: u32) -> Result<()> {
+        match (self, cache) {
+            (Self::Qwen35(m), AnyCache::Qwen35(c)) => m.copy_state(b, c, from, to),
+            _ => bail!("this model has no recurrent state"),
         }
     }
 

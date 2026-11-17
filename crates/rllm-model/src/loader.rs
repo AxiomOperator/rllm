@@ -69,7 +69,7 @@ pub(crate) fn check_same_as_head_dim(g: &Gguf, key: &str, head_dim: usize, what:
 /// View a GGUF tensor as a `HostTensor` without copying its data.
 pub fn host_tensor(g: &Gguf, name: &str) -> Result<HostTensor> {
     let info = g.require_tensor(name)?;
-    let owner: Arc<dyn AsRef<[u8]> + Send + Sync> = g.mmap().clone();
+    let owner: Arc<dyn AsRef<[u8]> + Send + Sync> = g.tensor_owner(info);
     Ok(HostTensor {
         name: name.to_string(),
         dtype: info.dtype,

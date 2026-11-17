@@ -78,13 +78,77 @@ fn state_file(dir: &Path) -> PathBuf {
     dir.join("servers.json")
 }
 
+/// Serializes read-modify-write of `servers.json` (concurrent starts and
+/// stops would otherwise drop each other's records).
+static STATE_LOCK: Mutex<()> = Mutex::new(());
+
+fn update_state(dir: &Path, f: impl FnOnce(&mut HashMap<u16, StartReq>)) {
+    let _g = STATE_LOCK.lock().unwrap();
+    let mut m = load_state(dir);
+    f(&mut m);
+    save_state(dir, &m);
+}
+
+/// Servers started but not yet answering: (port, bytes planned, when).
+/// Their memory isn't in use yet, so the next start's fit check subtracts it.
+static LOADING: Mutex<Vec<(u16, u64, Instant)>> = Mutex::new(Vec::new());
+
+fn loading_bytes() -> u64 {
+    let mut l = LOADING.lock().unwrap();
+    l.retain(|(_, _, t)| t.elapsed() < Duration::from_secs(900));
+    l.iter().map(|(_, b, _)| *b).sum()
+}
+
+fn loaded(port: u16) {
+    LOADING.lock().unwrap().retain(|(p, _, _)| *p != port);
+}
+
+/// A command line with the value after `--api-key` hidden.
+fn redact(args: &str) -> String {
+    let mut out = Vec::new();
+    let mut hide = false;
+    for a in args.split(' ') {
+        if hide {
+            out.push("***".to_string());
+            hide = false;
+        } else if a == "--api-key" {
+            out.push(a.to_string());
+            hide = true;
+        } else if a.starts_with("--api-key=") {
+            out.push("--api-key=***".to_string());
+        } else {
+            out.push(a.to_string());
+        }
+    }
+    out.join(" ")
+}
+
+fn is_loopback(host: &str) -> bool {
+    host == "localhost" || host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 fn load_state(dir: &Path) -> HashMap<u16, StartReq> {
     std::fs::read_to_string(state_file(dir)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
 fn save_state(dir: &Path, m: &HashMap<u16, StartReq>) {
     let _ = std::fs::create_dir_all(dir);
-    let _ = std::fs::write(state_file(dir), serde_json::to_string_pretty(m).unwrap_or_default());
+    // It holds API keys: owner-only, written whole then renamed in.
+    let tmp = dir.join(".servers.json.tmp");
+    let ok = {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).and_then(|mut f| f.write_all(serde_json::to_string_pretty(m).unwrap_or_default().as_bytes()))
+    };
+    if ok.is_ok() {
+        let _ = std::fs::rename(&tmp, state_file(dir));
+    }
+}
+
+/// The environment file holding a server's API key (mode 0600), so the key
+/// is on no command line.
+fn key_file(dir: &Path, port: u16) -> PathBuf {
+    dir.join(format!("serve-{port}.env"))
 }
 
 fn unit(port: u16) -> String {
@@ -159,7 +223,7 @@ pub async fn list(state_dir: &Path, default_key: Option<&str>) -> Vec<Server> {
         let pid = p.get("MainPID").and_then(|x| x.parse::<i32>().ok()).filter(|&x| x > 0);
         managed_pids.extend(pid);
         let req = known.get(&port);
-        let args = pid.and_then(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).ok()).map(|b| String::from_utf8_lossy(&b).replace('\0', " ")).unwrap_or_default();
+        let args = pid.and_then(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).ok()).map(|b| redact(String::from_utf8_lossy(&b).replace('\0', " ").trim_end())).unwrap_or_default();
         let state = match (p.get("ActiveState").map(String::as_str), p.get("Result").map(String::as_str)) {
             (Some("active"), _) => "running".to_string(),
             (Some("failed"), r) => format!("failed ({})", r.unwrap_or("?")),
@@ -202,7 +266,7 @@ pub async fn list(state_dir: &Path, default_key: Option<&str>) -> Vec<Server> {
             state: "running".into(),
             pid: Some(p.pid),
             model,
-            args: p.args.clone(),
+            args: redact(&p.args),
             healthy: false,
             uptime_s: p.age_s,
             requests_finished: None,
@@ -234,6 +298,10 @@ pub struct Ctx<'a> {
 
 /// Start a server; returns the plan's description.
 pub async fn start(c: &Ctx<'_>, mut req: StartReq) -> Result<String> {
+    // One start at a time: the fit check must see the previous start's
+    // reservation.
+    static START: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one = START.lock().await;
     ensure!(req.port >= 1024 && req.port != c.agent_port, "port {} not allowed (1024+, not the agent's {})", req.port, c.agent_port);
     ensure!(!port_in_use(req.port), "port {} is already in use", req.port);
     ensure!((1..=8).contains(&req.parallel), "parallel must be 1..8");
@@ -255,13 +323,22 @@ pub async fn start(c: &Ctx<'_>, mut req: StartReq) -> Result<String> {
         bail!("{}: {e}", req.model);
     }
     let host = sys::host(&c.model_dirs[0]);
-    let plan = models::plan(&info, req.ctx, req.parallel, kv, req.kv_tokens, sys::usable_bytes(&host));
+    let plan = models::plan(&info, req.ctx, req.parallel, kv, req.kv_tokens, sys::usable_bytes(&host).saturating_sub(loading_bytes()));
     if !plan.fits && !req.force {
         bail!("won't fit: {} (stop something, lower ctx/parallel, or force)", plan.detail);
     }
     if req.api_key.is_none() {
         req.api_key = c.default_key.map(String::from);
     }
+    if let Some(k) = &req.api_key {
+        ensure!(!k.is_empty() && !k.contains(['\n', '\r', '\0']), "bad api_key");
+    }
+    ensure!(
+        req.api_key.is_some() || is_loopback(&req.host),
+        "a server listening on {} needs an API key (set serve_api_key in the agent config, give api_key, or use host 127.0.0.1)",
+        req.host
+    );
+    ensure!(!req.host.is_empty() && !req.host.starts_with('-') && !req.host.contains(char::is_whitespace), "bad host {:?}", req.host);
     let bin = c.bin_dir.join("rllm");
     ensure!(bin.is_file(), "{} not found", bin.display());
     let mut args: Vec<String> = vec![
@@ -272,7 +349,13 @@ pub async fn start(c: &Ctx<'_>, mut req: StartReq) -> Result<String> {
         format!("--working-directory={}", c.bin_dir.display()),
     ];
     if let Some(k) = &req.api_key {
-        args.push(format!("--setenv=RLLM_API_KEY={k}"));
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let f = key_file(c.state_dir, req.port);
+        std::fs::create_dir_all(c.state_dir)?;
+        let mut w = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&f)?;
+        w.write_all(format!("RLLM_API_KEY={k}\n").as_bytes())?;
+        args.push(format!("--property=EnvironmentFile={}", f.display()));
     }
     for (k, v) in c.env {
         args.push(format!("--setenv={k}={v}"));
@@ -302,14 +385,22 @@ pub async fn start(c: &Ctx<'_>, mut req: StartReq) -> Result<String> {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
     let (ok, out) = sys::run("systemd-run", &a).await?;
     ensure!(ok, "systemd-run: {out}");
-    let mut known = load_state(c.state_dir);
-    known.insert(req.port, req.clone());
-    save_state(c.state_dir, &known);
+    LOADING.lock().unwrap().push((req.port, plan.need_bytes, Instant::now()));
+    update_state(c.state_dir, |known| {
+        known.insert(req.port, req.clone());
+    });
     Ok(format!("{} started: {}", unit(req.port), plan.detail))
 }
 
 /// Wait until a started server answers /health (or its unit stops).
 pub async fn wait_ready(port: u16, timeout: Duration) -> Result<()> {
+    struct Done(u16);
+    impl Drop for Done {
+        fn drop(&mut self) {
+            loaded(self.0);
+        }
+    }
+    let _done = Done(port);
     let t0 = Instant::now();
     while t0.elapsed() < timeout {
         if crate::http::request(&format!("127.0.0.1:{port}"), "GET", "/health", None, None, Duration::from_secs(2)).await.is_ok_and(|r| r.status == 200) {
@@ -332,9 +423,11 @@ pub async fn stop(state_dir: &Path, port: u16) -> Result<String> {
     if p.get("LoadState").is_some_and(|s| s == "loaded") {
         let _ = sys::run("systemctl", &["--user", "stop", &format!("{name}.service")]).await;
         let _ = sys::run("systemctl", &["--user", "reset-failed", &format!("{name}.service")]).await;
-        let mut known = load_state(state_dir);
-        known.remove(&port);
-        save_state(state_dir, &known);
+        update_state(state_dir, |known| {
+            known.remove(&port);
+        });
+        let _ = std::fs::remove_file(key_file(state_dir, port));
+        loaded(port);
         return Ok(format!("{name} stopped"));
     }
     let hits: Vec<_> = sys::procs_named("rllm").into_iter().filter(|x| x.args.split_whitespace().any(|a| a == "serve") && port_of(&x.args) == Some(port)).collect();
@@ -354,4 +447,21 @@ pub async fn stop(state_dir: &Path, port: u16) -> Result<String> {
 pub async fn log(port: u16, lines: usize) -> Result<String> {
     let (_, out) = sys::run("journalctl", &["--user", "-u", &format!("{}.service", unit(port)), "-n", &lines.to_string(), "-o", "cat", "--no-pager"]).await?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_keys() {
+        assert_eq!(redact("rllm serve m.gguf --api-key secret --port 8"), "rllm serve m.gguf --api-key *** --port 8");
+        assert_eq!(redact("rllm serve --api-key=secret"), "rllm serve --api-key=***");
+    }
+
+    #[test]
+    fn loopback_hosts() {
+        assert!(is_loopback("127.0.0.1") && is_loopback("localhost") && is_loopback("::1") && is_loopback("[::1]"));
+        assert!(!is_loopback("0.0.0.0") && !is_loopback("172.99.99.31"));
+    }
 }

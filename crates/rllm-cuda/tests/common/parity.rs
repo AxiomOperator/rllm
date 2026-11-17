@@ -152,7 +152,10 @@ fn matmul_all_dtypes_both_paths() {
             // m <= 8 on quantized weights runs int8 activations (dp4a), like
             // llama.cpp's q8_1 path: per-32 rounding costs ~0.5% per dot product.
             let quantized = matches!(dtype, DType::Q8_0 | DType::Q3K | DType::Q4K | DType::Q6K | DType::Q5K | DType::IQ4XS);
+            // F32 matrices stream their f16 copy in the matvec (as cuBLAS
+            // reads it for m > 8): f16 rounding of the weights.
             let tol = match (m <= 8, quantized) {
+                (true, false) if dtype == DType::F32 => 2e-3,
                 (true, false) => 1e-5,
                 (true, true) => 1.5e-2,
                 (false, _) => 5e-3,
@@ -533,7 +536,9 @@ fn matvec_float_split_k() {
             let (mut oc, mut og) = (cpu.alloc(m * n).unwrap(), gpu.alloc(m * n).unwrap());
             cpu.matmul(&xc, &wc, &mut oc, m).unwrap();
             gpu.matmul(&xg, &wg, &mut og, m).unwrap();
-            assert_close(&format!("matvec split-k {dtype} m={m}"), &download(&cpu, &oc, m * n), &download(&gpu, &og, m * n), 1e-5);
+            // F32 matrices stream their f16 copy (as prefill's GEMMs do).
+            let tol = if dtype == DType::F32 { 1e-3 } else { 1e-5 };
+            assert_close(&format!("matvec split-k {dtype} m={m}"), &download(&cpu, &oc, m * n), &download(&gpu, &og, m * n), tol);
         }
     }
 }
@@ -583,7 +588,9 @@ fn gated_ffn_float_decode_fused() {
                 cpu.gated_ffn(&xc, &wc[0], &wc[1], &wc[2], act, &mut oc, &mut gc, &mut uc, m, f).unwrap();
                 let (mut og, mut gg, mut ug) = (gpu.alloc(m * d).unwrap(), gpu.alloc(m * f).unwrap(), gpu.alloc(m * f).unwrap());
                 gpu.gated_ffn(&xg, &wg[0], &wg[1], &wg[2], act, &mut og, &mut gg, &mut ug, m, f).unwrap();
-                assert_close(&format!("float gated_ffn {dtype} {act:?} m={m}"), &download(&cpu, &oc, m * d), &download(&gpu, &og, m * d), 1e-4);
+                // An F32 down projection streams its f16 copy.
+                let tol = if dtype == DType::F32 { 1e-3 } else { 1e-4 };
+                assert_close(&format!("float gated_ffn {dtype} {act:?} m={m}"), &download(&cpu, &oc, m * d), &download(&gpu, &og, m * d), tol);
             }
         }
     }
@@ -639,13 +646,15 @@ fn sample_rows_matches_reference() {
     let (rows, vocab) = (6, 5024);
     let logits: Vec<f32> = (0..rows * vocab).map(|_| rng.f32() * 6.0).collect();
     let configs = [
-        (0.0, 0, 1.0),
-        (1.0, 0, 1.0),
-        (0.7, 40, 1.0),
-        (1.0, 0, 0.9),
-        (0.8, 50, 0.95),
+        (0.0, 0, 1.0, 0.0),
+        (1.0, 0, 1.0, 0.0),
+        (0.7, 40, 1.0, 0.0),
+        (1.0, 0, 0.9, 0.0),
+        (0.8, 50, 0.95, 0.0),
+        (1.0, 0, 1.0, 0.05),
+        (0.7, 40, 0.9, 0.1),
     ];
-    for (t, k, p) in configs {
+    for (t, k, p, min_p) in configs {
         let (mut same, mut total) = (0, 0);
         for counter in 0..20u64 {
             let specs: Vec<rllm_core::RowSample> = (0..rows)
@@ -653,6 +662,7 @@ fn sample_rows_matches_reference() {
                     temperature: t,
                     top_k: k,
                     top_p: p,
+                    min_p,
                     seed: 42 + r as u64,
                     counter,
                     adjust: if r == 1 { vec![(7, 40.0), (9, -3.0), (7, -40.0), (5, 25.0), (5, 25.0)] } else { Vec::new() },
@@ -694,7 +704,7 @@ fn sample_rows_masked_and_tiny_temperature() {
     for (t, k, p) in [(1.0, 3, 1.0), (0.1, 0, 0.05), (1e-30, 0, 1.0), (1e-30, 5, 0.5)] {
         for counter in 0..10u64 {
             let specs: Vec<rllm_core::RowSample> = (0..rows)
-                .map(|r| rllm_core::RowSample { temperature: t, top_k: k, top_p: p, seed: 9 + r as u64, counter, adjust: Vec::new() })
+                .map(|r| rllm_core::RowSample { temperature: t, top_k: k, top_p: p, min_p: 0.0, seed: 9 + r as u64, counter, adjust: Vec::new() })
                 .collect();
             let pick: Vec<(u32, &rllm_core::RowSample)> = (0..rows).map(|r| (r as u32, &specs[r])).collect();
             let (mut a, mut b) = (vec![0u32; rows], vec![0u32; rows]);
@@ -732,7 +742,9 @@ fn gated_delta_net_ops_match() {
     gpu.sigmoid_mul(&mut xg, &gg, n).unwrap();
     assert_close("sigmoid_mul", &download(&cpu, &xc, n), &download(&gpu, &xg, n), 1e-5);
 
-    for d in [64usize, 128] {
+    // Both recurrences: token by token (the default) and chunked (opt-in).
+    for (d, chunked) in [(64usize, false), (128, false), (64, true), (128, true)] {
+        set_gdn_chunked_for_tests(chunked);
         let shape = rllm_core::GdnShape { n_k_heads: 2, n_v_heads: 6, head_dim: d };
         let (ch, kernel, slots) = (shape.qkv_width(), 4usize, 3usize);
         let conv_w = f32_tensor("conv", &rng.vec(ch * kernel).iter().map(|v| v * 0.5).collect::<Vec<_>>());
@@ -746,8 +758,10 @@ fn gated_delta_net_ops_match() {
         // Stale data in the state buffers: fresh sequences must ignore it.
         let (mut csc, mut csg) = (upload_any(&cpu, &rng.vec(conv_len)), upload_any(&gpu, &rng.vec(conv_len)));
         let (mut ssc, mut ssg) = (upload_any(&cpu, &rng.vec(ssm_len)), upload_any(&gpu, &rng.vec(ssm_len)));
-        // Step 1: both sequences start (5 and 3 tokens); step 2: 1 and 4 more.
-        for (starts, fresh) in [(vec![0u32, 5, 8], vec![1u32, 1]), (vec![0u32, 1, 5], vec![0u32, 0])] {
+        // Step 1: both sequences start (5 and 3 tokens); step 2: 1 and 4 more;
+        // step 3: prompt-sized runs over several 8-token tiles (19 and 10);
+        // step 4: runs over several 32-token chunks (70, and a fresh 31).
+        for (starts, fresh) in [(vec![0u32, 5, 8], vec![1u32, 1]), (vec![0u32, 1, 5], vec![0u32, 0]), (vec![0u32, 19, 29], vec![0u32, 0]), (vec![0u32, 70, 101], vec![0u32, 1])] {
             let runs = rllm_core::SeqRuns { starts: &starts, slots: &[2, 0], fresh: &fresh, snap: &[], snap_at: &[] };
             let t = *starts.last().unwrap() as usize;
             let xin = rng.vec(t * ch);
@@ -765,9 +779,10 @@ fn gated_delta_net_ops_match() {
             let qc = upload_any(&gpu, &conv_out);
             cpu.gated_delta_net(&oc, &alc, &bec, &dtc, &ac, &mut ssc, &runs, &mut yc, shape, 1e-6, None).unwrap();
             gpu.gated_delta_net(&qc, &alg, &beg, &dtg, &ag, &mut ssg, &runs, &mut yg, shape, 1e-6, None).unwrap();
-            assert_close(&format!("gated_delta_net d{d}"), &download(&cpu, &yc, t * hv * d), &download(&gpu, &yg, t * hv * d), 1e-4);
+            assert_close(&format!("gated_delta_net d{d} chunked={chunked}"), &download(&cpu, &yc, t * hv * d), &download(&gpu, &yg, t * hv * d), 1e-4);
         }
     }
+    set_gdn_chunked_for_tests(false);
 }
 
 /// Speculative verification with recurrent state: a 4-token step that
@@ -877,6 +892,22 @@ fn moe_ffn_matches() {
             };
             let got = run_gpu(&x, &logits, &sy, &sg, m);
             assert_close(&format!("moe_ffn {fg}/{fu}/{fd} m={m} shared={with_shared}"), &want, &got, 5e-2);
+            // Fused with the residual add and the next norm: the same as
+            // moe_ffn, then add_rms_norm (the GPU's own unfused results).
+            {
+                let resid = rng.vec(m * d);
+                let nw = f32_tensor("nw", &rng.vec(d));
+                let nwg = gpu.upload(&nw).unwrap();
+                let (xg, lg) = (upload(&gpu, &x), upload_any(&gpu, &logits));
+                let (yg, gg) = (upload(&gpu, &sy), upload_any(&gpu, &sg));
+                let (mut r1, mut h1, mut o) = (upload(&gpu, &resid), gpu.alloc(m * d).unwrap(), gpu.alloc(m * d).unwrap());
+                gpu.moe_ffn(&xg, &lg, &mg, with_shared.then_some((&yg, &gg)), &mut o, m).unwrap();
+                gpu.add_rms_norm(&mut r1, &o, &nwg, &mut h1, m, d, 1e-6).unwrap();
+                let (mut r2, mut h2) = (upload(&gpu, &resid), gpu.alloc(m * d).unwrap());
+                gpu.moe_ffn_add_norm(&xg, &lg, &mg, with_shared.then_some((&yg, &gg)), &mut r2, Some((&nwg, &mut h2)), m, d, 1e-6).unwrap();
+                assert_eq!(download(&gpu, &r1, m * d), download(&gpu, &r2, m * d), "fused residual m={m}");
+                assert_eq!(download(&gpu, &h1, m * d), download(&gpu, &h2, m * d), "fused norm m={m}");
+            }
             if m <= 8 {
                 // Decode rows don't depend on the rest of the batch (MTP
                 // verification must match single-token steps bit for bit).
@@ -928,6 +959,63 @@ fn matmul_skinny_float() {
             cpu.matmul(&xc, &wc, &mut oc, m).unwrap();
             gpu.matmul(&xg, &wg, &mut og, m).unwrap();
             assert_close(&format!("skinny {dtype} n={n}"), &download(&cpu, &oc, m * n), &download(&gpu, &og, m * n), 1e-5);
+        }
+    }
+}
+
+/// Spans of several buffers copied at once, between buffers and within each.
+#[test]
+fn copy_layers_matches() {
+    let Some(gpu) = gpu_backend() else { return };
+    let cpu = CpuBackend::new();
+    let mut rng = Rng(77);
+    let (n, len) = (3usize, 1000usize);
+    let src: Vec<Vec<f32>> = (0..n).map(|_| rng.vec(4 * len)).collect();
+    let dst: Vec<Vec<f32>> = (0..n).map(|_| rng.vec(4 * len)).collect();
+    let (sc, sg): (Vec<_>, Vec<_>) = src.iter().map(|v| (upload_any(&cpu, v), upload_any(&gpu, v))).unzip();
+    let (mut dc, mut dg): (Vec<_>, Vec<_>) = dst.iter().map(|v| (upload_any(&cpu, v), upload_any(&gpu, v))).unzip();
+    cpu.copy_layers(Some(&sc), &mut dc, len, 2 * len, len).unwrap();
+    gpu.copy_layers(Some(&sg), &mut dg, len, 2 * len, len).unwrap();
+    cpu.copy_layers(None, &mut dc, 3 * len, 0, len).unwrap();
+    gpu.copy_layers(None, &mut dg, 3 * len, 0, len).unwrap();
+    for i in 0..n {
+        assert_eq!(download(&cpu, &dc[i], 4 * len), download(&gpu, &dg[i], 4 * len), "buffer {i}");
+    }
+    assert!(gpu.copy_layers(None, &mut dg, 0, len / 2, len).is_err(), "overlap is refused");
+}
+
+/// The conv feeding the recurrence directly (conv1d_silu_gdn, where the GPU
+/// normalizes q and k on the way), decode and prompt-sized steps.
+#[test]
+fn gdn_fused_conv_matches() {
+    let Some(gpu) = gpu_backend() else { return };
+    let cpu = CpuBackend::new();
+    let mut rng = Rng(91);
+    for d in [64usize, 128] {
+        let shape = rllm_core::GdnShape { n_k_heads: 2, n_v_heads: 4, head_dim: d };
+        let (ch, kernel, slots, hv) = (shape.qkv_width(), 4usize, 2usize, shape.n_v_heads);
+        let conv_w = f32_tensor("conv", &rng.vec(ch * kernel).iter().map(|v| v * 0.5).collect::<Vec<_>>());
+        let dt = f32_tensor("dt", &rng.vec(hv));
+        let a = f32_tensor("a", &rng.vec(hv).iter().map(|v| -(v.abs() + 0.1)).collect::<Vec<_>>());
+        let (wc, wg) = (cpu.upload(&conv_w).unwrap(), gpu.upload(&conv_w).unwrap());
+        let (dtc, dtg, ac, ag) = (cpu.upload(&dt).unwrap(), gpu.upload(&dt).unwrap(), cpu.upload(&a).unwrap(), gpu.upload(&a).unwrap());
+        let (mut csc, mut csg) = (upload_any(&cpu, &vec![0.0; slots * ch * (kernel - 1)]), upload_any(&gpu, &vec![0.0; slots * ch * (kernel - 1)]));
+        let (mut ssc, mut ssg) = (upload_any(&cpu, &vec![0.0; slots * shape.state_len()]), upload_any(&gpu, &vec![0.0; slots * shape.state_len()]));
+        // A prompt-sized step (13 and 21 tokens), then a decode step.
+        for (starts, fresh) in [(vec![0u32, 13, 34], vec![1u32, 1]), (vec![0u32, 1, 2], vec![0u32, 0])] {
+            let runs = rllm_core::SeqRuns { starts: &starts, slots: &[1, 0], fresh: &fresh, snap: &[], snap_at: &[] };
+            let t = *starts.last().unwrap() as usize;
+            let xin = rng.vec(t * ch);
+            let (al, be) = (rng.vec(t * hv), rng.vec(t * hv));
+            let (xic, xig) = (upload_any(&cpu, &xin), upload_any(&gpu, &xin));
+            let (alc, alg, bec, beg) = (upload_any(&cpu, &al), upload_any(&gpu, &al), upload_any(&cpu, &be), upload_any(&gpu, &be));
+            let (mut oc, mut og) = (cpu.alloc(t * ch).unwrap(), gpu.alloc(t * ch).unwrap());
+            cpu.conv1d_silu_gdn(&xic, &wc, &mut csc, &runs, &mut oc, ch, kernel, None, shape, 1e-6).unwrap();
+            gpu.conv1d_silu_gdn(&xig, &wg, &mut csg, &runs, &mut og, ch, kernel, None, shape, 1e-6).unwrap();
+            let (mut yc, mut yg) = (cpu.alloc(t * hv * d).unwrap(), gpu.alloc(t * hv * d).unwrap());
+            cpu.gated_delta_net(&oc, &alc, &bec, &dtc, &ac, &mut ssc, &runs, &mut yc, shape, 1e-6, None).unwrap();
+            gpu.gated_delta_net(&og, &alg, &beg, &dtg, &ag, &mut ssg, &runs, &mut yg, shape, 1e-6, None).unwrap();
+            assert_close(&format!("fused conv + gdn d{d} t={t}"), &download(&cpu, &yc, t * hv * d), &download(&gpu, &yg, t * hv * d), 2e-4);
         }
     }
 }

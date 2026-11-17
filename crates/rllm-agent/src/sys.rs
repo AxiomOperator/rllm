@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use tokio::process::Command;
 
@@ -328,10 +328,110 @@ pub async fn sha256(p: &Path) -> Result<String> {
     Ok(h)
 }
 
-/// A file name that stays inside its directory.
+/// A file name that stays inside its directory and is inert anywhere it is
+/// shown or passed on (HTML, URLs, command lines): ASCII letters, digits
+/// and `._+-`, not starting with a dot.
 pub fn safe_name(n: &str) -> Result<&str> {
-    if n.is_empty() || n.contains('/') || n.contains('\0') || n.starts_with('.') {
-        bail!("bad file name {n:?}");
+    let ok = !n.is_empty() && n.len() <= 255 && !n.starts_with('.') && n.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b));
+    if !ok {
+        bail!("bad file name {n:?} (use letters, digits and . _ + -)");
     }
     Ok(n)
+}
+
+/// curl flags for every transfer: http(s) only, also after redirects, and
+/// no URL globbing.
+pub const CURL_SAFE: [&str; 5] = ["--proto", "=http,https", "--proto-redir", "=http,https", "--globoff"];
+
+/// curl reading an `Authorization: Bearer` header from stdin (`-K -`), so
+/// the token never appears on a command line (`ps`, /proc/*/cmdline).
+pub fn curl_command(auth: Option<&str>) -> Command {
+    let mut c = Command::new("curl");
+    c.args(CURL_SAFE).kill_on_drop(true);
+    if auth.is_some() {
+        c.args(["-K", "-"]).stdin(std::process::Stdio::piped());
+    } else {
+        c.stdin(std::process::Stdio::null());
+    }
+    c
+}
+
+/// Run a command from [`curl_command`], feeding it the token, and collect
+/// its output.
+pub async fn curl_output(mut c: Command, auth: Option<&str>) -> Result<std::process::Output> {
+    use tokio::io::AsyncWriteExt;
+    c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().context("running curl")?;
+    if let Some(t) = auth {
+        let mut stdin = child.stdin.take().context("curl stdin")?;
+        let t = t.replace('\\', "\\\\").replace('"', "\\\"");
+        stdin.write_all(format!("header = \"Authorization: Bearer {t}\"\n").as_bytes()).await?;
+        drop(stdin);
+    }
+    Ok(child.wait_with_output().await?)
+}
+
+/// [`run`] for curl, with [`CURL_SAFE`] and the token passed on stdin.
+pub async fn curl(args: &[&str], auth: Option<&str>) -> Result<(bool, String)> {
+    let mut c = curl_command(auth);
+    c.args(args);
+    let out = curl_output(c, auth).await?;
+    let mut s = String::from_utf8_lossy(&out.stdout).to_string();
+    s.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok((out.status.success(), s))
+}
+
+/// Refuse URLs pointing at this machine or link-local addresses (cloud
+/// metadata): `/api/models/fetch` must not become a way to read local
+/// services. LAN addresses stay allowed (other machines' file servers).
+pub async fn check_fetch_target(url: &str) -> Result<()> {
+    let rest = url.split_once("://").map(|(_, r)| r).context("not a URL")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let (host, port) = if let Some(r) = hostport.strip_prefix('[') {
+        let (h, p) = r.split_once(']').context("bad IPv6 host")?;
+        (h.to_string(), p.strip_prefix(':').and_then(|p| p.parse().ok()).unwrap_or(443u16))
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse().context("bad port")?),
+            None => (hostport.to_string(), 443),
+        }
+    };
+    ensure!(!host.is_empty(), "no host in {url}");
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port)).await.with_context(|| format!("can't resolve {host}"))?.collect();
+    for a in &addrs {
+        let ip = match a.ip() {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(std::net::IpAddr::V6(v6)),
+            ip => ip,
+        };
+        let bad = match ip {
+            std::net::IpAddr::V4(v) => v.is_loopback() || v.is_link_local() || v.is_unspecified() || v.is_multicast() || v.is_broadcast(),
+            std::net::IpAddr::V6(v) => v.is_loopback() || v.is_unspecified() || v.is_multicast() || (v.segments()[0] & 0xffc0) == 0xfe80,
+        };
+        ensure!(!bad, "{host} resolves to {ip}: fetching from this machine or link-local addresses isn't allowed");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_names() {
+        assert!(safe_name("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf").is_ok());
+        for bad in ["", ".hidden", "a/b", "x');alert(1);('.gguf", "a b.gguf", "a\"b", "a<b", "é.gguf"] {
+            assert!(safe_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_targets() {
+        for bad in ["http://127.0.0.1:8090/api/status", "http://localhost/x", "http://169.254.169.254/latest", "http://[::1]:80/", "http://0.0.0.0/", "http://user@127.0.0.1/"] {
+            assert!(check_fetch_target(bad).await.is_err(), "{bad}");
+        }
+        for ok in ["http://172.99.99.31:8000/m.gguf", "https://10.0.0.5/x"] {
+            assert!(check_fetch_target(ok).await.is_ok(), "{ok}");
+        }
+    }
 }

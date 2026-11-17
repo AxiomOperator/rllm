@@ -1,16 +1,19 @@
 /// Token sampling: greedy when `temperature == 0`, otherwise temperature +
-/// top-k + top-p (nucleus).
+/// min-p + top-k + top-p (nucleus), in that order (as rllm_core::sample).
 #[derive(Debug, Clone)]
 pub struct SamplerConfig {
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
+    /// Keep tokens at least this fraction as likely as the most likely one
+    /// (after temperature); 0: off.
+    pub min_p: f32,
     pub seed: u64,
 }
 
 impl Default for SamplerConfig {
     fn default() -> Self {
-        Self { temperature: 0.0, top_k: 0, top_p: 1.0, seed: 0 }
+        Self { temperature: 0.0, top_k: 0, top_p: 1.0, min_p: 0.0, seed: 0 }
     }
 }
 
@@ -32,7 +35,7 @@ impl Sampler {
         if self.cfg.temperature <= 0.0 {
             return argmax(logits);
         }
-        let clean = without_nans(logits);
+        let clean = self.min_p_mask(without_nans(logits));
         let logits = &*clean;
         if !max_of(logits).is_finite() {
             // Nothing to weigh (every logit -inf), or +inf logits: they win.
@@ -66,6 +69,23 @@ impl Sampler {
         let cand = self.head(logits);
         let kept: f32 = cand.iter().map(|c| c.1).sum();
         draw_weighted(cand.iter().copied(), self.rng.next_f32() * kept)
+    }
+
+    /// Logits below min_p's cut as -inf: on the temperature-scaled logits,
+    /// `x >= max + ln(min_p)`. (Called with temperature > 0.)
+    fn min_p_mask<'a>(&self, x: std::borrow::Cow<'a, [f32]>) -> std::borrow::Cow<'a, [f32]> {
+        if self.cfg.min_p <= 0.0 || self.cfg.temperature <= 0.0 {
+            return x;
+        }
+        let max = max_of(&x);
+        if !max.is_finite() {
+            return x;
+        }
+        let cut = max + self.cfg.min_p.min(1.0).ln() / self.inv_t();
+        if x.iter().all(|&v| v >= cut) {
+            return x;
+        }
+        std::borrow::Cow::Owned(x.iter().map(|&v| if v >= cut { v } else { f32::NEG_INFINITY }).collect())
     }
 
     /// 1 / temperature, with rllm_core's minimum temperature (as the device
@@ -149,16 +169,16 @@ impl Sampler {
         if self.cfg.temperature <= 0.0 {
             return Dist::Point(argmax(logits));
         }
-        let clean = without_nans(logits);
+        let clean = self.min_p_mask(without_nans(logits));
         let logits = &*clean;
         if !max_of(logits).is_finite() {
             return Dist::Point(argmax(logits));
         }
         if self.cfg.top_k == 0 && self.cfg.top_p >= 1.0 {
+            // Unnormalized weights and their sum: no second pass to divide.
             let mut w = vec![0f32; logits.len()];
             let total = exp_weights(logits, max_of(logits), self.inv_t(), &mut w);
-            w.iter_mut().for_each(|x| *x /= total);
-            return Dist::Dense(w);
+            return Dist::Dense(w, 1.0 / total);
         }
         let mut cand = self.head(logits);
         let kept: f32 = cand.iter().map(|c| c.1).sum();
@@ -171,7 +191,7 @@ impl Sampler {
         match d {
             Dist::Point(id) => *id,
             Dist::Sparse(c) => draw_weighted(c.iter().copied(), self.rng.next_f32() * c.iter().map(|c| c.1).sum::<f32>()),
-            Dist::Dense(w) => draw_weighted(w.iter().enumerate().map(|(i, &p)| (i as u32, p)), self.rng.next_f32() * sum_of(w)),
+            Dist::Dense(w, _) => draw_weighted(w.iter().enumerate().map(|(i, &p)| (i as u32, p)), self.rng.next_f32() * sum_of(w)),
         }
     }
 
@@ -185,23 +205,28 @@ impl Sampler {
         if pd >= qd || self.rng.next_f32() * qd < pd {
             return (drafted, true);
         }
-        let residual: Vec<(u32, f32)> = match p {
-            Dist::Point(id) => return (*id, false),
-            Dist::Sparse(c) => {
-                let q = q.lookup();
-                c.iter().map(|&(id, pv)| (id, (pv - q.prob(id)).max(0.0))).collect()
-            }
-            Dist::Dense(w) => {
-                let q = q.lookup();
-                w.iter().enumerate().map(|(i, &pv)| (i as u32, (pv - q.prob(i as u32)).max(0.0))).collect()
-            }
-        };
-        let total: f32 = residual.iter().map(|c| c.1).sum();
+        // max(0, p - q), streamed twice (its sum, then the draw) rather than
+        // collected: a vocabulary-sized vector per rejection otherwise.
+        if let Dist::Point(id) = p {
+            return (*id, false);
+        }
+        let ql = q.lookup();
+        let total: f32 = residual(p, &ql).map(|c| c.1).sum();
         if total <= 0.0 {
             // Rounding left no residual mass (p and q nearly equal).
             return (self.draw(p), false);
         }
-        (draw_weighted(residual.iter().copied(), self.rng.next_f32() * total), false)
+        let r = self.rng.next_f32() * total;
+        (draw_weighted(residual(p, &ql), r), false)
+    }
+}
+
+/// max(0, p - q) per token of `p`'s support.
+fn residual<'a>(p: &'a Dist, q: &'a DistLookup<'a>) -> Box<dyn Iterator<Item = (u32, f32)> + 'a> {
+    match p {
+        Dist::Point(_) => Box::new(std::iter::empty()),
+        Dist::Sparse(c) => Box::new(c.iter().map(move |&(id, pv)| (id, (pv - q.prob(id)).max(0.0)))),
+        &Dist::Dense(ref w, s) => Box::new(w.iter().enumerate().map(move |(i, &pv)| (i as u32, (pv * s - q.prob(i as u32)).max(0.0)))),
     }
 }
 
@@ -229,8 +254,8 @@ pub enum Dist {
     Point(u32),
     /// Probabilities of these tokens; all others have none.
     Sparse(Vec<(u32, f32)>),
-    /// Probability of every token.
-    Dense(Vec<f32>),
+    /// Every token's weight, and 1 / their sum (probability = weight / sum).
+    Dense(Vec<f32>, f32),
 }
 
 impl Dist {
@@ -238,7 +263,7 @@ impl Dist {
         match self {
             Dist::Point(t) => (*t == id) as u32 as f32,
             Dist::Sparse(c) => c.iter().find(|c| c.0 == id).map_or(0.0, |c| c.1),
-            Dist::Dense(w) => w.get(id as usize).copied().unwrap_or(0.0),
+            Dist::Dense(w, s) => w.get(id as usize).map_or(0.0, |&x| x * s),
         }
     }
 
@@ -469,11 +494,11 @@ mod speed {
         let worst = (0..n).map(|i| (logits[i] - 15.0).exp()).zip(&w).map(|(a, b)| ((a - b) / a).abs()).fold(0f32, f32::max);
         println!("fast_exp max rel err {worst:e}");
         time("to_vec", &mut || std::hint::black_box(logits.to_vec())[7] as u32);
-        let mut s = Sampler::new(SamplerConfig { temperature: 1.0, top_k: 0, top_p: 1.0, seed: 1 });
+        let mut s = Sampler::new(SamplerConfig { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, seed: 1 });
         time("temp 1.0", &mut || s.sample(&logits));
-        let mut s = Sampler::new(SamplerConfig { temperature: 0.7, top_k: 0, top_p: 0.95, seed: 1 });
+        let mut s = Sampler::new(SamplerConfig { temperature: 0.7, top_k: 0, top_p: 0.95, min_p: 0.0, seed: 1 });
         time("top_p .95", &mut || s.sample(&logits));
-        let mut s = Sampler::new(SamplerConfig { temperature: 0.7, top_k: 40, top_p: 1.0, seed: 1 });
+        let mut s = Sampler::new(SamplerConfig { temperature: 0.7, top_k: 40, top_p: 1.0, min_p: 0.0, seed: 1 });
         time("top_k 40", &mut || s.sample(&logits));
     }
 }
@@ -486,7 +511,7 @@ mod tests {
     fn nan_logits_never_win_or_panic() {
         let x = [f32::NAN, 0.0, f32::NAN, 1.0];
         for (k, p) in [(0, 1.0), (2, 1.0), (0, 0.9), (2, 0.5)] {
-            let mut s = Sampler::new(SamplerConfig { temperature: 1.0, top_k: k, top_p: p, seed: 3 });
+            let mut s = Sampler::new(SamplerConfig { temperature: 1.0, top_k: k, top_p: p, min_p: 0.0, seed: 3 });
             for _ in 0..50 {
                 assert!(matches!(s.sample(&x), 1 | 3));
             }
@@ -503,16 +528,16 @@ mod tests {
         for z in [0, u64::MAX] {
             assert!(f(z) > 0.0 && f(z) < 1.0);
         }
-        let mut s = Sampler::new(SamplerConfig { temperature: 1.0, top_k: 0, top_p: 1.0, seed: 1 });
+        let mut s = Sampler::new(SamplerConfig { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, seed: 1 });
         for _ in 0..10_000 {
             assert_eq!(s.sample(&[f32::NEG_INFINITY, 0.0]), 1);
         }
-        let mut s = Sampler::new(SamplerConfig { temperature: 1.0, top_k: 2, top_p: 1.0, seed: 1 });
+        let mut s = Sampler::new(SamplerConfig { temperature: 1.0, top_k: 2, top_p: 1.0, min_p: 0.0, seed: 1 });
         match s.dist(&[1.0, 0.0, 1.0, 1.0]) {
             Dist::Sparse(c) => assert_eq!(c.len(), 3, "{c:?}"),
             d => panic!("{d:?}"),
         }
-        let mut s = Sampler::new(SamplerConfig { temperature: 1e-30, top_k: 2, top_p: 0.9, seed: 1 });
+        let mut s = Sampler::new(SamplerConfig { temperature: 1e-30, top_k: 2, top_p: 0.9, min_p: 0.0, seed: 1 });
         assert_eq!(s.sample(&[0.0, 1.0, 0.5]), 1);
     }
 
@@ -552,10 +577,10 @@ mod tests {
         let target = [2.0f32, 1.0, 0.5, 0.0, -1.0, -3.0];
         let draft = [0.0f32, 2.0, 0.0, 1.0, -2.0, 0.0];
         for (seed, cfg) in [
-            SamplerConfig { temperature: 1.0, top_k: 0, top_p: 1.0, seed: 0 },
-            SamplerConfig { temperature: 0.7, top_k: 3, top_p: 1.0, seed: 0 },
-            SamplerConfig { temperature: 1.0, top_k: 0, top_p: 0.8, seed: 0 },
-            SamplerConfig { temperature: 0.0, top_k: 0, top_p: 1.0, seed: 0 },
+            SamplerConfig { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, seed: 0 },
+            SamplerConfig { temperature: 0.7, top_k: 3, top_p: 1.0, min_p: 0.0, seed: 0 },
+            SamplerConfig { temperature: 1.0, top_k: 0, top_p: 0.8, min_p: 0.0, seed: 0 },
+            SamplerConfig { temperature: 0.0, top_k: 0, top_p: 1.0, min_p: 0.0, seed: 0 },
         ]
         .into_iter()
         .enumerate()
@@ -602,10 +627,14 @@ mod tests {
                 assert!((got[i] - w).abs() < 0.006, "token {i}: got {} want {w} ({got:?})", got[i]);
             }
         };
-        close(freq(SamplerConfig { temperature: 1.0, top_k: 0, top_p: 1.0, seed: 3 }), &softmax(1.0, 6));
-        close(freq(SamplerConfig { temperature: 0.5, top_k: 0, top_p: 1.0, seed: 4 }), &softmax(0.5, 6));
-        close(freq(SamplerConfig { temperature: 1.0, top_k: 3, top_p: 1.0, seed: 5 }), &softmax(1.0, 3));
+        close(freq(SamplerConfig { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, seed: 3 }), &softmax(1.0, 6));
+        close(freq(SamplerConfig { temperature: 0.5, top_k: 0, top_p: 1.0, min_p: 0.0, seed: 4 }), &softmax(0.5, 6));
+        close(freq(SamplerConfig { temperature: 1.0, top_k: 3, top_p: 1.0, min_p: 0.0, seed: 5 }), &softmax(1.0, 3));
         // top_p 0.8: the first three tokens hold 0.86 of the mass, two hold 0.73.
-        close(freq(SamplerConfig { temperature: 1.0, top_k: 0, top_p: 0.8, seed: 6 }), &softmax(1.0, 3));
+        close(freq(SamplerConfig { temperature: 1.0, top_k: 0, top_p: 0.8, min_p: 0.0, seed: 6 }), &softmax(1.0, 3));
+        // min_p 0.2 at T 1 keeps p >= 0.2 p_max: e^-1 and e^-1.5 stay, e^-2 goes.
+        close(freq(SamplerConfig { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.2, seed: 7 }), &softmax(1.0, 3));
+        // After temperature: at T 0.5 the ratios square, so min_p 0.1 keeps two.
+        close(freq(SamplerConfig { temperature: 0.5, top_k: 0, top_p: 1.0, min_p: 0.1, seed: 8 }), &softmax(0.5, 2));
     }
 }

@@ -44,18 +44,14 @@ pub async fn deploy(ctx: JobCtx, bin_dir: std::path::PathBuf, addr: String, toke
     let mut same = 0;
     for (i, e) in entries.iter().enumerate() {
         let name = e["name"].as_str().context("name")?;
-        sys::safe_name(name)?;
+        ensure!(BINARIES.contains(&name), "{addr} offered {name:?}, which isn't a deployable binary");
         let sha = e["sha256"].as_str().context("sha256")?;
         if sys::sha256(&bin_dir.join(name)).await.is_ok_and(|h| h == sha) {
             same += 1;
         }
         let dest = stage.join(name);
         ctx.log(format!("fetching {name} ({} bytes)", e["size"]));
-        let (ok, out) = sys::run(
-            "curl",
-            &["-sSf", "--max-time", "600", "-H", &format!("Authorization: Bearer {token}"), "-o", &dest.to_string_lossy(), &format!("http://{addr}/api/files/bin/{name}")],
-        )
-        .await?;
+        let (ok, out) = sys::curl(&["-sSf", "--max-time", "600", "-o", &dest.to_string_lossy(), &format!("http://{addr}/api/files/bin/{name}")], Some(&token)).await?;
         ensure!(ok, "fetching {name}: {out}");
         let got = sys::sha256(&dest).await?;
         ensure!(got == sha, "{name}: SHA-256 mismatch ({got} vs {sha})");

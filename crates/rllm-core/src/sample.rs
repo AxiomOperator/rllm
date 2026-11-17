@@ -6,10 +6,13 @@
 //! - temperature 0: argmax (lowest index on ties);
 //! - otherwise the Gumbel-max trick, `argmax(x / T + g)` with `g` Gumbel
 //!   noise, draws exactly from softmax(x / T);
-//! - top_k and top_p restrict the candidates to `x >= threshold`, the
+//! - min_p first keeps the tokens whose probability is at least `min_p`
+//!   times the most likely one's: `x >= max + ln(min_p)` on the scaled
+//!   logits;
+//! - top_k and top_p then restrict the candidates to `x >= threshold`, the
 //!   threshold found by bisection on the value: the k-th largest value for
 //!   top_k; for top_p the largest threshold whose candidates hold at least
-//!   `top_p` of the probability (of the top_k set when both are given).
+//!   `top_p` of the probability (of the min_p and top_k set when given).
 //!
 //! The noise comes from a counter-based hash of (seed, counter, token), so a
 //! request with a seed is reproducible whatever else is in the batch.
@@ -22,6 +25,8 @@ pub struct RowSample {
     pub top_k: u32,
     /// 1.0: no limit.
     pub top_p: f32,
+    /// 0.0: no limit.
+    pub min_p: f32,
     pub seed: u64,
     /// Distinguishes the draws of one request (e.g. its position).
     pub counter: u64,
@@ -75,7 +80,7 @@ pub fn sample_row(logits: &[f32], s: &RowSample) -> u32 {
     }
     let inv_t = 1.0 / s.temperature.max(MIN_TEMPERATURE);
     x.iter_mut().for_each(|v| *v *= inv_t);
-    let thr = threshold(&x, s.top_k, s.top_p);
+    let thr = threshold(&x, s.top_k, s.top_p, s.min_p);
     let mut best = (f32::NEG_INFINITY, 0u32);
     for (i, &v) in x.iter().enumerate() {
         if v >= thr {
@@ -98,7 +103,7 @@ pub fn sample_row(logits: &[f32], s: &RowSample) -> u32 {
 ///
 /// Ties: every value equal to the threshold is kept, so top_k may keep more
 /// than k tokens when several tie at the k-th value (as the GPU kernel does).
-pub fn threshold(x: &[f32], top_k: u32, top_p: f32) -> f32 {
+pub fn threshold(x: &[f32], top_k: u32, top_p: f32, min_p: f32) -> f32 {
     let (mut lo, hi) = x
         .iter()
         .filter(|v| v.is_finite())
@@ -108,6 +113,10 @@ pub fn threshold(x: &[f32], top_k: u32, top_p: f32) -> f32 {
         return thr;
     }
     let max = hi;
+    if min_p > 0.0 {
+        thr = hi + min_p.min(1.0).ln();
+        lo = lo.max(thr);
+    }
     if top_k > 0 && (top_k as usize) < x.len() {
         // Largest t with count(x >= t) >= k.
         let (mut a, mut b) = (lo, hi);
@@ -136,7 +145,7 @@ mod tests {
     use super::*;
 
     fn row(t: f32, k: u32, p: f32, seed: u64) -> RowSample {
-        RowSample { temperature: t, top_k: k, top_p: p, seed, counter: 0, adjust: Vec::new() }
+        RowSample { temperature: t, top_k: k, top_p: p, min_p: 0.0, seed, counter: 0, adjust: Vec::new() }
     }
 
     #[test]
@@ -182,7 +191,11 @@ mod tests {
             s.counter = c;
             assert_eq!(sample_row(&logits, &s), 8);
         }
-        assert!(threshold(&logits, 2, 1.0) > 2.8);
+        assert!(threshold(&logits, 2, 1.0, 0.0) > 2.8);
+        // min_p: max + ln(min_p), and the stricter of it and top_k wins.
+        let x = [2.0f32, 1.0, 0.5, 0.0];
+        assert!((threshold(&x, 0, 1.0, 0.2) - (2.0 + 0.2f32.ln())).abs() < 1e-6);
+        assert!(threshold(&x, 1, 1.0, 0.2) > 1.9);
         for t in [1e-30, 1e-45] {
             for c in 0..200 {
                 let mut s = row(t, 3, 0.5, 2);

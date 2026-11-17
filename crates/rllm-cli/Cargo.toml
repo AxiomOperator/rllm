@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 rllm-core.workspace = true
 rllm-gguf.workspace = true
+rllm-safetensors.workspace = true
 rllm-cpu.workspace = true
 rllm-cuda.workspace = true
 rllm-hip.workspace = true

@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 rllm-gguf = { path = "crates/rllm-gguf" }
+rllm-safetensors = { path = "crates/rllm-safetensors" }
 rllm-core = { path = "crates/rllm-core" }
 rllm-cpu = { path = "crates/rllm-cpu" }
 rllm-cuda = { path = "crates/rllm-cuda" }

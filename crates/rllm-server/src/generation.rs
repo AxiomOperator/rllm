@@ -108,6 +108,10 @@ pub fn spawn(state: &Arc<AppState>, spec: GenSpec, cancel: Arc<AtomicBool>) -> m
         for p in parser.push(&forced) {
             alive &= send(Out::Piece(p));
         }
+        // The server's time limit: past it the job is cancelled and its
+        // end reported as `length` (cut short by a limit, like max_tokens).
+        let deadline = state.request_timeout.map(|d| tokio::time::Instant::now() + d);
+        let mut timed_out = false;
         loop {
             // A client that leaves while its request is still queued sends
             // nothing to fail on: watch the output channel too.
@@ -119,6 +123,11 @@ pub fn spawn(state: &Arc<AppState>, spec: GenSpec, cancel: Arc<AtomicBool>) -> m
                 _ = out_tx.closed() => {
                     cancel.store(true, Ordering::Relaxed);
                     return;
+                }
+                _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if deadline.is_some() && !timed_out => {
+                    timed_out = true;
+                    cancel.store(true, Ordering::Relaxed);
+                    continue;
                 }
             };
             if !alive {
@@ -190,6 +199,7 @@ pub fn spawn(state: &Arc<AppState>, spec: GenSpec, cancel: Arc<AtomicBool>) -> m
                         Finish::Stop => FinishKind::Stop,
                         Finish::Length => FinishKind::Length,
                         Finish::Cancelled if stopped => FinishKind::Stop,
+                        Finish::Cancelled if timed_out => FinishKind::Length,
                         Finish::Cancelled if user_cancel.load(Ordering::Relaxed) => FinishKind::Cancelled,
                         Finish::Cancelled => FinishKind::Stop,
                     };

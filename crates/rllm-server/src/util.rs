@@ -2,7 +2,8 @@
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -20,9 +21,17 @@ pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> ApiResult<T> + Send
     tokio::task::spawn_blocking(f).await.map_err(|e| ApiError::server(format!("request task failed: {e}")))?
 }
 
+/// Most bytes of events a streaming response may have waiting for a client
+/// that doesn't read them. Past this the client counts as gone and the
+/// generation is cancelled, instead of the server buffering a whole
+/// generation (with logprobs, gigabytes) for a stalled reader.
+const MAX_PENDING_BYTES: usize = 32 << 20;
+
 /// The sending half of a streaming (SSE) response.
 pub struct SseSink {
-    tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
+    tx: mpsc::UnboundedSender<(Event, usize)>,
+    /// Bytes sent but not yet taken by the response body.
+    pending: Arc<AtomicUsize>,
 }
 
 /// What [`SseSink::next`] saw first.
@@ -35,19 +44,33 @@ pub enum Recv<T> {
 }
 
 impl SseSink {
+    /// Queue `ev` (`n` bytes); false once the client is gone or has fallen
+    /// [`MAX_PENDING_BYTES`] behind.
+    fn push(&self, ev: Event, n: usize) -> bool {
+        if self.pending.fetch_add(n, Ordering::Relaxed) + n > MAX_PENDING_BYTES {
+            self.pending.fetch_sub(n, Ordering::Relaxed);
+            return false;
+        }
+        self.tx.send((ev, n)).is_ok()
+    }
+
     /// A `data:` event with `v`; false once the client is gone.
     pub fn data(&self, v: &Value) -> bool {
-        self.tx.send(Ok(Event::default().data(v.to_string()))).is_ok()
+        let s = v.to_string();
+        let n = s.len();
+        self.push(Event::default().data(s), n)
     }
 
     /// A named event (`event: kind`) with `v`.
     pub fn event(&self, kind: &str, v: &Value) -> bool {
-        self.tx.send(Ok(Event::default().event(kind).data(v.to_string()))).is_ok()
+        let s = v.to_string();
+        let n = s.len() + kind.len();
+        self.push(Event::default().event(kind).data(s), n)
     }
 
     /// The `[DONE]` terminator of Chat Completions and Completions streams.
     pub fn done(&self) {
-        let _ = self.tx.send(Ok(Event::default().data("[DONE]")));
+        let _ = self.tx.send((Event::default().data("[DONE]"), 0));
     }
 
     /// An error event in OpenAI's shape, then `[DONE]`.
@@ -87,8 +110,13 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(f(SseSink { tx }));
-    Sse::new(UnboundedReceiverStream::new(rx)).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))).into_response()
+    let pending = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(f(SseSink { tx, pending: pending.clone() }));
+    let events = UnboundedReceiverStream::new(rx).map(move |(ev, n): (Event, usize)| {
+        pending.fetch_sub(n, Ordering::Relaxed);
+        Ok::<_, Infallible>(ev)
+    });
+    Sse::new(events).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))).into_response()
 }
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -141,4 +169,23 @@ pub fn hex_id(prefix: &str, len: usize) -> String {
     }
     s.truncate(prefix.len() + len);
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stalled_client_is_cut_off() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = SseSink { tx, pending: Arc::new(AtomicUsize::new(0)) };
+        let big = Value::String("x".repeat(1 << 20));
+        let sent = (0..64).take_while(|_| sink.data(&big)).count();
+        assert!((30..=32).contains(&sent), "{sent}");
+        // Once the body takes events, there is room again.
+        while let Ok((_, n)) = rx.try_recv() {
+            sink.pending.fetch_sub(n, Ordering::Relaxed);
+        }
+        assert!(sink.data(&big));
+    }
 }

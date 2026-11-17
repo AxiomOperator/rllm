@@ -80,6 +80,12 @@ impl Linear {
         Ok(Self { w, b, rows, cols })
     }
 
+    /// Fail unless this maps `cols` inputs to `rows` outputs.
+    fn expect(&self, name: &str, rows: usize, cols: usize) -> Result<()> {
+        ensure!(self.rows == rows && self.cols == cols, "{name}: {} x {} weight, expected {rows} x {cols}", self.rows, self.cols);
+        Ok(())
+    }
+
     /// `x [m, cols]` → `[m, rows]`.
     fn apply(&self, x: &[f32]) -> Vec<f32> {
         let (n, k) = (self.rows, self.cols);
@@ -140,8 +146,13 @@ struct Attn {
 }
 
 impl Attn {
-    fn load(g: &Gguf, prefix: &str, il: usize) -> Result<Self> {
-        let l = |s: &str| Linear::load(g, &format!("dec.blk.{il}.{prefix}{s}"), true);
+    fn load(g: &Gguf, prefix: &str, il: usize, width: usize) -> Result<Self> {
+        let l = |s: &str| -> Result<Linear> {
+            let name = format!("dec.blk.{il}.{prefix}{s}");
+            let lin = Linear::load(g, &name, true)?;
+            lin.expect(&name, width, width)?;
+            Ok(lin)
+        };
         Ok(Self { q: l("q")?, k: l("k")?, v: l("v")?, o: l("o")? })
     }
 
@@ -281,25 +292,35 @@ impl ClefHead {
         let eps = g.get_f64("clef.attention.layer_norm_epsilon").unwrap_or(1e-5) as f32;
         ensure!(n_routing + n_joint <= 64 && n_heads > 0, "invalid decision head size");
 
-        let proj = |s: &str| Linear::load(g, &format!("decision.proj_{s}"), false);
-        let proj_memory = proj("memory")?;
+        let proj_memory = Linear::load(g, "decision.proj_memory", false)?;
         let width = proj_memory.rows;
         ensure!(proj_memory.cols == hidden, "decision.proj_memory: {} inputs for hidden size {hidden}", proj_memory.cols);
-        ensure!(width % n_heads == 0, "decision head width {width} is not a multiple of {n_heads} heads");
+        ensure!(width > 0 && width % n_heads == 0, "decision head width {width} is not a multiple of {n_heads} heads");
+        // Every other projection also maps a hidden state to the head's width.
+        let proj = |s: &str| -> Result<Linear> {
+            let name = format!("decision.proj_{s}");
+            let lin = Linear::load(g, &name, false)?;
+            lin.expect(&name, width, hidden)?;
+            Ok(lin)
+        };
         let norm = |s: &str, w: usize| Norm::load(g, s, w);
 
         let mut blocks = Vec::new();
         for il in 0..n_routing + n_joint {
             let p = |s: &str| format!("dec.blk.{il}.{s}");
             let routing = il < n_routing;
+            let ffn_up = Linear::load(g, &p("ffn_up"), true)?;
+            ensure!(ffn_up.cols == width && ffn_up.rows > 0, "{}: {} inputs, expected {width}", p("ffn_up"), ffn_up.cols);
+            let ffn_down = Linear::load(g, &p("ffn_down"), true)?;
+            ffn_down.expect(&p("ffn_down"), width, ffn_up.rows)?;
             blocks.push(Block {
-                self_attn: if routing { None } else { Some((norm(&p("attn_norm"), width)?, Attn::load(g, "attn_", il)?)) },
+                self_attn: if routing { None } else { Some((norm(&p("attn_norm"), width)?, Attn::load(g, "attn_", il, width)?)) },
                 cross_norm_kv: if routing { Some(norm(&p("cross_attn_norm_kv"), width)?) } else { None },
                 cross_norm: norm(&p("cross_attn_norm"), width)?,
-                cross_attn: Attn::load(g, "cross_attn_", il)?,
+                cross_attn: Attn::load(g, "cross_attn_", il, width)?,
                 ffn_norm: norm(&p("ffn_norm"), width)?,
-                ffn_up: Linear::load(g, &p("ffn_up"), true)?,
-                ffn_down: Linear::load(g, &p("ffn_down"), true)?,
+                ffn_up,
+                ffn_down,
             });
         }
         let scales = read_vector(g, "decision.scales")?;

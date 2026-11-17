@@ -1,5 +1,6 @@
 //! Every CUDA op against the CPU reference backend on random inputs.
 
+use rllm_cuda::set_gdn_chunked_for_tests;
 use rllm_cuda::CudaBackend as GpuBackend;
 
 const VENDOR: &str = "CUDA";

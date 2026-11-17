@@ -8,7 +8,6 @@ use rllm_core::{Backend, KvType};
 use rllm_cpu::CpuBackend;
 use rllm_cuda::CudaBackend;
 use rllm_hip::HipBackend;
-use rllm_gguf::Gguf;
 use rllm_model::{AnyModel, Generator, Model, Sampler, SamplerConfig};
 use rllm_tokenizer::{ChatMessage, Tokenizer};
 
@@ -154,6 +153,25 @@ enum Cmd {
         /// Don't log a line per finished generation.
         #[arg(long, short)]
         quiet: bool,
+        /// Models with recurrent layers (Qwen3.5/3.6): prompt checkpoints of
+        /// their state kept for prefix reuse (default: --parallel; 0 turns
+        /// their prefix cache off). Each costs one sequence's state.
+        #[arg(long)]
+        state_checkpoints: Option<usize>,
+        /// Safetensors checkpoints: quantize the weight matrices as they load
+        /// (`q8_0`: about half the memory of BF16; `q4_k_m`: llama.cpp's
+        /// Q4_K_M mix, about 30%; also `RLLM_QUANTIZE`).
+        #[arg(long)]
+        quantize: Option<String>,
+        /// Batch-invariant mode: decode steps per prompt chunk while new
+        /// prompts and decoding requests both wait (1: alternate; more keeps
+        /// decoding faster while prompts arrive, at their first token's cost).
+        #[arg(long, default_value_t = 1)]
+        decode_per_prefill: usize,
+        /// End a generation still running this many seconds after it was
+        /// submitted (finish reason `length`); 0: no limit.
+        #[arg(long, default_value_t = 0)]
+        request_timeout: u64,
     },
     /// Recommend `rllm serve` settings for this machine and model: GPU and
     /// system memory, KV cache size and type, parallel requests, draft
@@ -467,7 +485,15 @@ fn real_main() -> Result<()> {
             cors_origins,
             store_file,
             quiet,
+            state_checkpoints,
+            decode_per_prefill,
+            quantize,
+            request_timeout,
         } => {
+            let quantize = match quantize.as_deref() {
+                None | Some("none") => None,
+                Some(q) => Some(rllm_safetensors::parse_quantize(q).map_err(|e| anyhow::anyhow!("--quantize {e}"))?),
+            };
             let cfg = rllm_server::ServeConfig {
                 model,
                 model_name,
@@ -492,6 +518,10 @@ fn real_main() -> Result<()> {
                 max_queue,
                 store_file,
                 log: !quiet,
+                request_timeout_secs: request_timeout,
+                state_checkpoints,
+                decode_per_prefill,
+                quantize,
             };
             match Device::parse(&device)? {
                 Device::Cpu => rllm_server::serve(cfg, || Ok(CpuBackend::new())),
@@ -515,7 +545,7 @@ fn real_main() -> Result<()> {
 }
 
 fn inspect(path: &PathBuf, list_tensors: bool) -> Result<()> {
-    let g = Gguf::open(path)?;
+    let g = rllm_safetensors::open_model(path)?;
     println!("GGUF v{}, {} metadata keys, {} tensors", g.version, g.metadata.len(), g.tensors.len());
     for (k, v) in &g.metadata {
         println!("  {k} = {}", v.summary());
@@ -536,7 +566,7 @@ fn inspect(path: &PathBuf, list_tensors: bool) -> Result<()> {
 }
 
 fn tokenize(path: &PathBuf, text: &str) -> Result<()> {
-    let g = Gguf::open(path)?;
+    let g = rllm_safetensors::open_model(path)?;
     let tok = Tokenizer::from_gguf(&g)?;
     let ids = tok.encode(text)?;
     for id in &ids {
@@ -548,7 +578,7 @@ fn tokenize(path: &PathBuf, text: &str) -> Result<()> {
 
 fn run<B: Backend>(backend: &B, a: RunArgs) -> Result<()> {
     let t0 = Instant::now();
-    let g = Gguf::open(&a.model)?;
+    let g = rllm_safetensors::open_model(&a.model)?;
     let tok = Tokenizer::from_gguf(&g)?;
 
     let text = if a.raw {
@@ -580,7 +610,7 @@ fn run<B: Backend>(backend: &B, a: RunArgs) -> Result<()> {
     );
 
     let mut generator = Generator::with_kv(backend, &model, a.ctx, a.block_size, a.kv_type)?;
-    let mut sampler = Sampler::new(SamplerConfig { temperature: a.temperature, top_k: a.top_k, top_p: a.top_p, seed: a.seed });
+    let mut sampler = Sampler::new(SamplerConfig { temperature: a.temperature, top_k: a.top_k, top_p: a.top_p, min_p: 0.0, seed: a.seed });
     let mut stream = tok.stream(false);
     let mut out = std::io::stdout().lock();
 
@@ -621,7 +651,7 @@ fn run<B: Backend>(backend: &B, a: RunArgs) -> Result<()> {
 }
 
 fn compare<B: Backend>(gpu: &B, path: &PathBuf, prompt: &str, steps: usize, block_size: usize, prefill_chunk: usize, kv: KvType) -> Result<()> {
-    let g = Gguf::open(path)?;
+    let g = rllm_safetensors::open_model(path)?;
     let tok = Tokenizer::from_gguf(&g)?;
     let cpu = CpuBackend::new();
     eprintln!("[rllm] comparing {} against {}", gpu.name(), cpu.name());
@@ -713,7 +743,7 @@ fn compare_ref<B: Backend>(
     prefill_chunk: usize,
 ) -> Result<()> {
     let r = read_ref(ref_path)?;
-    let g = Gguf::open(model_path)?;
+    let g = rllm_safetensors::open_model(model_path)?;
     let model = AnyModel::load(backend, &g)?;
     anyhow::ensure!(model.vocab_size() == r.n_vocab, "vocab mismatch: model {} vs reference {}", model.vocab_size(), r.n_vocab);
     eprintln!("[rllm] {} on {} vs llama.cpp: {} prompt + {} generated tokens", model.summary(), backend.name(), r.n_prompt, r.tokens.len() - r.n_prompt);
@@ -773,7 +803,7 @@ fn perplexity<B: Backend>(
     max_chunks: Option<usize>,
     kv_type: KvType,
 ) -> Result<()> {
-    let g = Gguf::open(model_path)?;
+    let g = rllm_safetensors::open_model(model_path)?;
     let tok = Tokenizer::from_gguf(&g)?;
     let model = AnyModel::load(backend, &g)?;
     let text = std::fs::read_to_string(file)?;
@@ -847,7 +877,7 @@ fn bench<B: Backend>(
     kv_type: KvType,
     batch: usize,
 ) -> Result<()> {
-    let g = Gguf::open(model_path)?;
+    let g = rllm_safetensors::open_model(model_path)?;
     let model = AnyModel::load(backend, &g)?;
     let name = g.get_str("general.name").unwrap_or("model").to_string();
     eprintln!("[rllm] {name} on {}: {}", backend.name(), model.summary());
@@ -920,7 +950,7 @@ fn bench<B: Backend>(
             }
             let mut next: Vec<[u32; 1]> = (0..batch).map(|_| [next_tok()]).collect();
             // Greedy, sampled on the device as the server does.
-            let greedy = rllm_model::RowSample { temperature: 0.0, top_k: 0, top_p: 1.0, seed: 0, counter: 0, adjust: Vec::new() };
+            let greedy = rllm_model::RowSample { temperature: 0.0, top_k: 0, top_p: 1.0, min_p: 0.0, seed: 0, counter: 0, adjust: Vec::new() };
             let sample = vec![Some(greedy); batch];
             backend.synchronize()?;
             let t0 = Instant::now();

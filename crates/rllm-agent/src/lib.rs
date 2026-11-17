@@ -36,6 +36,9 @@ use serde_json::{Value, json};
 use jobs::{JobCtx, Jobs};
 
 const DASHBOARD: &str = include_str!("dashboard.html");
+/// The dashboard's handlers are inline, but nothing may load or send data
+/// anywhere but this agent, and it can't be framed.
+const DASHBOARD_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 const STALE_SH: &str = include_str!("../../../tools/stale.sh");
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -461,19 +464,41 @@ async fn fleet(State(st): S) -> Json<Value> {
     Json(json!({"self": st.name, "peers": st.peers(), "suites": tests::SUITES}))
 }
 
-/// Forward `/fleet/<name>/<rest>` to that peer's agent.
+/// Percent-encode a decoded path for a request line: everything but
+/// unreserved characters and `/`.
+fn encode_path(p: &str) -> String {
+    let mut out = String::with_capacity(p.len());
+    for b in p.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Forward `/fleet/<name>/<rest>` to that peer's agent, streaming the
+/// answer back (model files are tens of GB).
 async fn proxy(State(st): S, UrlPath((name, rest)): UrlPath<(String, String)>, req: Request) -> R<Response> {
     let peer = st.peer(&name)?;
     let method = req.method().as_str().to_string();
     let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
     let body = axum::body::to_bytes(req.into_body(), 1 << 20).await?;
     let timeout = if rest.ends_with("/sha256") { 900 } else { 60 };
-    let r = http::request(&peer.addr, &method, &format!("/{rest}{query}"), Some(&st.cfg.token), (!body.is_empty()).then_some(&body[..]), Duration::from_secs(timeout))
+    let path = format!("/{}{query}", encode_path(&rest));
+    let r = http::stream(&peer.addr, &method, &path, Some(&st.cfg.token), (!body.is_empty()).then_some(&body[..]), Duration::from_secs(timeout))
         .await
         .map_err(|e| anyhow::anyhow!("{name}: {e:#}"))?;
-    let status = StatusCode::from_u16(r.status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let ct = if r.content_type.is_empty() { "application/json".to_string() } else { r.content_type };
-    Ok((status, [(header::CONTENT_TYPE, ct)], r.body).into_response())
+    let mut resp = Response::new(r.body);
+    *resp.status_mut() = StatusCode::from_u16(r.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    for (k, v) in r.headers {
+        if let (Ok(k), Ok(v)) = (header::HeaderName::try_from(k), header::HeaderValue::try_from(v)) {
+            resp.headers_mut().insert(k, v);
+        }
+    }
+    resp.headers_mut().entry(header::CONTENT_TYPE).or_insert(header::HeaderValue::from_static("application/json"));
+    Ok(resp)
 }
 
 /// POST to a peer's agent and wait for the job it starts, mirroring it.
@@ -491,13 +516,12 @@ async fn remote_job(ctx: &JobCtx, peer: &Peer, token: &str, path: &str, body: Va
         tokio::time::sleep(Duration::from_secs(3)).await;
         let j = match http::get_json(&peer.addr, &format!("/api/jobs/{id}"), token).await {
             Ok(j) => j,
-            // An agent restarting onto a new binary drops its jobs: a
-            // deploy that got that far has installed.
+            // An agent restarting onto a new binary drops its jobs; the
+            // caller checks what it is running now (see `confirm_deploy`).
             Err(e) if path == "/api/deploy" => {
                 guard.live = false;
-                ctx.log(format!("{}: agent restarting ({e:#})", peer.name));
-                tokio::time::sleep(Duration::from_secs(8)).await;
-                return Ok("installed; agent restarted".into());
+                ctx.log(format!("{}: lost the deploy job ({e:#}); checking its binaries", peer.name));
+                return Ok(DEPLOY_UNCONFIRMED.into());
             }
             Err(e) => return Err(e),
         };
@@ -525,6 +549,32 @@ async fn remote_job(ctx: &JobCtx, peer: &Peer, token: &str, path: &str, body: Va
     }
 }
 
+/// What [`remote_job`] returns when a deploy's job vanished (the agent
+/// restarted, or the connection failed): not yet known to have installed.
+const DEPLOY_UNCONFIRMED: &str = "\0unconfirmed";
+
+/// SHA-256 of each deployable binary a peer has.
+async fn bin_hashes(addr: &str, token: &str) -> Result<std::collections::BTreeMap<String, String>> {
+    let v = http::get_json(addr, "/api/bin/manifest", token).await?;
+    Ok(v.as_array().into_iter().flatten().filter_map(|e| Some((e["name"].as_str()?.to_string(), e["sha256"].as_str()?.to_string()))).collect())
+}
+
+/// After a deploy's job vanished: wait for the target's agent to answer
+/// again (up to 2 minutes) and check it now has the source's binaries.
+async fn confirm_deploy(ctx: &JobCtx, target: &Peer, source: &Peer, token: &str) -> Result<String> {
+    let want = bin_hashes(&source.addr, token).await.context("reading the source's manifest")?;
+    let t0 = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        match bin_hashes(&target.addr, token).await {
+            Ok(have) if want.iter().all(|(n, h)| have.get(n) == Some(h)) => return Ok("installed; agent restarted (binaries verified)".into()),
+            Ok(_) => bail!("{}: its binaries don't match {}'s after the deploy", target.name, source.name),
+            Err(e) if t0.elapsed() > Duration::from_secs(120) => bail!("{}: not answering after the deploy: {e:#}", target.name),
+            Err(_) => ctx.log(format!("{}: waiting for its agent", target.name)),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct FleetDeploy {
     source: String,
@@ -533,7 +583,7 @@ struct FleetDeploy {
 
 /// Rolling deploy: one machine at a time, stopping at the first failure.
 async fn fleet_deploy(State(st): S, Json(r): Json<FleetDeploy>) -> R<Json<Value>> {
-    st.peer(&r.source)?;
+    let source = st.peer(&r.source)?;
     let targets: Vec<Peer> = r.targets.iter().filter(|t| **t != r.source).map(|t| st.peer(t)).collect::<Result<_>>()?;
     check!(!targets.is_empty(), "no targets");
     let token = st.cfg.token.clone();
@@ -542,7 +592,11 @@ async fn fleet_deploy(State(st): S, Json(r): Json<FleetDeploy>) -> R<Json<Value>
         let mut done = Vec::new();
         for (i, t) in targets.iter().enumerate() {
             ctx.log(format!("== {} ({}/{})", t.name, i + 1, targets.len()));
-            match remote_job(&ctx, t, &token, "/api/deploy", json!({"source": r.source}), None).await {
+            let res = match remote_job(&ctx, t, &token, "/api/deploy", json!({"source": r.source}), None).await {
+                Ok(s) if s == DEPLOY_UNCONFIRMED => confirm_deploy(&ctx, t, &source, &token).await,
+                other => other,
+            };
+            match res {
                 Ok(s) => done.push(format!("{}: {s}", t.name)),
                 Err(e) => bail!("stopped at {}: {e:#} (done: {})", t.name, if done.is_empty() { "none".into() } else { done.join("; ") }),
             }
@@ -690,7 +744,7 @@ fn router(st: Arc<AppState>) -> Router {
         .layer(middleware::from_fn_with_state(st.clone(), auth));
     let fleet = Router::new().route("/{name}/{*rest}", any(proxy)).layer(middleware::from_fn_with_state(st.clone(), auth));
     Router::new()
-        .route("/", get(|| async { Html(DASHBOARD) }))
+        .route("/", get(|| async { ([(header::CONTENT_SECURITY_POLICY, DASHBOARD_CSP), (header::X_FRAME_OPTIONS, "DENY")], Html(DASHBOARD)) }))
         .route("/healthz", get(|| async { "ok" }))
         .nest("/api", api)
         .nest("/fleet", fleet)
@@ -803,4 +857,15 @@ pub fn install(config: &Path) -> Result<()> {
         println!("note: user {user} doesn't linger, so the agent stops at logout and won't start at boot: sudo loginctl enable-linger {user}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_paths_are_encoded() {
+        assert_eq!(encode_path("api/files/models/a b.gguf"), "api/files/models/a%20b.gguf");
+        assert_eq!(encode_path("api/x\r\nX-Evil: 1"), "api/x%0D%0AX-Evil%3A%201");
+    }
 }

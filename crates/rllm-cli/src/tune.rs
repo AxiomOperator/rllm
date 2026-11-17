@@ -236,16 +236,18 @@ fn plan(m: &ModelProfile, draft: Option<&Draft>, mach: &Machine, want_ctx: Optio
     let free = gpu.usable_bytes(mach.ram_available);
     // Hybrid models (Qwen3.5) keep a fixed-size recurrent state per sequence
     // (the batch, an embedding job and a spare); with an MTP head, also
-    // 6 snapshots of it shared by a step's verifications (MTP drafting).
+    // 6 snapshots of it shared by a step's verifications (MTP drafting),
+    // and `parallel` prefix-cache checkpoints (serve's default).
     // No draft model or prompt lookup.
     let recurrent = m.state_bytes_per_seq > 0;
-    let state_bytes = m.state_bytes_per_seq * (p.parallel + 2 + if m.mtp { 6 } else { 0 });
+    let state_bytes = m.state_bytes_per_seq * (p.parallel + 2 + if m.mtp { 6 } else { 0 } + if recurrent { p.parallel } else { 0 });
     if recurrent {
         p.prompt_lookup = false;
         p.reasons.push(format!(
-            "Recurrent state: {:.2} GiB for {} sequences{}; no draft model or prompt lookup.",
+            "Recurrent state: {:.2} GiB for {} sequences and {} prefix-cache checkpoints{}; no draft model or prompt lookup.",
             state_bytes as f64 / GIB,
             p.parallel + 2,
+            p.parallel,
             if m.mtp { ", with snapshots for MTP drafting (the model's own draft head, on by default; --no-mtp turns it off)" } else { "" }
         ));
     }
@@ -456,7 +458,7 @@ fn find_draft(model: &Path, g: &Gguf, profile: &ModelProfile, explicit: Option<&
         }
     };
     candidates.into_iter().find_map(|path| {
-        let d = Gguf::open(&path).ok()?;
+        let d = rllm_safetensors::open_model(&path).ok()?;
         let dp = ModelProfile::read(&d).ok()?;
         (dp.vocab == profile.vocab && (explicit.is_some() || dp.weight_bytes * 4 <= profile.weight_bytes) && same_vocab(&d))
             .then_some(Draft { path, profile: dp })
@@ -475,6 +477,8 @@ struct Measured {
     depth: usize,
     decode_one_tok_s: f64,
     decode_batch_tok_s: f64,
+    /// Requests decoded together for `decode_batch_tok_s`.
+    batch: usize,
     /// Draft step time / target step time (one sequence, short context).
     draft_ratio: Option<f64>,
 }
@@ -530,7 +534,7 @@ fn measure_on(gpu: &Gpu, model_path: &Path, p: &Plan) -> Result<Measured> {
 /// alone; the draft model's decode step is timed against the target's.
 fn measure<B: MemInfo>(b: &B, model_path: &Path, p: &Plan) -> Result<Measured> {
     let (free0, _) = b.mem_info()?;
-    let g = Gguf::open(model_path)?;
+    let g = rllm_safetensors::open_model(model_path)?;
     let model = AnyModel::load(b, &g)?;
     let (free1, _) = b.mem_info()?;
     let dg = p.draft.as_ref().map(Gguf::open).transpose()?;
@@ -552,12 +556,14 @@ fn measure<B: MemInfo>(b: &B, model_path: &Path, p: &Plan) -> Result<Measured> {
         Ok(())
     };
 
-    // One long request, then 7 short ones: the pool's worst case is a full
-    // context plus the others' prompts.
+    // One long request, then short ones up to `--parallel` (the server
+    // never runs more at once, and recurrent models have state for no
+    // more): the pool's worst case is a full context plus the others' prompts.
+    let n_seqs = p.parallel.clamp(1, MAX_PARALLEL);
     let short = 128;
-    let depth = p.ctx.min(p.kv_tokens.saturating_sub(MAX_PARALLEL * (short + 64))).saturating_sub(64).max(short);
+    let depth = p.ctx.min(p.kv_tokens.saturating_sub(n_seqs * (short + 64))).saturating_sub(64).max(short);
     let long = tokens(depth, vocab, 1);
-    let mut seqs: Vec<SeqKv> = (0..MAX_PARALLEL).map(|_| SeqKv::default()).collect();
+    let mut seqs: Vec<SeqKv> = (0..n_seqs).map(|_| SeqKv::default()).collect();
     let t = Instant::now();
     for part in long.chunks(p.prefill_chunk) {
         pool.step(&mut [StepItem { seq: &mut seqs[0], tokens: part, want: Want::Last }], false)?;
@@ -569,7 +575,7 @@ fn measure<B: MemInfo>(b: &B, model_path: &Path, p: &Plan) -> Result<Measured> {
     }
     // Decode: all sequences together, then the long one alone.
     let steps = 24;
-    let next: Vec<[u32; 1]> = (0..MAX_PARALLEL).map(|i| [i as u32 + 7]).collect();
+    let next: Vec<[u32; 1]> = (0..n_seqs).map(|i| [i as u32 + 7]).collect();
     let timed = |seqs: &mut [SeqKv], pool: &mut KvPool<_, _>| -> Result<f64> {
         let mut t0 = Instant::now();
         for step in 0..steps + 4 {
@@ -586,9 +592,10 @@ fn measure<B: MemInfo>(b: &B, model_path: &Path, p: &Plan) -> Result<Measured> {
     let decode_one_tok_s = timed(&mut seqs[..1], &mut pool)?;
     // Draft vs target, one short sequence each.
     let draft_ratio = match (&mut dpool, draft.as_ref()) {
-        (Some(dp), Some(_)) => {
+        (Some(dp), Some(d)) if n_seqs > 1 => {
+            // The draft's own vocabulary (it may be smaller than the target's).
             let mut ds = [SeqKv::default()];
-            dp.step(&mut [StepItem { seq: &mut ds[0], tokens: &tokens(short, vocab, 9), want: Want::Last }], false)?;
+            dp.step(&mut [StepItem { seq: &mut ds[0], tokens: &tokens(short, d.vocab_size(), 9), want: Want::Last }], false)?;
             let d_tok_s = timed(&mut ds, dp)?;
             let t_tok_s = timed(&mut seqs[1..2], &mut pool)?;
             note(b)?;
@@ -605,6 +612,7 @@ fn measure<B: MemInfo>(b: &B, model_path: &Path, p: &Plan) -> Result<Measured> {
         depth,
         decode_one_tok_s,
         decode_batch_tok_s,
+        batch: n_seqs,
         draft_ratio,
     })
 }
@@ -651,7 +659,7 @@ pub fn tune(a: TuneArgs) -> Result<()> {
     if let Some(n) = a.parallel {
         crate::check_arg("parallel", n, 1, 64)?;
     }
-    let g = Gguf::open(&a.model).with_context(|| format!("open {}", a.model.display()))?;
+    let g = rllm_safetensors::open_model(&a.model).with_context(|| format!("open {}", a.model.display()))?;
     let profile = ModelProfile::read(&g)?;
     let mach = read_machine(a.device.as_deref())?;
     let draft = if a.no_draft { None } else { find_draft(&a.model, &g, &profile, a.draft.as_deref()) };
@@ -776,7 +784,7 @@ pub fn tune(a: TuneArgs) -> Result<()> {
         println!("Measured (at the recommended settings)");
         println!("  Prefill at {} tokens of context: {:.0} tok/s", m.depth, m.prefill_tok_s);
         println!("  Decode, one request at that depth: {:.1} tok/s", m.decode_one_tok_s);
-        println!("  Decode, {MAX_PARALLEL} requests together: {:.0} tok/s total", m.decode_batch_tok_s);
+        println!("  Decode, {} requests together: {:.0} tok/s total", m.batch, m.decode_batch_tok_s);
         if let Some(r) = m.draft_ratio {
             println!("  Draft step / model step: {:.0}%", r * 100.0);
         }

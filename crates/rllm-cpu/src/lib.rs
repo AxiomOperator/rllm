@@ -461,7 +461,7 @@ impl Backend for CpuBackend {
         let n = *runs.starts.last().unwrap_or(&0) as usize;
         let keep = kernel - 1;
         let n_slots = state.len() / (channels * keep);
-        runs.check(n, n_slots)?;
+        runs.check(n, n_slots, snaps.as_ref().map_or(usize::MAX, |s| s.1))?;
         check_len("conv1d_silu x", x.len(), n * channels)?;
         check_len("conv1d_silu out", out.len(), n * channels)?;
         // Per sequence, then per channel: the channel's window slides over its tokens.
@@ -543,7 +543,7 @@ impl Backend for CpuBackend {
         let n = *runs.starts.last().unwrap_or(&0) as usize;
         let width = shape.qkv_width();
         let n_slots = state.len() / shape.state_len();
-        runs.check(n, n_slots)?;
+        runs.check(n, n_slots, snaps.as_ref().map_or(usize::MAX, |s| s.1))?;
         check_len("gated_delta_net qkv", qkv.len(), n * width)?;
         check_len("gated_delta_net alpha", alpha.len().min(beta.len()), n * hv)?;
         check_len("gated_delta_net out", out.len(), n * hv * d)?;
@@ -615,6 +615,29 @@ impl Backend for CpuBackend {
         check_len("copy_span src", src.len(), src_off + len)?;
         check_len("copy_span dst", dst.len(), dst_off + len)?;
         dst[dst_off..dst_off + len].copy_from_slice(&src[src_off..src_off + len]);
+        Ok(())
+    }
+
+    fn copy_layers(&self, src: Option<&[Vec<f32>]>, dst: &mut [Vec<f32>], src_off: usize, dst_off: usize, len: usize) -> Result<()> {
+        match src {
+            Some(src) => {
+                if src.len() != dst.len() {
+                    return Err(Error::Shape(format!("copy_layers: {} sources for {} destinations", src.len(), dst.len())));
+                }
+                for (s, d) in src.iter().zip(dst.iter_mut()) {
+                    self.copy_span(s, src_off, d, dst_off, len)?;
+                }
+            }
+            None => {
+                if src_off.max(dst_off) < src_off.min(dst_off) + len {
+                    return Err(Error::Shape("copy_layers: overlapping spans".into()));
+                }
+                for d in dst.iter_mut() {
+                    check_len("copy_layers", d.len(), src_off.max(dst_off) + len)?;
+                    d.copy_within(src_off..src_off + len, dst_off);
+                }
+            }
+        }
         Ok(())
     }
 

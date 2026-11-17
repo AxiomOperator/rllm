@@ -50,7 +50,6 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use rllm_core::Backend;
-use rllm_gguf::Gguf;
 use rllm_tokenizer::Tokenizer;
 use tower_http::cors::CorsLayer;
 
@@ -92,6 +91,9 @@ pub struct ServeConfig {
     pub batch_invariant: Option<bool>,
     /// Pinned system memory for the prefix cache's host tier (0: none).
     pub host_cache_bytes: usize,
+    /// Models with recurrent layers: prefix-cache checkpoints of their
+    /// state to keep (`None`: as many as `parallel`; 0: no prefix cache).
+    pub state_checkpoints: Option<usize>,
     /// Sample on the host from full logits rows (see `EngineConfig::host_sampling`).
     pub host_sampling: bool,
     /// Most queued generations before new ones get 503 (0: no limit).
@@ -100,6 +102,14 @@ pub struct ServeConfig {
     pub store_file: Option<PathBuf>,
     /// Log one line per finished generation.
     pub log: bool,
+    /// Safetensors checkpoints: quantize the weights as they load (Q8_0);
+    /// `None`: as `RLLM_QUANTIZE` says (default: as stored).
+    pub quantize: Option<rllm_core::DType>,
+    /// Batch-invariant mode: decode steps per prompt chunk while both wait.
+    pub decode_per_prefill: usize,
+    /// Seconds a generation may run, from submission, before it is ended
+    /// with finish reason `length` (0: no limit).
+    pub request_timeout_secs: u64,
 }
 
 /// Load the model on a backend made by `make_backend` (called on the engine
@@ -109,14 +119,18 @@ where
     B: Backend + 'static,
     F: FnOnce() -> Result<B> + Send + 'static,
 {
-    let gguf = Arc::new(Gguf::open(&cfg.model).with_context(|| format!("open {}", cfg.model.display()))?);
+    let gguf = Arc::new(match cfg.quantize {
+        Some(q) => rllm_safetensors::open_model_with(&cfg.model, rllm_safetensors::Options { quantize: Some(q) }),
+        None => rllm_safetensors::open_model(&cfg.model),
+    }.with_context(|| format!("open {}", cfg.model.display()))?);
     let tok = Arc::new(Tokenizer::from_gguf(&gguf)?);
     // A decision model (Clef): its head runs on the CPU after the backbone.
     let decision = decision::Decider::load(&gguf)?.map(Arc::new);
     let format = output::Format::detect(tok.chat_template().unwrap_or(""));
     let t0 = Instant::now();
     let vocab = Arc::new(engine::Vocab::build(&tok));
-    let batch_invariant = cfg.batch_invariant.unwrap_or_else(|| rllm_model::is_recurrent(&gguf));
+    let recurrent = rllm_model::is_recurrent(&gguf);
+    let batch_invariant = cfg.batch_invariant.unwrap_or(recurrent);
     let mut parallel = cfg.parallel.max(1);
     if batch_invariant && parallel > engine::INVARIANT_MAX_TOKENS {
         eprintln!("[rllm] --batch-invariant: --parallel {parallel} lowered to {}", engine::INVARIANT_MAX_TOKENS);
@@ -129,13 +143,12 @@ where
     .max(cfg.ctx);
     let metrics = Arc::new(Metrics::default());
     // Models with recurrent layers can't speculate: don't open a draft.
-    let recurrent = rllm_model::is_recurrent(&gguf);
     let draft = match &cfg.draft {
         Some(_) if recurrent => {
             eprintln!("[rllm] --draft not supported for models with recurrent layers (Qwen3.5): ignored");
             None
         }
-        Some(p) => Some(Arc::new(Gguf::open(p).with_context(|| format!("open {}", p.display()))?)),
+        Some(p) => Some(Arc::new(rllm_safetensors::open_model(p).with_context(|| format!("open {}", p.display()))?)),
         None => None,
     };
     let engine_cfg = engine::EngineConfig {
@@ -143,7 +156,10 @@ where
         prefill_chunk: cfg.prefill_chunk,
         parallel,
         kv_tokens,
-        prefix_cache: cfg.prefix_cache && !batch_invariant,
+        // Block-level prefix hits change how a prompt is chunked, so
+        // batch-invariant mode has none; recurrent models' checkpoints sit on
+        // chunk boundaries and keep it.
+        prefix_cache: cfg.prefix_cache && (!batch_invariant || recurrent),
         kv_type: cfg.kv_type,
         draft,
         draft_tokens: cfg.draft_tokens.max(1),
@@ -151,6 +167,9 @@ where
         mtp: cfg.mtp,
         batch_invariant,
         host_cache_bytes: if cfg.prefix_cache && !batch_invariant { cfg.host_cache_bytes } else { 0 },
+        // A decision model only embeds (no prefix cache): no checkpoints.
+        decode_per_prefill: cfg.decode_per_prefill.max(1),
+        state_checkpoints: if decision.is_some() { 0 } else { cfg.state_checkpoints.unwrap_or(parallel) },
         host_sampling: cfg.host_sampling,
         max_queue: cfg.max_queue,
     };
@@ -160,7 +179,9 @@ where
     };
     let (handle, info) = engine::start(make_backend, gguf.clone(), tok.clone(), vocab, engine_cfg, metrics.clone())?;
     let model_id = cfg.model_name.clone().unwrap_or_else(|| {
-        cfg.model.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "rllm".into())
+        // A checkpoint directory's whole name (`Qwen3-0.6B`), a file's stem.
+        let name = if cfg.model.is_dir() { cfg.model.file_name() } else { cfg.model.file_stem() };
+        name.map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "rllm".into())
     });
     let fingerprint = {
         use std::hash::{Hash, Hasher};
@@ -174,7 +195,15 @@ where
         info.backend,
         cfg.ctx,
         cfg.kv_type,
-        if cfg.prefix_cache && !info.recurrent && !batch_invariant { "on" } else { "off" },
+        match (cfg.prefix_cache && (!batch_invariant || info.recurrent), info.recurrent) {
+            (false, _) => "off".to_string(),
+            (true, false) => "on".to_string(),
+            (true, true) => match cfg.state_checkpoints.unwrap_or(parallel) {
+                0 => "off".to_string(),
+                n if decision.is_none() => format!("on ({n} state checkpoints)"),
+                _ => "off".to_string(),
+            },
+        },
         match info.host_blocks {
             Some(n) => format!(" + host tier ({} tokens, {:.1} GiB)", n * engine::BLOCK_SIZE, cfg.host_cache_bytes as f64 / (1u64 << 30) as f64),
             None => String::new(),
@@ -202,6 +231,7 @@ where
         store_file: cfg.store_file.clone(),
         metrics,
         log: cfg.log,
+        request_timeout: (cfg.request_timeout_secs > 0).then(|| std::time::Duration::from_secs(cfg.request_timeout_secs)),
         save_lock: Mutex::new(()),
         decision,
     });
@@ -239,13 +269,41 @@ where
 /// client that opens connections and sends nothing holds them forever.
 const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Accept HTTP/1.1 connections until Ctrl-C, then wait for open requests
-/// (a second Ctrl-C stops waiting). `axum::serve` has no header-read
-/// timeout, hence the hand-written loop.
+/// Resolves on Ctrl-C (SIGINT) or SIGTERM (systemd's and Kubernetes' stop
+/// signal).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// How long open requests may take to finish after a stop signal before
+/// the server exits anyway (systemd's default stop timeout is 90 s).
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Accept HTTP/1.1 connections until Ctrl-C or SIGTERM, then wait for open
+/// requests (up to [`DRAIN_TIMEOUT`]; a second signal stops waiting).
+/// `axum::serve` has no header-read timeout, hence the hand-written loop.
 async fn serve_http(listener: tokio::net::TcpListener, app: Router) {
     use hyper_util::rt::{TokioIo, TokioTimer};
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
-    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+    let mut ctrl_c = std::pin::pin!(shutdown_signal());
     loop {
         let stream = tokio::select! {
             r = listener.accept() => match r {
@@ -271,10 +329,11 @@ async fn serve_http(listener: tokio::net::TcpListener, app: Router) {
         });
     }
     drop(listener);
-    eprintln!("[rllm] shutting down: waiting for open requests (Ctrl-C again to stop now)");
+    eprintln!("[rllm] shutting down: waiting up to {} s for open requests (signal again to stop now)", DRAIN_TIMEOUT.as_secs());
     tokio::select! {
         _ = graceful.shutdown() => {}
-        _ = tokio::signal::ctrl_c() => {}
+        _ = shutdown_signal() => {}
+        _ = tokio::time::sleep(DRAIN_TIMEOUT) => eprintln!("[rllm] open requests still running after {} s; stopping", DRAIN_TIMEOUT.as_secs()),
     }
 }
 
@@ -388,6 +447,12 @@ async fn invalid_url(method: Method, uri: axum::http::Uri) -> Response {
     ApiError::not_found(format!("Invalid URL ({method} {})", uri.path())).into_response()
 }
 
+/// Key comparison in time independent of where the keys differ.
+fn same_key(expected: &str, given: &str) -> bool {
+    let (a, b) = (expected.as_bytes(), given.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// `Authorization: Bearer <key>` when the server has an API key.
 async fn auth(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     let Some(key) = &state.api_key else { return next.run(req).await };
@@ -396,7 +461,7 @@ async fn auth(State(state): State<Arc<AppState>>, req: Request, next: Next) -> R
     }
     let given = req.headers().get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).map(str::trim);
     match given {
-        Some(k) if k == key => next.run(req).await,
+        Some(k) if same_key(key, k) => next.run(req).await,
         Some(k) => {
             let shown = if k.len() > 8 { format!("{}...{}", &k[..4], &k[k.len() - 4..]) } else { "****".into() };
             ApiError::unauthorized(format!("Incorrect API key provided: {shown}."), Some("invalid_api_key")).into_response()

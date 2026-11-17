@@ -181,16 +181,30 @@ impl SeqRuns<'_> {
         self.slots.len()
     }
 
-    /// Check the runs are consistent with `n_tokens` tokens and `n_slots` state slots.
-    pub fn check(&self, n_tokens: usize, n_slots: usize) -> Result<()> {
+    /// Check the runs are consistent with `n_tokens` tokens and `n_slots`
+    /// state slots: every sequence in its own slot (backends update slots in
+    /// parallel, one sequence each) and, with snapshots, each sequence's
+    /// snapshot entries disjoint from the others'. `n_snap` bounds the
+    /// snapshot buffer's entries (ignored without snapshots).
+    pub fn check(&self, n_tokens: usize, n_slots: usize, n_snap: usize) -> Result<()> {
         let n = self.slots.len();
-        let ok = self.starts.len() == n + 1
+        let mut ok = self.starts.len() == n + 1
             && self.fresh.len() == n
             && self.starts.first() == Some(&0)
             && self.starts.last().map(|&e| e as usize) == Some(n_tokens)
             && self.starts.windows(2).all(|w| w[0] < w[1])
             && self.slots.iter().all(|&s| (s as usize) < n_slots)
             && (self.snap.is_empty() || (self.snap.len() == n && self.snap_at.len() == n));
+        if ok {
+            let mut seen = std::collections::HashSet::with_capacity(n);
+            ok = self.slots.iter().all(|&s| seen.insert(s));
+        }
+        if ok && !self.snap.is_empty() {
+            let mut ranges: Vec<(u64, u64)> =
+                self.snap_at.iter().zip(self.snap).filter(|(_, n)| **n > 0).map(|(&a, &n)| (a as u64, a as u64 + n as u64)).collect();
+            ranges.sort_unstable();
+            ok = ranges.windows(2).all(|w| w[0].1 <= w[1].0) && ranges.last().is_none_or(|r| r.1 <= n_snap as u64);
+        }
         if ok { Ok(()) } else { Err(Error::Shape(format!("bad sequence runs for {n_tokens} tokens and {n_slots} state slots"))) }
     }
 }
@@ -244,25 +258,27 @@ pub struct MoeFfn<'a, W> {
 /// ids and weights in descending probability order. Backends share this
 /// definition so their routing agrees exactly.
 pub fn moe_route(logits: &[f32], k: usize, norm: bool, scale: f32, ids: &mut [u32], wts: &mut [f32]) {
-    let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+    // A NaN logit counts as -inf: never chosen, adds nothing to the softmax.
+    let at = |e: usize| if logits[e].is_nan() { f32::NEG_INFINITY } else { logits[e] };
+    let max = (0..logits.len()).fold(f32::NEG_INFINITY, |m, e| m.max(at(e)));
     let mut sum = 0f32;
-    for &v in logits {
-        sum += (v - max).exp();
+    for e in 0..logits.len() {
+        sum += (at(e) - max).exp();
     }
     let mut taken = 0usize;
     for j in 0..k {
         // Selection on the logits (softmax is monotonic); ties to the lower index.
         let mut best = usize::MAX;
-        for (e, &v) in logits.iter().enumerate() {
+        for e in 0..logits.len() {
             if ids[..taken].contains(&(e as u32)) {
                 continue;
             }
-            if best == usize::MAX || v > logits[best] {
+            if best == usize::MAX || at(e) > at(best) {
                 best = e;
             }
         }
         ids[j] = best as u32;
-        wts[j] = (logits[best] - max).exp() / sum;
+        wts[j] = (at(best) - max).exp() / sum;
         taken += 1;
     }
     let total: f32 = wts[..k].iter().sum();
@@ -301,6 +317,12 @@ pub trait Backend: Send + Sync {
     /// loader gives the file's pages back after each upload.
     fn keeps_host_weights(&self) -> bool {
         false
+    }
+
+    /// Whether [`Backend::gated_delta_net`] handles heads of `head_dim`
+    /// (checked when a model loads, not on its first step).
+    fn supports_gdn_head_dim(&self, head_dim: usize) -> bool {
+        head_dim > 0
     }
     fn alloc(&self, len: usize) -> Result<Self::Buffer>;
     fn alloc_kv(&self, layout: KvLayout) -> Result<Self::KvCache>;
@@ -401,6 +423,14 @@ pub trait Backend: Send + Sync {
     /// `gate = silu(gate) * up`, over `len` elements.
     fn silu_mul(&self, gate: &mut Self::Buffer, up: &Self::Buffer, len: usize) -> Result<()>;
 
+    /// `z = silu(z) * rms_norm(x) * w` over `rows` rows of `w.cols` (Gated
+    /// DeltaNet's output gate); one pass on backends that fuse it.
+    fn norm_gate(&self, x: &Self::Buffer, w: &Self::Weight, z: &mut Self::Buffer, rows: usize, width: usize, eps: f32) -> Result<()> {
+        let mut t = self.alloc(rows * width)?;
+        self.rms_norm(x, w, &mut t, rows, eps)?;
+        self.silu_mul(z, &t, rows * width)
+    }
+
     /// `gate = gelu_tanh(gate) * up`, over `len` elements.
     fn gelu_mul(&self, gate: &mut Self::Buffer, up: &Self::Buffer, len: usize) -> Result<()>;
 
@@ -445,6 +475,27 @@ pub trait Backend: Send + Sync {
         kernel: usize,
         snaps: Option<(&mut Self::Buffer, usize)>,
     ) -> Result<()>;
+
+    /// [`Backend::conv1d_silu`] whose output feeds [`Backend::gated_delta_net`]
+    /// with shape `gdn` next: backends may prepare that step's inputs on the
+    /// way (normalized q and k). Same results as the two calls alone.
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_silu_gdn(
+        &self,
+        x: &Self::Buffer,
+        w: &Self::Weight,
+        state: &mut Self::Buffer,
+        runs: &SeqRuns,
+        out: &mut Self::Buffer,
+        channels: usize,
+        kernel: usize,
+        snaps: Option<(&mut Self::Buffer, usize)>,
+        gdn: GdnShape,
+        eps: f32,
+    ) -> Result<()> {
+        let _ = (gdn, eps);
+        self.conv1d_silu(x, w, state, runs, out, channels, kernel, snaps)
+    }
 
     /// Gated DeltaNet recurrence over each sequence's tokens. `qkv` is the
     /// convolved `[tokens, q | k | v]` (`shape.qkv_width()` wide); `alpha` and
@@ -492,12 +543,62 @@ pub trait Backend: Send + Sync {
         out: &mut Self::Buffer,
         m: usize,
     ) -> Result<()>;
+
+    /// [`Backend::moe_ffn`] added to the residual `x` (`[m, width]`) right
+    /// away, then with `norm = (w, out)`: `out = rms_norm(x) * w`, the next
+    /// layer's input (as [`Backend::add_rms_norm`]). One pass for the combine,
+    /// add and norm on backends that fuse it; the same results.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_ffn_add_norm(
+        &self,
+        h: &Self::Buffer,
+        logits: &Self::Buffer,
+        moe: &MoeFfn<Self::Weight>,
+        shared: Option<(&Self::Buffer, &Self::Buffer)>,
+        x: &mut Self::Buffer,
+        norm: Option<(&Self::Weight, &mut Self::Buffer)>,
+        m: usize,
+        width: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let mut o = self.alloc(m * width)?;
+        self.moe_ffn(h, logits, moe, shared, &mut o, m)?;
+        match norm {
+            Some((w, out)) => self.add_rms_norm(x, &o, w, out, m, width, eps),
+            None => self.add(x, &o, m * width),
+        }
+    }
     /// `x[r, :] += sigmoid(g[r]) * y[r, :]` for `rows` rows of `width` (a
     /// gated shared expert).
     fn add_sigmoid_scaled(&self, x: &mut Self::Buffer, y: &Self::Buffer, g: &Self::Buffer, rows: usize, width: usize) -> Result<()>;
     /// `dst[dst_off..dst_off + len] = src[src_off..src_off + len]` (device
     /// copy; restoring recurrent-state snapshots).
     fn copy_span(&self, src: &Self::Buffer, src_off: usize, dst: &mut Self::Buffer, dst_off: usize, len: usize) -> Result<()>;
+
+    /// For every `i`: `dst[i][dst_off..dst_off + len] = src[i][src_off..
+    /// src_off + len]`, or with `src` None within `dst[i]` itself (the spans
+    /// must not overlap). One call for a span of every layer's state:
+    /// recurrent-state checkpoints and MTP rollback.
+    fn copy_layers(&self, src: Option<&[Self::Buffer]>, dst: &mut [Self::Buffer], src_off: usize, dst_off: usize, len: usize) -> Result<()> {
+        if let Some(src) = src {
+            if src.len() != dst.len() {
+                return Err(Error::Shape(format!("copy_layers: {} sources for {} destinations", src.len(), dst.len())));
+            }
+            for (s, d) in src.iter().zip(dst.iter_mut()) {
+                self.copy_span(s, src_off, d, dst_off, len)?;
+            }
+            return Ok(());
+        }
+        if src_off.max(dst_off) < src_off.min(dst_off) + len {
+            return Err(Error::Shape("copy_layers: overlapping spans".into()));
+        }
+        let mut tmp = self.alloc(len.max(1))?;
+        for d in dst.iter_mut() {
+            self.copy_span(d, src_off, &mut tmp, 0, len)?;
+            self.copy_span(&tmp, 0, d, dst_off, len)?;
+        }
+        Ok(())
+    }
 
     /// `out[i, :] = x[first + i * stride, :]` for `i < count`, rows of `width`.
     #[allow(clippy::too_many_arguments)]

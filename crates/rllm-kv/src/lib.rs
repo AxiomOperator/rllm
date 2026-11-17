@@ -18,7 +18,7 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-use std::collections::{HashMap, HashSet};
+
 
 pub struct BlockAllocator {
     block_size: usize,
@@ -56,13 +56,16 @@ impl BlockAllocator {
         self.state_free.len()
     }
 
-    fn alloc_state(&mut self) -> Option<u32> {
+    /// Take a free recurrent-state slot (a sequence's, or a prefix-cache
+    /// checkpoint's).
+    pub fn alloc_state(&mut self) -> Option<u32> {
         let s = self.state_free.pop()?;
         self.state_used[s as usize] = true;
         Some(s)
     }
 
-    fn release_state(&mut self, slot: u32) {
+    /// Give back a slot from [`Self::alloc_state`].
+    pub fn release_state(&mut self, slot: u32) {
         match self.state_used.get_mut(slot as usize) {
             Some(used) if *used => {
                 *used = false;
@@ -249,11 +252,20 @@ impl BlockStore for BlockAllocator {
 /// host blocks instead of dropped, and a later lookup that matches it
 /// further than anything on the device copies it back: a copy over PCIe
 /// instead of recomputing the prefix. Host entries are evicted LRU in turn.
+///
+/// Models with recurrent state (see [`PrefixCache::with_states`]) can't
+/// rebuild it from KV blocks, so their entries are checkpoints instead: the
+/// blocks of a block-aligned prefix plus a state slot holding the recurrent
+/// state after exactly that prefix. Such an entry only matches a request
+/// that starts with all of its tokens.
 #[derive(Default)]
 pub struct PrefixCache {
     entries: Vec<Entry>,
     clock: u64,
     stats: TierStats,
+    /// Most state slots held by checkpoint entries (0: a cache without
+    /// recurrent state).
+    max_states: usize,
 }
 
 struct Entry {
@@ -262,6 +274,9 @@ struct Entry {
     blocks: Vec<u32>,
     used: u64,
     on_host: bool,
+    /// Checkpoint entries: the state slot holding the recurrent state after
+    /// `tokens` (device entries only).
+    state: Option<u32>,
 }
 
 /// Host tier activity since start.
@@ -278,6 +293,88 @@ impl PrefixCache {
     const MAX_ENTRIES: usize = 256;
     /// Upper bound on host entries (lookups scan every entry).
     const MAX_HOST_ENTRIES: usize = 2048;
+
+    /// A cache for a model with recurrent state, holding at most
+    /// `max_states` checkpoints (each takes one state slot; allocate that
+    /// many beyond the sequences' own).
+    pub fn with_states(max_states: usize) -> Self {
+        Self { max_states: max_states.max(1), ..Default::default() }
+    }
+
+    /// Whether entries are recurrent-state checkpoints.
+    pub fn stateful(&self) -> bool {
+        self.max_states > 0
+    }
+
+    /// State slots held by checkpoints.
+    pub fn n_states(&self) -> usize {
+        self.entries.iter().filter(|e| e.state.is_some()).count()
+    }
+
+    /// The longest checkpoint whose tokens all start `tokens`, leaving at
+    /// least one token to compute: (tokens covered, its blocks with a
+    /// reference taken for the caller, the state slot to copy from). The
+    /// entry keeps its slot; copy it before anything can evict the entry.
+    pub fn lookup_state(&mut self, store: &mut impl BlockStore, tokens: &[u32]) -> Option<(usize, Vec<u32>, u32)> {
+        let best = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.state.is_some() && !e.on_host && e.tokens.len() < tokens.len() && tokens.starts_with(&e.tokens))
+            .max_by_key(|(_, e)| e.tokens.len())
+            .map(|(i, _)| i)?;
+        self.touch(best);
+        let e = &self.entries[best];
+        let blocks = e.blocks.clone();
+        for &b in &blocks {
+            store.device().share(b);
+        }
+        Some((e.tokens.len(), blocks, e.state.expect("filtered")))
+    }
+
+    /// Keep a checkpoint of a sequence at `tokens` (block-aligned): share
+    /// its first blocks `blocks` and take a state slot, which `copy` fills
+    /// with the sequence's state (false: it failed, nothing is kept). The
+    /// least recently used checkpoint makes way past `max_states`. Returns
+    /// whether a checkpoint is now cached.
+    pub fn checkpoint<S: BlockStore>(&mut self, store: &mut S, tokens: &[u32], blocks: &[u32], copy: impl FnOnce(&mut S, u32) -> bool) -> bool {
+        let bs = store.device().block_size();
+        if !self.stateful() || tokens.is_empty() || !tokens.len().is_multiple_of(bs) || blocks.len() != tokens.len() / bs {
+            return false;
+        }
+        if let Some(i) = self.entries.iter().position(|e| e.state.is_some() && e.tokens == tokens) {
+            self.touch(i);
+            return true;
+        }
+        // Checkpoints this one extends (the same conversation's earlier
+        // turns) are superseded: drop them, or each conversation would hold
+        // two slots and concurrent conversations would evict each other.
+        let mut i = 0;
+        while i < self.entries.len() {
+            if self.entries[i].state.is_some() && tokens.starts_with(&self.entries[i].tokens) {
+                let e = self.entries.swap_remove(i);
+                Self::release(store, e);
+            } else {
+                i += 1;
+            }
+        }
+        while self.n_states() >= self.max_states || self.len() >= Self::MAX_ENTRIES {
+            if !self.evict(store) {
+                return false;
+            }
+        }
+        let Some(slot) = store.device().alloc_state() else { return false };
+        if !copy(store, slot) {
+            store.device().release_state(slot);
+            return false;
+        }
+        for &b in blocks {
+            store.device().share(b);
+        }
+        self.clock += 1;
+        self.entries.push(Entry { tokens: tokens.to_vec(), blocks: blocks.to_vec(), used: self.clock, on_host: false, state: Some(slot) });
+        true
+    }
 
     /// Entries on the device.
     pub fn len(&self) -> usize {
@@ -316,6 +413,10 @@ impl PrefixCache {
     /// one token to compute (the model needs it for the next logits).
     /// Takes a reference to each returned block. Returns (tokens covered, blocks).
     pub fn lookup(&mut self, store: &mut impl BlockStore, tokens: &[u32]) -> (usize, Vec<u32>) {
+        if self.stateful() {
+            // Blocks alone can't resume a recurrent model: see lookup_state.
+            return (0, Vec::new());
+        }
         let bs = store.device().block_size();
         let limit = tokens.len().saturating_sub(1) / bs;
         let mut best = self.best_matches(tokens, bs, limit);
@@ -345,8 +446,9 @@ impl PrefixCache {
     fn best_matches(&self, tokens: &[u32], bs: usize, limit: usize) -> [Option<(usize, usize)>; 2] {
         let mut best: [Option<(usize, usize)>; 2] = [None, None];
         for (i, e) in self.entries.iter().enumerate() {
-            let common = e.tokens.iter().zip(tokens).take_while(|(a, b)| a == b).count();
-            let n = (common / bs).min(limit).min(e.blocks.len());
+            // Whole blocks at a time (slice equality vectorizes; only full
+            // blocks are shared anyway).
+            let n = e.tokens.chunks_exact(bs).zip(tokens.chunks_exact(bs)).take_while(|(a, b)| a == b).count().min(limit).min(e.blocks.len());
             let b = &mut best[e.on_host as usize];
             if n > 0 && b.is_none_or(|(_, m)| n > m) {
                 *b = Some((i, n));
@@ -393,6 +495,12 @@ impl PrefixCache {
     /// Retire a sequence whose cache holds `tokens` (`seq.len == tokens.len()`).
     /// Its full blocks join the cache; the partial last block is released.
     pub fn insert(&mut self, store: &mut impl BlockStore, tokens: &[u32], mut seq: SeqKv) {
+        if self.stateful() {
+            // Its state is past the last block boundary, so only checkpoints
+            // taken on the way (see `checkpoint`) are reusable.
+            seq.free(store.device());
+            return;
+        }
         // Cached blocks are reused without a recurrent state: give it back.
         if let Some(s) = seq.state.take() {
             store.device().release_state(s);
@@ -424,7 +532,7 @@ impl PrefixCache {
     fn add_device(&mut self, store: &mut impl BlockStore, tokens: Vec<u32>, blocks: Vec<u32>) {
         self.drop_extended(store, &tokens);
         self.clock += 1;
-        self.entries.push(Entry { tokens, blocks, used: self.clock, on_host: false });
+        self.entries.push(Entry { tokens, blocks, used: self.clock, on_host: false, state: None });
     }
 
     /// Drop entries whose tokens are a prefix of `tokens`: redundant once
@@ -442,6 +550,9 @@ impl PrefixCache {
     }
 
     fn release(store: &mut impl BlockStore, e: Entry) {
+        if let Some(s) = e.state {
+            store.device().release_state(s);
+        }
         if e.on_host {
             let host = store.host().expect("host entries need a host tier");
             e.blocks.into_iter().for_each(|b| host.release(b));
@@ -473,6 +584,10 @@ impl PrefixCache {
     /// and the host doesn't already hold it).
     fn offload(&mut self, store: &mut impl BlockStore, e: &Entry) {
         let n = e.blocks.len();
+        if e.state.is_some() {
+            // The host tier holds KV blocks only.
+            return;
+        }
         let Some(capacity) = store.host().map(|h| h.n_blocks()) else { return };
         if n > capacity || self.entries.iter().any(|h| h.on_host && h.tokens.starts_with(&e.tokens)) {
             return;
@@ -500,20 +615,23 @@ impl PrefixCache {
                 j += 1;
             }
         }
-        self.entries.push(Entry { tokens: e.tokens.clone(), blocks: host, used: e.used, on_host: true });
+        self.entries.push(Entry { tokens: e.tokens.clone(), blocks: host, used: e.used, on_host: true, state: None });
     }
 
     /// Device blocks that evicting cache entries would free: those whose
     /// every reference is held by device entries (several entries can share
     /// a block; no sequence holds it).
-    fn freeable(&self, dev: &BlockAllocator) -> HashSet<u32> {
-        let mut refs: HashMap<u32, u32> = HashMap::new();
+    /// Indexed by block id, with their count.
+    fn freeable(&self, dev: &BlockAllocator) -> (Vec<bool>, usize) {
+        let mut refs = vec![0u32; dev.n_blocks()];
         for e in self.entries.iter().filter(|e| !e.on_host) {
             for &b in &e.blocks {
-                *refs.entry(b).or_default() += 1;
+                refs[b as usize] += 1;
             }
         }
-        refs.into_iter().filter(|&(b, n)| dev.refcount(b) == n).map(|(b, _)| b).collect()
+        let free: Vec<bool> = refs.iter().enumerate().map(|(b, &n)| n > 0 && dev.refcount(b as u32) == n).collect();
+        let count = free.iter().filter(|&&f| f).count();
+        (free, count)
     }
 
     /// Evict until `need` device blocks are free (or nothing is left to evict).
@@ -523,18 +641,21 @@ impl PrefixCache {
         }
         // Evicting is pointless (and costs a copy to the host tier) when even
         // all freeable blocks are too few.
-        let freeable = self.freeable(store.device());
-        if store.device().n_free() + freeable.len() < need {
+        let (freeable, n_freeable) = self.freeable(store.device());
+        if store.device().n_free() + n_freeable < need {
             return false;
         }
-        while store.device().n_free() < need {
+        // Past the need by a little (1/64 of the pool, as far as there is
+        // anything to evict), so the next steps don't each come back here.
+        let target = (need + store.device().n_blocks() / 64).min(store.device().n_free() + n_freeable);
+        while store.device().n_free() < target {
             // Only entries holding freeable blocks: the others' blocks stay
             // in use by running sequences. Evicting one entry of several that
             // share a block frees it once the last of them goes. (Evicting
             // keeps the set valid: a block's cache references and refcount
             // drop together.)
-            if !self.evict_where(store, |e, _| e.blocks.iter().any(|b| freeable.contains(b))) {
-                return false;
+            if !self.evict_where(store, |e, _| e.blocks.iter().any(|&b| freeable[b as usize])) {
+                return store.device().n_free() >= need;
             }
         }
         true
@@ -882,5 +1003,85 @@ mod tests {
         held.into_iter().for_each(|b| st.dev.release(b));
         assert!(pc.make_room(&mut st, 6));
         assert_eq!((pc.len(), pc.host_len()), (0, 1));
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    /// A sequence of `n` tokens with its blocks and a state slot.
+    fn seq(a: &mut BlockAllocator, n: usize) -> SeqKv {
+        let mut s = SeqKv::default();
+        s.append(a, n).unwrap();
+        s
+    }
+
+    #[test]
+    fn checkpoints_resume_only_whole_prefixes() {
+        let mut a = BlockAllocator::new(32, 4).with_state_slots(4);
+        let mut c = PrefixCache::with_states(2);
+        let toks: Vec<u32> = (0..10).collect();
+        let s = seq(&mut a, 10);
+        let mut copied = None;
+        assert!(c.checkpoint(&mut a, &toks[..8], &s.block_table[..2], |_, slot| {
+            copied = Some(slot);
+            true
+        }));
+        let ck = copied.unwrap();
+        assert_eq!(a.n_free_state(), 2);
+        // Plain lookups never match a stateful cache.
+        assert_eq!(c.lookup(&mut a, &toks).0, 0);
+        // A request with all 8 tokens and more resumes from the checkpoint.
+        let (n, blocks, from) = c.lookup_state(&mut a, &[&toks[..8], &[99, 98]].concat()).unwrap();
+        assert_eq!((n, from), (8, ck));
+        assert_eq!(blocks, s.block_table[..2]);
+        assert_eq!(a.refcount(blocks[0]), 3);
+        // One that diverges inside it, or has nothing left to compute, doesn't.
+        assert!(c.lookup_state(&mut a, &[0, 1, 2, 3, 4, 5, 6, 0, 9]).is_none());
+        assert!(c.lookup_state(&mut a, &toks[..8]).is_none());
+        // Retiring frees everything of a sequence (no KV-only entries).
+        let mut s = s;
+        s.truncate(&mut a, 10);
+        c.insert(&mut a, &toks, s);
+        assert_eq!(c.len(), 1);
+        assert_eq!(a.n_free_state(), 3);
+        // Clearing returns the checkpoint's slot and block references.
+        blocks.into_iter().for_each(|b| a.release(b));
+        c.clear(&mut a);
+        assert_eq!((a.n_free_state(), a.n_free()), (4, 32));
+    }
+
+    #[test]
+    fn checkpoints_are_capped_lru() {
+        let mut a = BlockAllocator::new(64, 4).with_state_slots(8);
+        let mut c = PrefixCache::with_states(2);
+        let mut seqs = Vec::new();
+        for k in 0..3u32 {
+            let toks: Vec<u32> = (0..8).map(|t| t + 100 * k).collect();
+            let s = seq(&mut a, 8);
+            assert!(c.checkpoint(&mut a, &toks, &s.block_table, |_, _| true));
+            seqs.push((toks, s));
+        }
+        assert_eq!(c.n_states(), 2);
+        // The first was evicted, the later two stay.
+        let probe = |c: &mut PrefixCache, a: &mut BlockAllocator, k: usize| {
+            let q = [&seqs[k].0[..], &[7]].concat();
+            c.lookup_state(a, &q).map(|(_, b, _)| b.into_iter().for_each(|b| a.release(b))).is_some()
+        };
+        assert!(!probe(&mut c, &mut a, 0) && probe(&mut c, &mut a, 1) && probe(&mut c, &mut a, 2));
+        // A checkpoint extending another replaces it (one slot per conversation).
+        let longer = [&seqs[2].0[..], &[1, 2, 3, 4]].concat();
+        let s = seq(&mut a, 12);
+        assert!(c.checkpoint(&mut a, &longer, &s.block_table, |_, _| true));
+        assert_eq!(c.n_states(), 2);
+        assert!(probe(&mut c, &mut a, 1));
+        let q = [&longer[..], &[7]].concat();
+        assert_eq!(c.lookup_state(&mut a, &q).map(|(n, b, _)| { b.into_iter().for_each(|b| a.release(b)); n }), Some(12));
+        assert!(c.lookup_state(&mut a, &[&seqs[2].0[..], &[9]].concat()).is_none());
+        // A failed copy keeps nothing (the LRU entry already made way).
+        let s = seq(&mut a, 8);
+        assert!(!c.checkpoint(&mut a, &[5; 8], &s.block_table, |_, _| false));
+        assert_eq!(c.n_states(), 1);
     }
 }

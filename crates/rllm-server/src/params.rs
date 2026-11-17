@@ -108,6 +108,7 @@ pub fn sampling(m: &serde_json::Map<String, Value>, vocab: usize) -> ApiResult<G
         top_p: opt_f32(m, "top_p", 0.0, 1.0)?.unwrap_or(1.0),
         // Not in the OpenAI API, but common in compatible servers.
         top_k: opt_u64(m, "top_k", 0, 1 << 20)?.unwrap_or(0) as usize,
+        min_p: opt_f32(m, "min_p", 0.0, 1.0)?.unwrap_or(0.0),
         frequency_penalty: opt_f32(m, "frequency_penalty", -2.0, 2.0)?.unwrap_or(0.0),
         presence_penalty: opt_f32(m, "presence_penalty", -2.0, 2.0)?.unwrap_or(0.0),
         seed: match m.get("seed") {
@@ -134,5 +135,8 @@ pub fn sampling(m: &serde_json::Map<String, Value>, vocab: usize) -> ApiResult<G
             p.logit_bias.push((id, b));
         }
     }
+    // By id (JSON object keys come in string order): device sampling merges
+    // it with the penalty counts without sorting.
+    p.logit_bias.sort_unstable_by_key(|b| b.0);
     Ok(p)
 }

@@ -21,7 +21,7 @@
 //! The KV pools live as long as the engine. CUDA decode graphs capture their
 //! device addresses, so they must not be reallocated.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -46,6 +46,8 @@ pub struct GenParams {
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: usize,
+    /// 0: off (see `rllm_model::SamplerConfig::min_p`).
+    pub min_p: f32,
     pub seed: u64,
     pub frequency_penalty: f32,
     pub presence_penalty: f32,
@@ -64,6 +66,7 @@ impl Default for GenParams {
             temperature: 1.0,
             top_p: 1.0,
             top_k: 0,
+            min_p: 0.0,
             seed: 0,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
@@ -283,6 +286,13 @@ pub struct EngineConfig {
     pub batch_invariant: bool,
     /// Pinned system memory for the prefix cache's host tier, in bytes (0: none).
     pub host_cache_bytes: usize,
+    /// `batch_invariant`: decode steps per prompt chunk while both are
+    /// waiting (1: alternate; more favors decoding requests' latency over
+    /// new prompts' time to first token).
+    pub decode_per_prefill: usize,
+    /// Models with recurrent state: most prefix-cache checkpoints kept (each
+    /// holds one extra state slot); 0 turns their prefix cache off.
+    pub state_checkpoints: usize,
     /// Sample every token on the host from full logits rows, instead of on
     /// the device where possible (see `device_sample`).
     pub host_sampling: bool,
@@ -292,6 +302,18 @@ pub struct EngineConfig {
 }
 
 pub const BLOCK_SIZE: usize = 16;
+
+/// Waiting requests behind one that doesn't fit that may be admitted past it.
+const ADMIT_PASS: usize = 4;
+/// How often a request that doesn't fit may be passed before admission
+/// waits for it (so a large request isn't starved by small ones).
+const ADMIT_MAX_PASSED: u32 = 8;
+
+/// Recurrent models' checkpoints stop at least this many tokens before the
+/// end of a prompt: the next turn of a chat usually renders the end of the
+/// previous prompt (the assistant's opening, `<think>`) differently, so a
+/// checkpoint there would never match.
+const CHECKPOINT_TAIL: usize = 16;
 
 /// Most tokens in a decode step under `batch_invariant`: GPU steps up to 8
 /// tokens run each token through the same matvec kernels as a 1-token step.
@@ -384,7 +406,8 @@ where
             };
             if model.recurrent() {
                 // A recurrent state can't be rebuilt from cached KV blocks
-                // or rewound after rejected draft tokens.
+                // (the prefix cache keeps checkpoints of it instead) or
+                // rewound after rejected draft tokens (MTP snapshots it).
                 let mut off = Vec::new();
                 if cfg.draft.is_some() {
                     off.push("--draft");
@@ -400,14 +423,20 @@ where
                 }
                 cfg.draft = None;
                 cfg.prompt_lookup = false;
-                cfg.prefix_cache = false;
+                cfg.prefix_cache &= cfg.state_checkpoints > 0;
                 cfg.host_cache_bytes = 0;
+            } else {
+                cfg.state_checkpoints = 0;
+            }
+            if !cfg.prefix_cache {
+                cfg.state_checkpoints = 0;
             }
             let kv_tokens = cfg.kv_tokens.max(cfg.ctx);
             let pools = (|| -> Result<_> {
                 // Recurrent models keep a state per sequence holding blocks:
                 // the running batch, an embedding job and a spare.
-                let mut pool = KvPool::new(&backend, &model, kv_tokens, BLOCK_SIZE, cfg.kv_type, cfg.parallel.max(1) + 2)?;
+                // Prefix-cache checkpoints hold one more each.
+                let mut pool = KvPool::new(&backend, &model, kv_tokens, BLOCK_SIZE, cfg.kv_type, cfg.parallel.max(1) + 2 + cfg.state_checkpoints)?;
                 let mtp_drafts = cfg.draft_tokens.clamp(1, MTP_MAX_DRAFTS);
                 // Snapshots for the drafts one step verifies: at most
                 // `decoding` sequences with spec_len's share each.
@@ -538,7 +567,9 @@ struct Seq {
     budget: usize,
     generated: usize,
     sampler: Sampler,
-    counts: HashMap<u32, u32>,
+    /// Generated token counts (penalties), ordered by id so device
+    /// adjustment lists come out sorted.
+    counts: BTreeMap<u32, u32>,
     json: Option<JsonState>,
     /// Admission order; the newest running sequence is preempted first.
     admitted: u64,
@@ -553,6 +584,14 @@ struct Seq {
     spec_pause: u32,
     /// Verifications in a row that accepted nothing.
     spec_misses: u32,
+    /// Recurrent models: where to keep a prefix-cache checkpoint of this
+    /// sequence's state (a prompt chunk ends there); 0: none.
+    ckpt_at: usize,
+    /// Steps this sequence's prompt waited for others' chunks (ages its
+    /// prefill priority, so short prompts can't starve it).
+    prefill_wait: u32,
+    /// Times later requests were admitted past it while it didn't fit.
+    passed: u32,
 }
 
 impl Seq {
@@ -634,9 +673,11 @@ struct Scheduler<'a, 'm, B: Backend> {
     running: Vec<Seq>,
     admissions: u64,
     timing: StepTiming,
-    /// `batch_invariant`: the last step was a prompt chunk (the next one
-    /// decodes, if anything is decoding).
-    invariant_last_prefill: bool,
+    /// `batch_invariant`: decode steps since the last prompt chunk.
+    invariant_decodes: usize,
+    /// What admission last found nothing to admit with: (free blocks,
+    /// running, waiting, cache entries). Unchanged, it isn't retried.
+    admit_stuck: Option<(usize, usize, usize, usize)>,
 }
 
 /// Where step time goes (`RLLM_ENGINE_TIMING=1` prints it every 256 steps).
@@ -690,7 +731,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             pool,
             draft,
             mtp_drafts,
-            cache: PrefixCache::default(),
+            cache: if cfg.state_checkpoints > 0 { PrefixCache::with_states(cfg.state_checkpoints) } else { PrefixCache::default() },
             tok,
             vocab,
             cfg,
@@ -699,7 +740,8 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             embeds: VecDeque::new(),
             running: Vec::new(),
             admissions: 0,
-            invariant_last_prefill: false,
+            invariant_decodes: usize::MAX,
+            admit_stuck: None,
             timing: StepTiming { enabled: std::env::var_os("RLLM_ENGINE_TIMING").is_some(), ..StepTiming::default() },
         }
     }
@@ -743,13 +785,29 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                 }
             }
             Metrics::add(&self.metrics.busy_us, t0.elapsed().as_micros() as usize);
+            // Keep a step's worth of blocks free between steps, so evictions
+            // (and host-tier copies) happen here rather than while planning.
+            if self.cfg.prefix_cache && !self.running.is_empty() {
+                let reserve = (self.running.len() + self.cfg.prefill_chunk.div_ceil(BLOCK_SIZE)).min(self.pool.alloc.n_blocks() / 4);
+                self.cache.make_room(&mut self.pool, reserve);
+            }
         }
     }
 
     fn accept(&mut self, job: Job) {
         match job {
             Job::Generate { prompt, params, events, cancel } => {
-                self.queued.fetch_sub(1, Ordering::Relaxed);
+                // Leaves `queued` for `waiting` (published right away, below):
+                // `reserve` must see it in one of them, or `--max-queue`
+                // could be exceeded until the next publish.
+                struct Dequeue<'a>(&'a AtomicUsize);
+                impl Drop for Dequeue<'_> {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+                let queued = self.queued.clone();
+                let _dequeue = Dequeue(&queued);
                 if prompt.is_empty() || prompt.len() >= self.cfg.ctx {
                     let msg = format!("prompt ({} tokens) does not fit the context ({} tokens)", prompt.len(), self.cfg.ctx);
                     let _ = events.send(GenEvent::Error(msg));
@@ -761,7 +819,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                     return;
                 }
                 let sampler_cfg =
-                    SamplerConfig { temperature: params.temperature, top_k: params.top_k, top_p: params.top_p, seed: params.seed };
+                    SamplerConfig { temperature: params.temperature, top_k: params.top_k, top_p: params.top_p, min_p: params.min_p, seed: params.seed };
                 let sampler = Sampler::new(sampler_cfg.clone());
                 let draft_sampler = Sampler::new(SamplerConfig { seed: params.seed ^ 0xD1B5_4A32_D192_ED03, ..sampler_cfg });
                 let json = params.json.clone();
@@ -773,7 +831,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                     budget,
                     generated: 0,
                     sampler,
-                    counts: HashMap::new(),
+                    counts: BTreeMap::new(),
                     json,
                     admitted: 0,
                     draft_kv: SeqKv::default(),
@@ -781,10 +839,14 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                     spec_k: self.spec_max(),
                     spec_pause: 0,
                     spec_misses: 0,
+                    ckpt_at: 0,
+                    prefill_wait: 0,
+                    passed: 0,
                     params,
                     events,
                     cancel,
                 });
+                Metrics::set(&self.metrics.waiting, self.waiting.len());
             }
             Job::Embed { inputs, rows, reply } => {
                 self.embeds.push_back(EmbedJob { out: Vec::with_capacity(inputs.len()), inputs, reply, seq: SeqKv::default(), sum: Vec::new(), rows })
@@ -856,14 +918,31 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
     /// slot and KV blocks for their whole prompt (evicting cached prefixes
     /// as needed). Strictly in arrival order.
     fn admit(&mut self) {
+        let snapshot = |e: &Self| (e.pool.alloc.n_free(), e.running.len(), e.waiting.len(), e.cache.len());
+        if self.waiting.is_empty() || self.admit_stuck == Some(snapshot(self)) {
+            return;
+        }
+        self.admit_stuck = None;
         // Blocks the prompts admitted in this pass will take (they are only
         // allocated by the next step), so each admission sees what is left.
         let mut reserved = 0;
-        while self.running.len() < self.cfg.parallel.max(1) {
-            let Some(mut s) = self.waiting.pop_front() else { return };
+        // A request that doesn't fit blocks admission, but up to ADMIT_PASS
+        // later (smaller) ones may try past it, until it has been passed
+        // ADMIT_MAX_PASSED times.
+        let mut i = 0;
+        let mut admitted = false;
+        while self.running.len() < self.cfg.parallel.max(1) && i < self.waiting.len() {
+            let mut s = self.waiting.remove(i).expect("in range");
             if self.cfg.prefix_cache && s.kv.len == 0 {
-                let (n, blocks) = self.cache.lookup(&mut self.pool, &s.tokens);
-                s.kv = SeqKv::with_prefix(blocks, n);
+                if self.cache.stateful() {
+                    self.resume_checkpoint(&mut s);
+                } else {
+                    let (n, blocks) = self.cache.lookup(&mut self.pool, &s.tokens);
+                    s.kv = SeqKv::with_prefix(blocks, n);
+                }
+            }
+            if self.cache.stateful() {
+                s.ckpt_at = self.checkpoint_at(&s);
             }
             // The prompt's blocks, plus one block of headroom per running
             // sequence so they can keep decoding.
@@ -871,9 +950,17 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             let need = reserved + prompt + self.running.len();
             if !self.cache.make_room(&mut self.pool, need) {
                 s.kv.free(&mut self.pool.alloc);
-                self.waiting.push_front(s);
-                return;
+                self.waiting.insert(i, s);
+                if i < ADMIT_PASS && self.waiting[0].passed < ADMIT_MAX_PASSED {
+                    i += 1;
+                    continue;
+                }
+                break;
             }
+            if i > 0 {
+                self.waiting[0].passed += 1;
+            }
+            admitted = true;
             if s.cached.is_none() {
                 s.cached = Some(s.kv.len);
             }
@@ -881,6 +968,61 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             self.admissions += 1;
             s.admitted = self.admissions;
             self.running.push(s);
+        }
+        if !admitted && self.running.len() < self.cfg.parallel.max(1) {
+            self.admit_stuck = Some(snapshot(self));
+        }
+    }
+
+    /// Recurrent models: start `s` from the longest checkpoint its tokens
+    /// begin with, in a state slot of its own (a copy of the checkpoint's).
+    fn resume_checkpoint(&mut self, s: &mut Seq) {
+        let Some(slot) = self.pool.alloc.alloc_state() else { return };
+        let Some((n, blocks, from)) = self.cache.lookup_state(&mut self.pool, &s.tokens) else {
+            self.pool.alloc.release_state(slot);
+            return;
+        };
+        match self.pool.copy_state(from, slot) {
+            Ok(()) => s.kv = SeqKv { block_table: blocks, len: n, state: Some(slot) },
+            Err(e) => {
+                eprintln!("[rllm] restoring a recurrent-state checkpoint failed: {e:#}");
+                blocks.into_iter().for_each(|b| self.pool.alloc.release(b));
+                self.pool.alloc.release_state(slot);
+            }
+        }
+    }
+
+    /// Where to checkpoint `s` (0: nowhere): the last multiple of the
+    /// prompt chunk (and block) size at least CHECKPOINT_TAIL tokens before
+    /// the end of its tokens. On chunk boundaries a request resumed from it
+    /// computes the same chunks as one that ran from the start, so its
+    /// output is the same either way (batch-invariant mode).
+    fn checkpoint_at(&self, s: &Seq) -> usize {
+        let chunk = self.cfg.prefill_chunk.max(1);
+        let step = chunk / gcd(chunk, BLOCK_SIZE) * BLOCK_SIZE;
+        let at = s.tokens.len().saturating_sub(CHECKPOINT_TAIL) / step * step;
+        if at > s.kv.len { at } else { 0 }
+    }
+
+    /// After a step: checkpoint the sequences that just reached their
+    /// checkpoint position.
+    fn take_checkpoints(&mut self, active: &[usize]) {
+        for &i in active {
+            let s = &mut self.running[i];
+            if s.ckpt_at == 0 || s.kv.len != s.ckpt_at {
+                continue;
+            }
+            let at = std::mem::take(&mut s.ckpt_at);
+            let Some(from) = s.kv.state else { continue };
+            let blocks = s.kv.block_table[..at / BLOCK_SIZE].to_vec();
+            let tokens = s.tokens[..at].to_vec();
+            self.cache.checkpoint(&mut self.pool, &tokens, &blocks, |pool, slot| match pool.copy_state(from, slot) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("[rllm] keeping a recurrent-state checkpoint failed: {e:#}");
+                    false
+                }
+            });
         }
     }
 
@@ -925,7 +1067,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
     fn invariant_plan(&mut self, takes: &mut [usize], spec: &mut [usize]) {
         let prefill = (0..takes.len()).find(|&i| takes[i] > 0 && self.running[i].todo().len() > 1);
         let decoding = (0..takes.len()).any(|i| self.running[i].todo().len() == 1);
-        let prefill_turn = prefill.is_some() && (!decoding || !self.invariant_last_prefill);
+        let prefill_turn = prefill.is_some() && (!decoding || self.invariant_decodes >= self.cfg.decode_per_prefill.max(1));
         if prefill_turn {
             let p = prefill.expect("checked");
             for (i, t) in takes.iter_mut().enumerate() {
@@ -947,15 +1089,23 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                 left -= takes[i];
             }
         }
-        self.invariant_last_prefill = prefill_turn;
+        self.invariant_decodes = if prefill_turn { 0 } else { self.invariant_decodes.saturating_add(1) };
     }
 
     /// Plan, run and sample one batched forward pass.
     fn step(&mut self) -> Result<()> {
         let t_start = Instant::now();
         // Decoding sequences first (one token each, plus drafts), then
-        // prompt chunks in admission order within the prefill budget.
-        self.running.sort_by_key(|s| (s.todo().len() > 1, s.admitted));
+        // prompt chunks within the prefill budget, shortest remaining prompt
+        // first (a short chat doesn't wait behind every chunk of a long
+        // agent prompt); waiting ages a prompt, a chunk's worth per step, so
+        // a long one still gets its turn. Each prompt's chunks start at its
+        // own cached length, so this doesn't change how it is chunked.
+        let chunk = self.cfg.prefill_chunk.max(1);
+        self.running.sort_by_key(|s| {
+            let n = s.todo().len();
+            if n > 1 { (true, n.saturating_sub(s.prefill_wait as usize * chunk), s.admitted) } else { (false, 0, s.admitted) }
+        });
         let mut takes: Vec<usize>;
         let mut spec: Vec<usize>;
         let mut drafts = true;
@@ -972,7 +1122,11 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                     if n == 1 {
                         1 + k
                     } else {
-                        let t = n.min(budget);
+                        let mut t = n.min(budget);
+                        // A prompt chunk ends at the sequence's checkpoint.
+                        if s.ckpt_at > s.kv.len {
+                            t = t.min(s.ckpt_at - s.kv.len);
+                        }
                         budget -= t;
                         t
                     }
@@ -1007,8 +1161,11 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             Metrics::add(&self.metrics.preemptions, 1);
             anyhow::ensure!(!self.running.is_empty(), "KV cache too small for one sequence");
         }
-        for s in &mut self.running {
+        for (s, &t) in self.running.iter_mut().zip(&takes) {
             s.spec_pause = s.spec_pause.saturating_sub(1);
+            if s.todo().len() > 1 {
+                s.prefill_wait = if t == 0 { s.prefill_wait.saturating_add(1) } else { 0 };
+            }
         }
 
         // Draft proposals: prompt lookup first (free), then the draft model
@@ -1114,11 +1271,19 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                 start_of[i] = start;
                 n_tok += takes[i];
                 // `tokens` and `kv` are disjoint fields.
-                let Seq { tokens, kv, .. } = s;
+                let Seq { tokens, kv, params, json, counts, .. } = s;
                 snaps.push(if spec_tokens[i].is_empty() { 0 } else { (takes[i] - 1) as u32 });
                 if !spec_tokens[i].is_empty() {
                     rows_of.push(takes[i]);
-                    sample.extend(std::iter::repeat_n(None, takes[i]));
+                    // Greedy verification picks each row's token on the
+                    // device; only the ids come back.
+                    match device_verify(params, json, counts, &proposals[i].tokens, tokens.len(), self.cfg.host_sampling) {
+                        Some(specs) => {
+                            on_device[i] = true;
+                            sample.extend(specs.into_iter().map(Some));
+                        }
+                        None => sample.extend(std::iter::repeat_n(None, takes[i])),
+                    }
                     items.push(StepItem { seq: kv, tokens: &spec_tokens[i], want: Want::All });
                 } else {
                     let all = start + takes[i] == tokens.len();
@@ -1144,6 +1309,9 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             self.timing.forward += t.elapsed();
             out
         };
+        if self.cache.stateful() {
+            self.take_checkpoints(&active);
+        }
         let t_sample = Instant::now();
         // Sample every sequence whose pending tokens are all in the cache now.
         let vocab_n = self.pool.model().vocab_size();
@@ -1152,8 +1320,15 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         let mut ids = ids.into_iter();
         let mut device_results: Vec<(usize, Next, usize)> = Vec::new();
         for &i in active.iter().filter(|&&i| on_device[i]) {
-            let id = ids.next().context("missing device-sampled id")?;
-            device_results.push((i, emit(&mut self.running[i], id, None, &[], self.tok), 0));
+            if proposals[i].tokens.is_empty() {
+                let id = ids.next().context("missing device-sampled id")?;
+                device_results.push((i, emit(&mut self.running[i], id, None, &[], self.tok), 0));
+            } else {
+                let picks: Vec<u32> = ids.by_ref().take(takes[i]).collect();
+                anyhow::ensure!(picks.len() == takes[i], "missing device-sampled verification ids");
+                let (next, kept) = verify_picked(&mut self.running[i], &picks, &proposals[i].tokens, self.tok);
+                device_results.push((i, next, kept));
+            }
         }
         // Logits rows are processed in place (no copies: a fresh 1 MB
         // buffer per token costs more in page faults than the argmax).
@@ -1232,6 +1407,8 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                 done.push((i, Some(f)));
             }
         }
+        // The rows' memory serves the next step's copy.
+        rllm_model::recycle_rows(out);
         self.timing.sample += t_sample.elapsed();
         self.timing.total += t_start.elapsed();
         self.timing.report();
@@ -1293,7 +1470,20 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                         (&s.kv, tok, pos)
                     })
                     .collect();
-                let mut logits = self.pool.mtp_draft(&items, round == 0)?;
+                // Greedy sequences without logit adjustments draft their
+                // argmax: picked on the device, no logits copied back.
+                let greedy = live.iter().all(|&(i, _)| plain_greedy(&self.running[i].params));
+                let out = self.pool.mtp_draft(&items, round == 0, greedy)?;
+                if greedy {
+                    anyhow::ensure!(out.ids.len() == live.len(), "{} draft ids for {} sequences", out.ids.len(), live.len());
+                    for (&t, &(i, _)) in out.ids.iter().zip(&live) {
+                        let p = &mut props[i];
+                        p.tokens.push(t);
+                        p.dists.push(Dist::Point(t));
+                    }
+                    continue;
+                }
+                let mut logits = out.rows;
                 for (row, &(i, _)) in logits.chunks_exact_mut(vocab_n).zip(&live) {
                     let s = &mut self.running[i];
                     let p = &mut props[i];
@@ -1504,18 +1694,40 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
 /// How to sample a sequence's next token on the device, or None when it
 /// needs its logits row on the host: logprobs, a JSON constraint (its
 /// verification steps never get here), or `--host-sampling`.
-fn device_sample(params: &GenParams, json: &Option<JsonState>, counts: &HashMap<u32, u32>, position: usize, host_only: bool) -> Option<RowSample> {
+fn device_sample(params: &GenParams, json: &Option<JsonState>, counts: &BTreeMap<u32, u32>, position: usize, host_only: bool) -> Option<RowSample> {
     if host_only || params.logprobs.is_some() || json.is_some() {
         return None;
     }
-    let mut adjust = params.logit_bias.clone();
-    if params.frequency_penalty != 0.0 || params.presence_penalty != 0.0 {
-        adjust.extend(counts.iter().map(|(&id, &c)| (id, -(c as f32 * params.frequency_penalty + params.presence_penalty))));
-    }
+    // Sorted by id with one entry per id (logit_bias is sorted at parse,
+    // counts are ordered), merged in one pass: the backend then needs no
+    // sort of all rows' entries.
+    let adjust = if params.frequency_penalty != 0.0 || params.presence_penalty != 0.0 {
+        let pen = |c: u32| -(c as f32 * params.frequency_penalty + params.presence_penalty);
+        let mut out = Vec::with_capacity(params.logit_bias.len() + counts.len());
+        let mut bias = params.logit_bias.iter().peekable();
+        for (&id, &c) in counts {
+            while let Some(&&(b, d)) = bias.peek().filter(|x| x.0 < id) {
+                out.push((b, d));
+                bias.next();
+            }
+            match bias.peek() {
+                Some(&&(b, d)) if b == id => {
+                    out.push((id, d + pen(c)));
+                    bias.next();
+                }
+                _ => out.push((id, pen(c))),
+            }
+        }
+        out.extend(bias.copied());
+        out
+    } else {
+        params.logit_bias.clone()
+    };
     Some(RowSample {
         temperature: params.temperature,
         top_k: params.top_k.min(u32::MAX as usize) as u32,
         top_p: params.top_p,
+        min_p: params.min_p,
         seed: params.seed,
         counter: position as u64,
         adjust,
@@ -1597,6 +1809,47 @@ fn process_logits(s: &Seq, logits: &mut [f32]) -> Option<LogSoftmax> {
 
 /// The draft model's view of the request's logit processing: bias and
 /// penalties, counting the tokens drafted so far as generated.
+/// Device sampling specs for a greedy sequence's verification rows: the
+/// pending token's row and one per draft, each with the penalties of the
+/// drafts before it (as if they were accepted, which is all that is read).
+/// None when the rows must come to the host (sampling, logprobs, JSON).
+fn device_verify(params: &GenParams, json: &Option<JsonState>, counts: &BTreeMap<u32, u32>, drafts: &[u32], position: usize, host_only: bool) -> Option<Vec<RowSample>> {
+    if params.temperature > 0.0 {
+        return None;
+    }
+    let penalties = params.frequency_penalty != 0.0 || params.presence_penalty != 0.0;
+    let mut c = if penalties { counts.clone() } else { BTreeMap::new() };
+    let mut out = Vec::with_capacity(drafts.len() + 1);
+    for j in 0..=drafts.len() {
+        out.push(device_sample(params, json, &c, position + j, host_only)?);
+        if penalties && j < drafts.len() {
+            *c.entry(drafts[j]).or_default() += 1;
+        }
+    }
+    Some(out)
+}
+
+/// Greedy verification from the device's picks (one per row): drafts are
+/// kept while they equal the pick; the first pick that differs (or the
+/// last row's) is the step's next token.
+fn verify_picked(s: &mut Seq, picks: &[u32], drafts: &[u32], tok: &Tokenizer) -> (Next, usize) {
+    let mut kept = 0;
+    for (j, &id) in picks.iter().enumerate() {
+        let accepted = drafts.get(j) == Some(&id);
+        match emit(s, id, None, &[], tok) {
+            Next::Continue if accepted => kept += 1,
+            next => return (next, kept),
+        }
+    }
+    (Next::Continue, kept)
+}
+
+/// Greedy, with nothing that changes the logits (bias, penalties): its
+/// next token is the raw logits' argmax.
+fn plain_greedy(p: &GenParams) -> bool {
+    p.temperature <= 0.0 && p.logit_bias.is_empty() && p.frequency_penalty == 0.0 && p.presence_penalty == 0.0 && p.logprobs.is_none() && p.json.is_none()
+}
+
 fn draft_logits(s: &Seq, drafted: &[u32], logits: &mut [f32]) {
     let params = &s.params;
     for &(id, b) in &params.logit_bias {
@@ -1665,13 +1918,11 @@ fn pick_json(logits: &[f32], state: &mut JsonState, vocab: &Vocab, params: &GenP
             _ => Err("the JSON schema is too ambiguous to enforce (constraint work limit exceeded)".to_owned()),
         }
     };
-    let mut order: Vec<u32> = (0..logits.len() as u32).collect();
-    let head = 256.min(order.len());
-    order.select_nth_unstable_by(head - 1, |&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
-    order[..head].sort_unstable_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
+    // The most likely 256 in order, in one pass (no vocabulary-sized sort).
+    let head: Vec<u32> = rllm_model::top_candidates(logits, 256.min(logits.len())).into_iter().map(|(id, _)| id).collect();
     let want = if params.temperature <= 0.0 { 1 } else { 32 };
     let mut found: Vec<(u32, JsonState)> = Vec::new();
-    for &id in &order[..head] {
+    for &id in &head {
         if let Some(s) = valid(id)? {
             found.push((id, s));
             if found.len() >= want {
@@ -1681,8 +1932,10 @@ fn pick_json(logits: &[f32], state: &mut JsonState, vocab: &Vocab, params: &GenP
     }
     if found.is_empty() {
         // Rare: nothing valid in the head; scan the rest in logit order.
-        order[head..].sort_unstable_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
-        for &id in &order[head..] {
+        let in_head: std::collections::HashSet<u32> = head.iter().copied().collect();
+        let mut order: Vec<u32> = (0..logits.len() as u32).filter(|i| !in_head.contains(i)).collect();
+        order.sort_unstable_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
+        for &id in &order {
             if let Some(s) = valid(id)? {
                 found.push((id, s));
                 break;
@@ -1740,6 +1993,17 @@ impl LogSoftmax {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_adjustments_come_out_sorted_and_merged() {
+        let params = GenParams { logit_bias: vec![(2, 1.0), (5, -1.0), (9, 3.0)], frequency_penalty: 0.5, presence_penalty: 0.25, ..Default::default() };
+        let counts: BTreeMap<u32, u32> = [(1, 2), (5, 1), (12, 4)].into_iter().collect();
+        let s = device_sample(&params, &None, &counts, 0, false).unwrap();
+        let ids: Vec<u32> = s.adjust.iter().map(|a| a.0).collect();
+        assert_eq!(ids, vec![1, 2, 5, 9, 12]);
+        let d5 = s.adjust.iter().find(|a| a.0 == 5).unwrap().1;
+        assert!((d5 - (-1.0 - 0.75)).abs() < 1e-6);
+    }
 
     fn handle(max_queue: usize) -> (EngineHandle, mpsc::Receiver<Job>) {
         let (tx, rx) = mpsc::channel();
@@ -1804,4 +2068,8 @@ mod tests {
         assert!(Proposal::lookup(&[1, 2, 3, 9, 4, 9], 2).tokens.is_empty());
         assert!(Proposal::lookup(&[1], 2).tokens.is_empty());
     }
+}
+
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
 }

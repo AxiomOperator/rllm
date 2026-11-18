@@ -14,7 +14,8 @@ your own requests (with templates, and live output when streaming), and
 change the settings. With --batch or --only (or when not on a terminal) it
 runs the checks and exits.
 
-    python3 tools/test_endpoints.py --url http://localhost:8080
+    python3 tools/test_endpoints.py                    # asks for the server
+    python3 tools/test_endpoints.py --url http://host:8080
     python3 tools/test_endpoints.py --batch
     python3 tools/test_endpoints.py --only chat,responses -v
     python3 tools/test_endpoints.py --api-key "$RLLM_API_KEY" --list
@@ -935,7 +936,7 @@ def settings(c, a, base_checks):
             continue
         try:
             if name == 'url':
-                c.base = value.rstrip('/')
+                c.base = normalize_url(value)
             elif name == 'api key':
                 c.s.headers.pop('Authorization', None)
                 a.api_key = None if value == '-' else value
@@ -960,12 +961,65 @@ def settings(c, a, base_checks):
             print(f'{RED}{err}{RESET}' if err else f'{GREEN}connected{RESET}: model {c.model}{" (decision model)" if c.decision else ""}')
 
 
+def normalize_url(text):
+    """'host:port' or a full URL → a base URL without a trailing slash or /v1."""
+    text = text.strip().rstrip('/')
+    if text.endswith('/v1'):
+        text = text[:-3]
+    return text if '://' in text else 'http://' + text
+
+
+def choose_server(c, a):
+    """Ask for the server URL and API key until a connection works (or the user goes on anyway).
+    Returns the connection error, None when connected, or False if the user quit."""
+    import getpass
+    print(f'{BOLD}rllm endpoint tester{RESET}')
+    ask_url, ask_key = not a.url, a.api_key is None
+    while True:
+        if ask_url:
+            url = ask('Server URL (e.g. http://192.168.1.20:8080 or host:port): ')
+            if url is None:
+                return False
+            if not url:
+                continue
+            c.base = normalize_url(url)
+        if ask_key:
+            try:
+                key = getpass.getpass('API key (Enter for none): ').strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return False
+            a.api_key = key or None
+            c.s.headers.pop('Authorization', None)
+            if key:
+                c.s.headers['Authorization'] = f'Bearer {key}'
+        print(f'{DIM}connecting to {c.base} ...{RESET}')
+        err = connect(c, a.model)
+        if not err:
+            print(f'{GREEN}connected{RESET}: model {c.model}{" (decision model)" if c.decision else ""}')
+            return None
+        print(f'{RED}{err}{RESET}')
+        if 'HTTP 401' in err:
+            print('The server wants an API key.')
+            ask_url, ask_key = False, True
+            continue
+        again = ask('Try again? [y = same server, u = another URL, n = go to the menu anyway] ', 'u')
+        if again is None:
+            return False
+        if again.lower().startswith('n'):
+            return err
+        ask_url = again.lower().startswith('u')
+        ask_key = ask_url
+
+
 def interactive(c, a, base_checks):
     try:
         import readline  # noqa: F401  (line editing and history for input())
     except ImportError:
         pass
-    err = connect(c, a.model)
+    err = choose_server(c, a)
+    if err is False:
+        return 0
     checks = plan(c, base_checks)
     results, last = [], {}
     while True:
@@ -1032,7 +1086,7 @@ def interactive(c, a, base_checks):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--url', default='http://localhost:8080', help='server base URL (default: %(default)s)')
+    p.add_argument('--url', help='server base URL, e.g. http://host:8080 (asked for in the menu if not given; required with --batch)')
     p.add_argument('--api-key', default=None, help='bearer token, if the server has --api-key (also tests 401s)')
     p.add_argument('--model', help='model id to send (default: the first from /v1/models)')
     p.add_argument('--only', help=f'comma-separated groups or name substrings to run (implies --batch); groups: {", ".join(GROUPS)}')
@@ -1059,9 +1113,12 @@ def main():
             print(f'{g:12} {n}')
         return 0
 
-    c = Client(a.url, a.api_key, a.timeout, a.verbose)
+    interactive_mode = not (a.batch or a.only) and sys.stdin.isatty() and sys.stdout.isatty()
+    if not a.url and not interactive_mode:
+        p.error('--url is required when not running interactively (--batch, --only, or not on a terminal)')
+    c = Client(normalize_url(a.url) if a.url else '', a.api_key, a.timeout, a.verbose)
     c.effort = None if a.reasoning_effort == 'default' else a.reasoning_effort
-    if not (a.batch or a.only) and sys.stdin.isatty() and sys.stdout.isatty():
+    if interactive_mode:
         return interactive(c, a, checks)
 
     err = connect(c, a.model)

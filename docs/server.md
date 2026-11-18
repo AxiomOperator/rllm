@@ -48,6 +48,7 @@ r = client.chat.completions.create(model="my-model", messages=[{"role": "user", 
 | `--store-file` | none | Save stored chat completions and responses to this JSON file (every 2 s when changed, and at shutdown) and load it at start. |
 | `-q`, `--quiet` | off | Don't log a line per finished generation. |
 | `--decode-per-prefill` | 1 | Batch-invariant mode: decode steps per prompt chunk while new prompts and decoding requests both wait (more keeps decoding faster while prompts arrive, at their first token's cost). |
+| `--spec-step-tokens` | 16 | Most tokens in a step verifying MTP drafts, all requests together (batch-invariant mode: at most 16). Within it each step's draft length is tuned by measurement (see MTP below). A draft model's and prompt lookup's steps stay within 8. |
 
 Environment: `RLLM_API_KEY` (as `--api-key`), `RLLM_ENGINE_TIMING=1` (print
 where engine step time goes every 256 steps, draft model included), `RLLM_MTP_VOCAB=n`
@@ -247,7 +248,8 @@ retrieval-embedding model.
 - **One model, one engine thread, continuous batching.** The engine owns a paged KV cache of `--kv-tokens` tokens, shared by all requests.
   - Each forward pass takes one token from every decoding request, plus up to `--prefill-chunk` prompt tokens from requests still reading their prompt.
   - New requests join the batch as soon as a slot (`--parallel`) and KV blocks are free. Finished ones leave without waiting for the rest.
-  - Steps of up to 8 tokens (decoding requests, or drafts being verified), and pure decode steps of up to 64 requests, replay CUDA/HIP graphs. Larger steps that mix in prompt chunks run directly.
+  - Steps of up to 64 tokens (decoding requests, drafts being verified, or both) replay CUDA/HIP graphs. Larger steps that mix in prompt chunks run directly.
+  - Steps of up to 16 tokens run the matvec (decode) kernels: 1 to 8 tokens their 8-token build, 9 to 16 a 16-token build (Qwen3.6-35B-A3B on the Ada: 12 tokens 938 tok/s instead of 702, 16: 1044 instead of 830; 1 to 8 unchanged).
   - Decode attention splits long contexts over several thread blocks per head and merges them in a fixed order (2× faster on Qwen3-0.6B at 8k context on the laptop GPU).
   - HTTP handling, stop sequences and output parsing run on the async runtime; chat templating and tokenizing a request run on its blocking pool, so a large prompt doesn't hold up other connections.
 - **Prefix cache.** When a request finishes, its KV blocks stay cached. A later request whose prompt starts with the same tokens reuses those blocks instead of recomputing them. That covers the next turn of a chat, a repeated system prompt, `n` choices or `previous_response_id`.
@@ -301,10 +303,24 @@ below. For these models:
   model), chaining from the main model's last hidden state. Every step also
   runs the head's K/V over its tokens, and verification steps snapshot the
   recurrent state after each token so rejected drafts roll back exactly.
-  The snapshots are 6 state copies shared by every request (one step
-  verifies at most 6 drafts in all: 3 for each of up to 2 sequences, fewer
-  as more decode together), about 0.9 GiB on the 27B. If they don't fit,
-  the server starts without MTP and says so. `--no-mtp` turns it off;
+  The snapshots are state copies shared by every request: as many as one
+  step verifies drafts (12 at `--parallel 8` with 16-token steps; about
+  1.8 GiB on the 27B). If they don't fit, steps of 8 tokens (6 copies) are
+  tried, then the server starts without MTP and says so.
+  - **Steps of up to 16 tokens** (`--spec-step-tokens`, default 16): a step
+    of 9 to 16 tokens runs the same matvec kernels as decoding (built a
+    second time for 16 tokens; 1 to 8 keep the 8-token build), so it costs
+    little more than an 8-token step and each token's logits stay bit for
+    bit those of a step of its own. Within that, each step's draft length is
+    picked from measurements: for every (decoding requests, drafts per
+    request) the server keeps the tokens a step produced per millisecond,
+    drafting included, tries each length a few times, then takes the
+    longest within 5% of the best, and re-tries the others every 128 steps
+    (`RLLM_SPEC_DEBUG=1` prints the table). Qwen3.6-35B-A3B on the RTX 6000
+    Ada, default mode, 512 tokens per request: 1 request 311 tok/s (as
+    before), 4: 639 (628), 8: 793 (701), 16 with `--parallel 16`: 868 (700
+    at the old limit of 8). On Strix Halo, bound by memory bandwidth,
+    within ±3% up to 8 requests and +5% at 16. `--no-mtp` turns it off;
 - the head drafts over the first 131072 token ids plus the special tokens
   (`RLLM_MTP_VOCAB=n` sets the size; 0: the whole vocabulary), reading about
   half of the 248k-row output matrix per draft token. Drafts only decide
@@ -322,9 +338,23 @@ the split count a step of its own would (from its own context, not the
 step's longest), so a verification step that crosses a power-of-two context
 (256, 512, ... tokens) matches one-token steps bit for bit.
 
+**Gemma 4 26B-A4B (`gemma4` with experts).** Each layer keeps its dense
+FFN and adds 128 routed experts (top 8, GELU): the router reads
+rms_norm(x) times a learned scale over sqrt(hidden), and each chosen
+expert's output is scaled by a learned per-expert factor (folded into the
+routing weight). The two branches are normed separately and summed. Its
+sliding-window layers have 8 KV heads and its global layers 2, with V taken
+from the K projection. On the RTX 6000 Ada (Q8_0): 145 tok/s for one
+request, 504 tok/s for 8. The model is sensitive to rounding: llama.cpp's
+own default and exact-attention runs differ by up to KL 4.9 on a chat prompt;
+rllm sits within that (KL mean 0.05 against llama.cpp's default). Prefilling
+the same text in 512- versus 16-token chunks moves its predictions by mean KL
+0.20, against 0.003 for Qwen3.6-35B-A3B; the GPU model tests measure that
+noise floor and hold sensitive models to it.
+
 **Mixture of experts (`qwen35moe`).** Each token's router picks 8 of the 256
 experts (softmax, weights renormalized over the chosen ones) and a shared
-expert is added, scaled by a sigmoid gate. On the GPU, decode steps (up to 8
+expert is added, scaled by a sigmoid gate. On the GPU, decode steps (up to 16
 tokens) run one matrix-vector product per (token, expert) pair, reading only
 the chosen experts' weights; prefill sorts the pairs by expert and runs one
 grouped int8 GEMM over all experts. Experts can be any of rllm's quantized
@@ -436,12 +466,12 @@ prefill kernels, and prompts prefilled together split their matrix work
 differently. So under concurrent load, greedy output can differ from the
 same request run alone, and between runs (with or without speculative
 decoding). `--batch-invariant` removes that: every step is either decode
-tokens only (at most 8, where each token's logits are bit for bit what a
+tokens only (at most 16, where each token's logits are bit for bit what a
 step of its own would give) or one request's prompt chunk, never a mix.
 Concurrent requests then produce exactly what they produce alone, and greedy
 output with and without speculation (draft model or MTP) matches under any
 load. It costs throughput when prompts arrive while others decode, caps
-`--parallel` at 8 and turns the block prefix cache off (Qwen3.5 hybrids'
+`--parallel` at 16 and turns the block prefix cache off (Qwen3.5 hybrids'
 state checkpoints stay: they keep the chunking). It is on by default for
 Qwen3.5 hybrids (`qwen35`, `qwen35moe`), so their MTP output matches
 decoding without MTP under any load;
@@ -458,7 +488,7 @@ is a main-model step saved.
 - **Exact.** Verification follows the speculative sampling rule (accept a drafted token with probability min(1, p/q), otherwise draw from the leftover distribution), so output is distributed exactly as without a draft. Greedy output is token for token the same on Qwen3: a verification step computes the same logits as one-token steps, at any context length (decode attention splits a long context per token, not per step). On Gemma 4 models, whose one-token steps use their own fused kernels, it matches as closely as batched requests do.
 - **Request features.** Logit bias, frequency and presence penalties, logprobs, stop sequences and `n` all apply as usual (the draft sees the bias and penalties too). Requests with a JSON constraint (`json_object`, `json_schema`, forced tool calls) decode without drafts.
 - **Adaptive.** Each request proposes one token more than it last had accepted, up to `--draft-tokens`, so drafts stay short where the text is hard to predict. After three verifications in a row that accept nothing, the request decodes without drafts for 8 steps.
-- **Batching.** Drafts are shortened so a step stays within 8 tokens (one request: up to 7 drafts; two: 3 each; three or four: 1 each). With 5 or more requests decoding, the batch alone keeps the GPU busy and speculation pauses.
+- **Batching.** A draft model's and prompt lookup's drafts are shortened so a step stays within 8 tokens (one request: up to 7 drafts; two: 3 each; three or four: 1 each); with 5 or more requests decoding, speculation pauses. Longer steps measured slower with a draft model (Qwen3-8B with a Qwen3-0.6B draft on the Ada: 390 against 528 tok/s at 4 requests with 32-token steps): a draft skipped for a step catches up later. MTP steps go further (below).
 - **Short sequences only.** The draft model drafts for sequences up to 6144 tokens; longer ones decode with prompt lookup only (if on) and release their draft cache. Beyond that length the draft's attention and its catch-up over the prompt cost more than it saves:
 
 | Qwen3-8B + 0.6B draft, RTX 6000 Ada | 901 tokens | 4111 | 8331 | 16751 |

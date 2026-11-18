@@ -6,7 +6,7 @@
 
 use rayon::prelude::*;
 use rllm_core::quant::dequantize_row;
-use rllm_core::{AttnMeta, Backend, DType, Error, GdnShape, HostBytes, HostTensor, KvLayout, KvType, MoeFfn, Result, SeqRuns};
+use rllm_core::{Activation, AttnMeta, Backend, DType, Error, GdnShape, HostBytes, HostTensor, KvLayout, KvType, MoeFfn, Result, SeqRuns};
 
 pub struct CpuBackend;
 
@@ -385,7 +385,11 @@ impl Backend for CpuBackend {
     }
 
     fn moe_ffn(&self, x: &Vec<f32>, logits: &Vec<f32>, moe: &MoeFfn<CpuWeight>, shared: Option<(&Vec<f32>, &Vec<f32>)>, out: &mut Vec<f32>, m: usize) -> Result<()> {
-        let MoeFfn { gate, up, down, n_expert: ne, n_used: k, n_ff, norm_topk, scale } = *moe;
+        let MoeFfn { gate, up, down, n_expert: ne, n_used: k, n_ff, norm_topk, scale, act, expert_scale } = *moe;
+        let escale = match expert_scale {
+            Some(w) => Some(w.dense.as_deref().filter(|v| v.len() == ne).ok_or_else(|| Error::Shape(format!("moe_ffn: expert scale must be {ne} f32 values")))?),
+            None => None,
+        };
         let d = gate.cols;
         if k == 0 || k > ne || gate.rows != ne * n_ff || up.rows != ne * n_ff || up.cols != d || down.rows != ne * d || down.cols != n_ff {
             return Err(Error::Shape(format!(
@@ -400,6 +404,9 @@ impl Backend for CpuBackend {
         for t in 0..m {
             rllm_core::moe_route(&logits[t * ne..(t + 1) * ne], k, norm_topk, scale, &mut ids[t * k..(t + 1) * k], &mut wts[t * k..(t + 1) * k]);
         }
+        if let Some(s) = escale {
+            wts.iter_mut().zip(&ids).for_each(|(w, &e)| *w *= s[e as usize]);
+        }
         // Per expert, its (token, slot) pairs in order; each pair's output row.
         let mut pairs: Vec<Vec<usize>> = vec![Vec::new(); ne];
         for (p, &e) in ids.iter().enumerate() {
@@ -413,7 +420,10 @@ impl Backend for CpuBackend {
             rows_matmul(gate, e * n_ff, n_ff, &xg, c, &mut g);
             rows_matmul(up, e * n_ff, n_ff, &xg, c, &mut u);
             for (g, u) in g.iter_mut().zip(&u) {
-                *g = *g / (1.0 + (-*g).exp()) * u;
+                *g = match act {
+                    Activation::Silu => *g / (1.0 + (-*g).exp()) * u,
+                    Activation::GeluTanh => gelu_tanh(*g) * u,
+                };
             }
             let mut o = vec![0f32; c * d];
             rows_matmul(down, e * d, d, &g, c, &mut o);

@@ -803,7 +803,7 @@ impl<B: Backend> Qwen35<B> {
                 Some(s) => b.matmul_many(h, &[router, &s.gate_inp], &mut [&mut logits, &mut sg], n)?,
                 None => b.matmul(h, router, &mut logits, n)?,
             }
-            let moe = MoeFfn { gate, up, down, n_expert: m.n_expert, n_used: m.n_used, n_ff: m.n_ff, norm_topk: true, scale: m.scale };
+            let moe = MoeFfn { gate, up, down, n_expert: m.n_expert, n_used: m.n_used, n_ff: m.n_ff, norm_topk: true, scale: m.scale, act: Activation::Silu, expert_scale: None };
             let so = match shared {
                 Some(s) => {
                     let f = m.n_ff_shared;
@@ -841,7 +841,7 @@ impl<B: Backend> Qwen35<B> {
                     Some(s) => b.matmul_many(h, &[router, &s.gate_inp], &mut [&mut logits, &mut sg], n)?,
                     None => b.matmul(h, router, &mut logits, n)?,
                 }
-                let moe = MoeFfn { gate, up, down, n_expert: m.n_expert, n_used: m.n_used, n_ff: m.n_ff, norm_topk: true, scale: m.scale };
+                let moe = MoeFfn { gate, up, down, n_expert: m.n_expert, n_used: m.n_used, n_ff: m.n_ff, norm_topk: true, scale: m.scale, act: Activation::Silu, expert_scale: None };
                 let so = match shared {
                     Some(s) => {
                         let f = m.n_ff_shared;

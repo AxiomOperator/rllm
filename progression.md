@@ -81,6 +81,69 @@ xychart-beta
 
 Through the server (300 tokens, one request), greedy went from 212.5 to 217.7 tok/s. Sampled decode is now as fast as greedy: 212.6 with Qwen's settings and 211.2 with top-p only.
 
+## Speculation past 8 tokens per step (RTX 6000 Ada)
+
+A step of 9 to 16 tokens used to leave the matvec kernels for the matmul path and cost about 50% more than an 8-token step, so speculation stopped at 8 tokens per step and switched off with 5 or more requests decoding. The matvec kernels are now built a second time for up to 16 tokens (steps of 1 to 8 keep the 8-token build), and each step's MTP draft length is tuned by measurement.
+
+```mermaid
+xychart-beta
+    title "Ada decode, Qwen3.6-35B-A3B, tokens per step (tok/s aggregate)"
+    x-axis ["8 before", "8 after", "12 before", "12 after", "16 before", "16 after"]
+    y-axis "tok/s" 0 --> 1100
+    bar [814, 815, 702, 938, 830, 1044]
+```
+
+| Tokens per step | Before | After |
+|---|---|---|
+| 1 | 217 | 217 |
+| 8 | 814 | 815 |
+| 9 | 608 | 846 |
+| 12 | 702 | **938** |
+| 16 | 830 | **1,044** |
+
+Serving Qwen3.6-35B-A3B in its default mode (batch-invariant, MTP), 512 tokens per request:
+
+```mermaid
+xychart-beta
+    title "Ada MTP serving, Qwen3.6-35B-A3B (tok/s aggregate)"
+    x-axis ["1 req before", "1 req after", "4 before", "4 after", "8 before", "8 after", "16 before", "16 after"]
+    y-axis "tok/s" 0 --> 950
+    bar [311, 312, 628, 639, 701, 793, 700, 868]
+```
+
+| Concurrent requests | Before | After | Change |
+|---|---|---|---|
+| 1 | 311 | 312 | — |
+| 2 | 448 | 453 | +1% |
+| 4 | 628 | 639 | +2% |
+| 8 | 701 | **793** | +13% |
+| 16 | 700 (`--parallel` capped at 8) | **868** (`--parallel 16`) | +24% |
+
+Batch-invariant mode now allows 16-token decode steps and `--parallel 16`: a token in a 12- or 16-token step gives bit for bit the logits of a step of its own (checked on CUDA and HIP). On Strix Halo, bound by memory bandwidth, the same build is within ±3% up to 8 requests and +5% at 16; steps of 12 tokens run 176 instead of 143 tok/s there.
+
+A draft model and prompt lookup keep 8-token steps: with a separate draft model, longer steps measured slower (a draft skipped for a step has to catch up later).
+
+## New models: Gemma 4 26B-A4B and Mistral's Tekken family (RTX 6000 Ada)
+
+Neither ran in rllm before, in any format. Both now run from a GGUF or straight from the Hugging Face checkpoint.
+
+```mermaid
+xychart-beta
+    title "Ada decode, new models (tok/s aggregate)"
+    x-axis ["Gemma 26B-A4B 1 req", "Gemma 26B-A4B 4 req", "Gemma 26B-A4B 8 req"]
+    y-axis "tok/s" 0 --> 550
+    bar [144.7, 361.2, 504.4]
+```
+
+| Model | Format | What was checked | Result |
+|---|---|---|---|
+| Gemma 4 26B-A4B (128 experts, top 8) | Q8_0 GGUF | logits against llama.cpp, 45 positions | KL mean 0.05 against llama.cpp's default; llama.cpp's own two modes differ more (0.16) |
+| Gemma 4 26B-A4B | BF16 checkpoint, `--quantize q8_0` | same prompt as the GGUF | same answer, logprobs within Q8 rounding |
+| Gemma 4 26B-A4B | Q8_0 GGUF | decode, 1 / 4 / 8 requests | 144.7 / 361.2 / 504.4 tok/s |
+| Gemma 4 26B-A4B | Q8_0 GGUF | own rounding noise (512- vs 16-token prefill chunks) | mean KL 0.20, against 0.003–0.004 for Qwen3.6-35B-A3B and Nemotron E4B; GPU model tests pass against this floor |
+| Mistral Nemo 12B (Tekken) | BF16 checkpoint and GGUF | served on CUDA | identical prompt, text and logprobs |
+| Tekken tokenizers (Nemo, Small 3, Ministral 8B) | tokenizer.json | ids against Hugging Face `tokenizers`, 10 texts | identical |
+
 ## Time to first token with hybrid checkpoints
 
 Qwen3.5/3.6 hybrids now keep recurrent-state checkpoints in the prefix cache, so a follow-up turn resumes instead of re-reading the whole conversation.
@@ -120,7 +183,7 @@ xychart-beta
 | Chunked Gated DeltaNet, pp512 (Strix Halo) | 1,431 | 1,256 | opt-in, `RLLM_GDN_CHUNKED=1` |
 | Chunked Gated DeltaNet, pp4096 (Ada) | 8,962 | 7,674 | opt-in |
 | K6 smaller MoE gate/up blocks, decode | 59.7 | 59.5 | no change, `RLLM_MOE_GLU_THREADS` |
-| K2 graphs for mixed steps | — | — | correct, but dormant until speculation goes past 8 tokens per step |
+| K2 graphs for mixed steps | — | — | in use since speculation goes past 8 tokens per step (see above) |
 
 ## Safetensors checkpoints, quantized as they load (Ada)
 

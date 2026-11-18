@@ -118,11 +118,11 @@ enum Cmd {
         #[arg(long)]
         no_mtp: bool,
         /// Make each request's output independent of what it is batched with:
-        /// every step is either up to 8 decode tokens (whose per-token results
+        /// every step is either up to 16 decode tokens (whose per-token results
         /// don't depend on the rest of the step) or a single request's prompt
         /// chunk, so concurrent requests produce exactly what they would alone
         /// (and greedy output with and without speculation matches under
-        /// load). Costs throughput under concurrent load; caps --parallel at 8
+        /// load). Costs throughput under concurrent load; caps --parallel at 16
         /// and turns the prefix cache off. On by default for Qwen3.5 hybrids
         /// (which have no prefix cache anyway).
         #[arg(long, conflicts_with = "no_batch_invariant")]
@@ -168,6 +168,12 @@ enum Cmd {
         /// decoding faster while prompts arrive, at their first token's cost).
         #[arg(long, default_value_t = 1)]
         decode_per_prefill: usize,
+        /// Most tokens in a step that verifies MTP drafts, across all
+        /// decoding requests (batch-invariant mode: at most 16); within it the
+        /// draft length is tuned by measurement. A draft model's and prompt
+        /// lookup's steps stay within 8.
+        #[arg(long, default_value_t = rllm_server::SPEC_STEP_TOKENS)]
+        spec_step_tokens: usize,
         /// End a generation still running this many seconds after it was
         /// submitted (finish reason `length`); 0: no limit.
         #[arg(long, default_value_t = 0)]
@@ -487,6 +493,7 @@ fn real_main() -> Result<()> {
             quiet,
             state_checkpoints,
             decode_per_prefill,
+            spec_step_tokens,
             quantize,
             request_timeout,
         } => {
@@ -521,6 +528,7 @@ fn real_main() -> Result<()> {
                 request_timeout_secs: request_timeout,
                 state_checkpoints,
                 decode_per_prefill,
+                spec_step_tokens,
                 quantize,
             };
             match Device::parse(&device)? {

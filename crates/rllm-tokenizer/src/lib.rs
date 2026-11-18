@@ -30,6 +30,8 @@ const PRE_QWEN2: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|
 const PRE_QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const PRE_LLAMA3: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const PRE_GEMMA4: &str = r"[^\n]+|[\n]+";
+/// Mistral's Tekken (Nemo, Small 3, Ministral): as in its tokenizer.json.
+const PRE_TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 // ggml token types
 const TOKEN_NORMAL: i64 = 1;
@@ -82,6 +84,7 @@ impl Tokenizer {
             ("gpt2", "qwen2") => Kind::Gpt2(PRE_QWEN2),
             ("gpt2", "qwen35") => Kind::Gpt2(PRE_QWEN35),
             ("gpt2", "llama-bpe") => Kind::Gpt2(PRE_LLAMA3),
+            ("gpt2", "tekken" | "pixtral") => Kind::Gpt2(PRE_TEKKEN),
             ("gemma4", _) => Kind::Gemma4,
             ("llama", _) => Kind::Spm,
             ("gpt2", other) => bail!("unsupported pre-tokenizer {other:?}"),
@@ -118,9 +121,9 @@ impl Tokenizer {
         let bpe = BPE::builder()
             .vocab_and_merges(vocab, merges)
             .byte_fallback(spm_style)
-            // Llama 3: a pre-token that is itself in the vocabulary is used
-            // whole (llama.cpp's ignore_merges for llama-bpe).
-            .ignore_merges(pre == "llama-bpe")
+            // Llama 3 and Tekken: a pre-token that is itself in the
+            // vocabulary is used whole (llama.cpp's ignore_merges).
+            .ignore_merges(matches!(pre, "llama-bpe" | "tekken" | "pixtral"))
             .build()
             .map_err(|e| anyhow!("BPE: {e}"))?;
 

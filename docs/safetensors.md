@@ -1,6 +1,6 @@
 # Safetensors support: design and plan
 
-Status (2026-11-17): **Qwen3, Qwen3.5/3.6 (dense, MoE, MTP), Clef, Llama 2/3, Mistral 7B, TinyLlama and Gemma 4 (dense) checkpoints load directly, optionally quantized as they load to Q8_0 or llama.cpp's Q4_K_M mix** (`rllm serve DIR --quantize q8_0|q4_k_m`, or `RLLM_QUANTIZE` for the other commands). `rllm serve`, `bench`, `perplexity` and `tune` take a checkpoint directory (or a `.safetensors` file next to its `config.json`) wherever they take a `.gguf`. This document is the plan for loading Hugging Face checkpoints (`config.json`, `*.safetensors`, `tokenizer.json`, `tokenizer_config.json`) directly, without converting them to GGUF first. It covers what is still to come: Gemma 4 MoE, and Mistral's Tekken tokenizer (Nemo and later), which rllm's tokenizer doesn't support.
+Status (2026-11-17): **Qwen3, Qwen3.5/3.6 (dense, MoE, MTP), Clef, Llama 2/3, Mistral (7B with SentencePiece; Nemo and Small 3 with Tekken), TinyLlama and Gemma 4 (dense and the 26B-A4B MoE) checkpoints load directly, optionally quantized as they load to Q8_0 or llama.cpp's Q4_K_M mix** (`rllm serve DIR --quantize q8_0|q4_k_m`, or `RLLM_QUANTIZE` for the other commands). `rllm serve`, `bench`, `perplexity` and `tune` take a checkpoint directory (or a `.safetensors` file next to its `config.json`) wherever they take a `.gguf`. This document is the plan for loading Hugging Face checkpoints (`config.json`, `*.safetensors`, `tokenizer.json`, `tokenizer_config.json`) directly, without converting them to GGUF first. What is still to come is listed under Plan.
 
 Each family is checked against llama.cpp's conversion of the same checkpoint with `crates/rllm-safetensors/tests/against_gguf.rs`. That test compares every tensor (dims, then bytes, or values within the reference's quantization) and every metadata key rllm reads. `examples/st_diff.rs` shows where they differ.
 
@@ -45,6 +45,15 @@ Each family is checked against llama.cpp's conversion of the same checkpoint wit
 - TinyLlama-1.1B-Chat-v1.0 (Llama 2's tokenizer) and mistralai/Mistral-7B-Instruct-v0.3 (32,768 pieces): every tensor identical and every key equal;
 - served on the CPU: the same prompt, text and logprobs as the GGUF for both.
 
+**google/gemma-4-26B-A4B-it (BF16, 128 experts, top 8, 8 KV heads on sliding-window layers and 2 on global ones, K equal to V on global layers)**, against ggml-org's Q8_0 GGUF:
+- every tensor within Q8 rounding and every key equal: the router (`router.proj`), its input scale (`ffn_gate_inp.scale`), the per-expert output scale (`ffn_down_exps.scale`), the fused `gate_up_proj` kept as `ffn_gate_up_exps`, and the three extra norms;
+- rllm runs it from either form (new: experts with GELU and a per-expert scale, KV heads per kind of layer). On CUDA, quantized to Q8_0 at load, it gives the same answer and 39-token prompt as the GGUF.
+- Against llama.cpp (`tools/llama-ref`, 29-token chat prompt and 16 generated tokens), rllm on CUDA is closer to llama.cpp's default numerics (KL mean 0.05, max 0.5) than llama.cpp's own default and exact-attention runs are to each other (KL mean 0.16, max 4.9), and every generated token agrees. The model is unusually sensitive to rounding: the same text prefilled in 512- and in 16-token chunks (two correct kernel paths) moves its predictions by mean KL 0.20 (Qwen3.6-35B-A3B and Nemotron E4B: 0.003-0.004). The GPU model tests now measure that noise floor and hold such a model to it; every new op also matches the CPU at the 26B's exact shapes (attention 16 heads over 8 and 2 KV heads, experts 128 × 704 on 2816).
+
+**Mistral Tekken** (Nemo, Small 3, Ministral): byte-level BPE whose pre-tokenizer regex is detected from `tokenizer.json` (`tekken`, or `llama-bpe` for Small 3, whose file uses Llama 3's split). rllm's tokenizer gained the Tekken split:
+- `tests/bpe_tokenizer.rs` wraps a tokenizer.json in a one-layer checkpoint and requires the same ids as Hugging Face's `tokenizers` on ten texts (case changes, digits, code, URLs, CJK, emoji, Arabic, whitespace runs): identical for Nemo, Small 3, Ministral 8B and Llama 3;
+- mistralai/Mistral-Nemo-Instruct-2407 against the GGUF llama.cpp's converter makes from it: every tensor identical and every key equal; served on CUDA, the same 22-token prompt, text and logprobs.
+
 **Cloudflare/clef (BF16, a 64-layer Qwen3.5 plus the decision head in `joint_head.safetensors`)**, against llama.cpp's `Clef-Q8_0.gguf`, on the Ada box:
 - every tensor within Q8 rounding and every key equal, including the head's 125M parameters and the generated `systemone` template (a port of llama.cpp's `ClefModel`): routing blocks first, `in_proj` split into q/k/v, the three learned scalars stored as `decision.scales` (exp, capped at 100, and a sigmoid);
 - served on CUDA with `--quantize q8_0` (ready in 52 s): the same 319-token prompt and the same decisions on the docs' example as the GGUF, probabilities within 0.02.
@@ -74,9 +83,9 @@ Checkpoint::open(dir)                       rllm-safetensors (done)
 | Family | Copying tensors (transforms) | Other work | Effort |
 |---|---|---|---|
 | **Qwen3** dense | none | metadata from config; GPT-2 BPE tokenizer keys; `tokenizer.ggml.pre` = `qwen2` | 2–3 days |
-| **Llama 2/3, Mistral 7B** (**done**) | none (see below); `rope_freqs` generated from `rope_scaling` (llama3) | **Q/K permutation:** the converter permutes Q/K and rllm undoes it on load for `llama`. On HF weights both steps must be skipped: a metadata flag (`rllm.qk_unpermuted`) that the loader honors. Mistral v0.1–v0.3 need SentencePiece scores from `tokenizer.model` (protobuf). Tekken (Nemo) isn't supported by rllm's tokenizer at all | 3–5 days |
+| **Llama 2/3, Mistral 7B** (**done**) | none (see below); `rope_freqs` generated from `rope_scaling` (llama3) | **Q/K permutation:** the converter permutes Q/K and rllm undoes it on load for `llama`. On HF weights both steps must be skipped: a metadata flag (`rllm.qk_unpermuted`) that the loader honors. Mistral v0.1–v0.3 need SentencePiece scores from `tokenizer.model` (protobuf); Tekken (Nemo and later) is byte-level BPE with its own split (done) | 3–5 days |
 | **Qwen3.5 / 3.6** dense, MoE, MTP (**done**) | value heads reordered from grouped to tiled in 7 tensors (`in_proj_qkv` value rows, `in_proj_z`, `in_proj_a/b`, `A_log`, `dt_bias`, conv1d value channels, `out_proj` columns); every RMSNorm +1 except `linear_attn.norm`; `A_log` → `ssm_a = -exp(A_log)`; conv1d squeezed to [C, K] as F32; experts stacked into `*_exps` (fused `gate_up_proj` maps directly) | MTP layer renamed to `blk.{n_layers}` (`fc` → `eh_proj`, `pre_fc_norm_*` → `enorm`/`hnorm`, `norm` → `shared_head_norm`), `block_count` includes it; `ffn_gate_inp_shexp` stored as [d] (real GGUFs load with rllm's strict [d] check) | 1–2 weeks |
-| **Gemma 4** (dense **done**; MoE to do) | `rope_freqs` = [1.0 × n_rot, 1e30 …] generated | `key_length` is the global head size and `key_length_swa` the local one; no norm +1 (unlike Gemma 1–3); token types from `all_special_ids` with 7 tool/channel tokens forced to USER_DEFINED; configs with array-valued `feed_forward_length` / `head_count_kv` are rejected (as their GGUFs are) | 1 week |
+| **Gemma 4** (dense and MoE **done**) | `rope_freqs` = [1.0 × n_rot, 1e30 …] generated | `key_length` is the global head size and `key_length_swa` the local one; no norm +1 (unlike Gemma 1–3); token types from `all_special_ids` with 7 tool/channel tokens forced to USER_DEFINED; configs with array-valued `feed_forward_length` / `head_count_kv` are rejected (as their GGUFs are) | 1 week |
 | **Clef** (**done**) | as Qwen3.5 (it is a Qwen3.5 core) plus the decision head's tensors | the systemone template from `tokenizer_config.json` | 2–3 days after Qwen3.5 |
 
 **Config defaults.** The converter reads `config.json` through transformers' `AutoConfig`, which fills defaults (`head_dim = hidden / heads`, `rope_theta`, `rms_norm_eps`, …). The Rust converter has to apply the same per-class defaults, listed in the spec's section 0.1 and each family's "Metadata" table.
@@ -107,10 +116,10 @@ A BF16 checkpoint takes about 2 bytes per parameter: 70 GB for Qwen3.6-35B-A3B, 
    - `rllm serve DIR`;
    - a parity test: greedy outputs and logits match the GGUF made by llama.cpp from the same checkpoint (BF16 → BF16 GGUF: identical bytes, so identical logits);
    - perplexity on wikitext-2 against the GGUF.
-2. **Done:** **Llama 2/3 and Mistral 7B**, with generated `rope_freqs` and SentencePiece vocabularies. The converter permutes Q/K as llama.cpp does, so no loader flag is needed. Tekken tokenizers (Mistral Nemo and later) aren't supported by rllm at all.
+2. **Done:** **Llama 2/3 and Mistral 7B**, with generated `rope_freqs` and SentencePiece vocabularies. The converter permutes Q/K as llama.cpp does, so no loader flag is needed. **Done:** Tekken tokenizers (Mistral Nemo, Small 3, Ministral).
 3. **Done:** **Q8_0 and Q4_K_M at load** (`--quantize q8_0|q4_k_m`), checked against `llama-quantize` byte for byte and by perplexity.
 4. **Done:** **Qwen3.5 / 3.6**: transforms, expert stacking, MTP, checked on the real Qwen3.6-35B-A3B.
-5. **Done:** **Clef and Gemma 4 dense.** Gemma 4 MoE (26B-A4B) needs MoE support in rllm's Gemma 4 loader first.
+5. **Done:** **Clef and Gemma 4**, dense and MoE (26B-A4B).
 6. **Integration:**
    - `ModelProfile`, `rllm tune` and the agent's model list read directories;
    - the agent fetches whole HF repos: the safetensors files plus the JSON files;

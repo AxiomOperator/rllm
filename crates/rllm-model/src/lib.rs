@@ -332,7 +332,7 @@ impl ModelProfile {
             "gemma4" => {
                 let c = Gemma4Config::from_gguf(g)?;
                 let (swa, global) = c.kv_layer_counts();
-                let kv = vec![one(swa.max(1), c.n_kv_heads, c.head_dim_swa), one(global.max(1), c.n_kv_heads, c.head_dim_global)];
+                let kv = vec![one(swa.max(1), c.n_kv_heads_swa, c.head_dim_swa), one(global.max(1), c.n_kv_heads_global, c.head_dim_global)];
                 Ok(Self { arch: "gemma4".into(), n_layers: c.n_layers, hidden: c.hidden, ffn: c.ffn, vocab: c.vocab, max_context: c.max_context, weight_bytes, repack_bytes, state_bytes_per_seq: 0, mtp: false, moe_bytes_per_token: 0, kv })
             }
             "qwen35" | "qwen35moe" | "clef" => {

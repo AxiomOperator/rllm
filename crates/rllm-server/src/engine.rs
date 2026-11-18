@@ -290,6 +290,9 @@ pub struct EngineConfig {
     /// waiting (1: alternate; more favors decoding requests' latency over
     /// new prompts' time to first token).
     pub decode_per_prefill: usize,
+    /// Most tokens in a step that verifies drafts (outside batch-invariant
+    /// mode, which keeps decode steps within INVARIANT_MAX_TOKENS).
+    pub spec_step_tokens: usize,
     /// Models with recurrent state: most prefix-cache checkpoints kept (each
     /// holds one extra state slot); 0 turns their prefix cache off.
     pub state_checkpoints: usize,
@@ -315,19 +318,86 @@ const ADMIT_MAX_PASSED: u32 = 8;
 /// checkpoint there would never match.
 const CHECKPOINT_TAIL: usize = 16;
 
-/// Most tokens in a decode step under `batch_invariant`: GPU steps up to 8
-/// tokens run each token through the same matvec kernels as a 1-token step.
-pub const INVARIANT_MAX_TOKENS: usize = 8;
+/// Most tokens in a decode step under `batch_invariant`: GPU steps up to 16
+/// tokens run each token through the same matvec kernels as a 1-token step
+/// (bit for bit, `verification_steps_match_single_steps`).
+pub const INVARIANT_MAX_TOKENS: usize = 16;
 
-/// Most tokens in a step that verifies drafts. Up to 8 tokens a step stays
-/// on the matvec kernels and in a CUDA graph; beyond that the main model's
-/// pass costs much more, so drafts are shortened to fit (and switched off
-/// once 5 sequences decode together).
-const SPEC_STEP_TOKENS: usize = 8;
+/// Default for `spec_step_tokens`: most tokens in a step that verifies
+/// drafts (steps up to 16 tokens stay on the matvec kernels). Within it,
+/// [`SpecTuner`] picks the draft length.
+pub const SPEC_STEP_TOKENS: usize = 16;
 /// After this many verifications in a row that accept no draft token, a
 /// sequence decodes without drafts for SPEC_PAUSE_STEPS steps.
 const SPEC_MAX_MISSES: u32 = 3;
 const SPEC_PAUSE_STEPS: u32 = 8;
+/// Picks the most drafts per sequence for a decode step: the cap with the
+/// most tokens per millisecond, measured. Each cell (decoding sequences,
+/// cap) keeps the tokens a step produced (each sequence's token plus its
+/// kept drafts) over its wall time, drafting included; sequences still
+/// shorten their own drafts after misses (`spec_k`), and the measurement
+/// includes that. Unmeasured caps are tried first (a cell's first sample is
+/// dropped: it pays for capturing the step's CUDA graph), and every
+/// EXPLORE_EVERY decode steps the caps are tried again in turn, so the
+/// table follows the context growing and the text changing.
+struct SpecTuner {
+    /// [decoding][cap]: (tokens per ms, samples).
+    rate: Vec<Vec<(f64, u32)>>,
+    steps: u64,
+}
+
+const EXPLORE_EVERY: u64 = 128;
+/// Samples (after the dropped first) before a cell is trusted.
+const COST_SAMPLES: u32 = 3;
+/// How much better (tokens per ms) a shorter cap must be to be chosen.
+const CAP_MARGIN: f64 = 0.05;
+
+impl SpecTuner {
+    fn new(max_seqs: usize, max_k: usize) -> Self {
+        Self { rate: vec![vec![(0.0, 0); max_k + 1]; max_seqs + 1], steps: 0 }
+    }
+
+    /// The cap for a step of `d` decoding sequences (at most `kmax`).
+    fn choose(&mut self, d: usize, kmax: usize) -> usize {
+        let Some(row) = self.rate.get(d).filter(|_| d > 0) else { return kmax };
+        let kmax = kmax.min(row.len() - 1);
+        if let Some(k) = (0..=kmax).find(|&k| row[k].1 < COST_SAMPLES + 1) {
+            return k;
+        }
+        self.steps += 1;
+        if self.steps.is_multiple_of(EXPLORE_EVERY) {
+            return ((self.steps / EXPLORE_EVERY) as usize) % (kmax + 1);
+        }
+        // The longest cap within CAP_MARGIN of the best: rates move with
+        // how predictable the text is, and longer drafts cost little when
+        // few sequences decode, so a shorter cap must be clearly better.
+        let best = (0..=kmax).map(|k| row[k].0).fold(0.0, f64::max);
+        (0..=kmax).rev().find(|&k| row[k].0 >= best * (1.0 - CAP_MARGIN)).unwrap_or(0)
+    }
+
+    /// A decode-only step of `d` sequences under cap `k` produced `tokens`
+    /// in `ms`.
+    fn record(&mut self, d: usize, k: usize, tokens: usize, ms: f64) {
+        let Some(c) = self.rate.get_mut(d).and_then(|r| r.get_mut(k)) else { return };
+        let r = tokens as f64 / ms.max(1e-3);
+        c.0 = match c.1 {
+            0 => 0.0,
+            1 => r,
+            _ => 0.8 * c.0 + 0.2 * r,
+        };
+        c.1 = c.1.saturating_add(1);
+        static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DEBUG.get_or_init(|| std::env::var_os("RLLM_SPEC_DEBUG").is_some()) && self.steps.is_multiple_of(100) {
+            for (d, row) in self.rate.iter().enumerate().filter(|(_, r)| r.iter().any(|c| c.1 > 0)) {
+                let cells: Vec<String> = row.iter().enumerate().filter(|(_, c)| c.1 > 0).map(|(k, c)| format!("k{k}={:.3}tok/ms(n{})", c.0, c.1)).collect();
+                eprintln!("[spec] d={d}: {}", cells.join(" "));
+            }
+        }
+    }
+}
+
+/// Most tokens in a step verifying a draft model's or prompt lookup's drafts.
+const DRAFT_STEP_TOKENS: usize = 8;
 /// The draft model drafts only for sequences up to this many tokens. Beyond
 /// it the draft's own attention and its catch-up over the prompt (it has no
 /// prefix cache) cost more than it saves: Qwen3-8B with a Qwen3-0.6B draft
@@ -440,19 +510,30 @@ where
                 let mtp_drafts = cfg.draft_tokens.clamp(1, MTP_MAX_DRAFTS);
                 // Snapshots for the drafts one step verifies: at most
                 // `decoding` sequences with spec_len's share each.
-                let snapshots = (1..=SPEC_STEP_TOKENS).map(|d| d * mtp_drafts.min((SPEC_STEP_TOKENS / d).saturating_sub(1))).max().unwrap_or(0);
+                let snapshots_for = |step: usize| (1..=step.min(cfg.parallel.max(1))).map(|d| d * mtp_drafts.min((step / d).saturating_sub(1))).max().unwrap_or(0);
+                let mut step = cfg.spec_step_tokens.max(1);
+                if cfg.batch_invariant {
+                    step = step.min(INVARIANT_MAX_TOKENS);
+                }
                 let mtp_drafts = match cfg.mtp && model.has_mtp() {
                     false => 0,
                     // Speculation only saves time: without room for its
-                    // snapshots, serve without it.
-                    true => match pool.enable_mtp(snapshots) {
-                        Ok(true) => mtp_drafts,
-                        Ok(false) => 0,
-                        Err(e) => {
-                            eprintln!("[rllm] MTP drafting disabled: {e:#} (its state snapshots don't fit; a smaller --kv-tokens or --parallel leaves room)");
-                            0
+                    // snapshots, try steps of 8 tokens, then serve without it.
+                    true => {
+                        let mut r = pool.enable_mtp(snapshots_for(step));
+                        if !matches!(r, Ok(true)) && step > 8 && snapshots_for(8) < snapshots_for(step) {
+                            step = 8;
+                            r = pool.enable_mtp(snapshots_for(step));
                         }
-                    },
+                        match r {
+                            Ok(true) => mtp_drafts,
+                            Ok(false) => 0,
+                            Err(e) => {
+                                eprintln!("[rllm] MTP drafting disabled: {e:#} (its state snapshots don't fit; a smaller --kv-tokens or --parallel leaves room)");
+                                0
+                            }
+                        }
+                    }
                 };
                 if cfg.host_cache_bytes > 0 {
                     pool.add_host_tier(cfg.host_cache_bytes, cfg.kv_type).context("allocating the host cache")?;
@@ -461,9 +542,9 @@ where
                     Some(d) => Some(KvPool::new(&backend, d, draft_pool_tokens(kv_tokens), BLOCK_SIZE, cfg.kv_type, cfg.parallel.max(1)).context("draft model KV cache")?),
                     None => None,
                 };
-                Ok((pool, draft, mtp_drafts))
+                Ok((pool, draft, mtp_drafts, step))
             })();
-            let (pool, draft, mtp_drafts) = match pools {
+            let (pool, draft, mtp_drafts, step) = match pools {
                 Ok(p) => p,
                 Err(e) => {
                     // Free the device memory before reporting: the caller
@@ -487,6 +568,8 @@ where
                 mtp_drafts,
             };
             let _ = ready_tx.send(Ok(info));
+            // The step budget MTP's snapshots were allocated for.
+            let cfg = EngineConfig { spec_step_tokens: step, ..cfg };
             Scheduler::new(pool, draft, mtp_drafts, &tok, &vocab, &cfg, &metrics, queued_engine).run(jobs_rx);
         })
         .context("spawn engine thread")?;
@@ -675,6 +758,8 @@ struct Scheduler<'a, 'm, B: Backend> {
     timing: StepTiming,
     /// `batch_invariant`: decode steps since the last prompt chunk.
     invariant_decodes: usize,
+    /// Draft lengths per step (when speculating).
+    tuner: SpecTuner,
     /// What admission last found nothing to admit with: (free blocks,
     /// running, waiting, cache entries). Unchanged, it isn't retried.
     admit_stuck: Option<(usize, usize, usize, usize)>,
@@ -741,6 +826,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             running: Vec::new(),
             admissions: 0,
             invariant_decodes: usize::MAX,
+            tuner: SpecTuner::new(cfg.parallel.max(1), cfg.draft_tokens.max(MTP_MAX_DRAFTS).max(1)),
             admit_stuck: None,
             timing: StepTiming { enabled: std::env::var_os("RLLM_ENGINE_TIMING").is_some(), ..StepTiming::default() },
         }
@@ -1046,14 +1132,32 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
     /// Draft tokens to propose for a sequence this step (0: none). Only
     /// for decoding sequences without a JSON constraint, within the
     /// remaining budget, and so that a step of `decoding` sequences stays
-    /// within SPEC_STEP_TOKENS.
-    fn spec_len(&self, s: &Seq, decoding: usize) -> usize {
-        let any = self.draft.is_some() || self.cfg.prompt_lookup || self.mtp_drafts > 0;
-        if !any || s.todo().len() != 1 || s.json.is_some() || s.spec_pause > 0 {
+    /// within `spec_step_tokens` (or INVARIANT_MAX_TOKENS), and at most
+    /// `k` (the step's length, from the tuner).
+    fn spec_len(&self, s: &Seq, decoding: usize, k: usize) -> usize {
+        if !self.speculates() || s.todo().len() != 1 || s.json.is_some() || s.spec_pause > 0 {
             return 0;
         }
-        let fit = (SPEC_STEP_TOKENS / decoding.max(1)).saturating_sub(1);
-        s.spec_k.min(fit).min((s.budget - s.generated).saturating_sub(1))
+        s.spec_k.min(self.spec_fit(decoding)).min(k).min((s.budget - s.generated).saturating_sub(1))
+    }
+
+    fn speculates(&self) -> bool {
+        self.draft.is_some() || self.cfg.prompt_lookup || self.mtp_drafts > 0
+    }
+
+    /// Most drafts per sequence that fit a step of `decoding` sequences.
+    /// A draft model and prompt lookup stay within DRAFT_STEP_TOKENS: a
+    /// draft model skipped for a step catches up later, and longer steps
+    /// measured slower with one (Qwen3-8B with a Qwen3-0.6B draft).
+    fn spec_fit(&self, decoding: usize) -> usize {
+        let mut step = self.cfg.spec_step_tokens.max(1);
+        if self.mtp_drafts == 0 {
+            step = step.min(DRAFT_STEP_TOKENS);
+        }
+        if self.cfg.batch_invariant {
+            step = step.min(INVARIANT_MAX_TOKENS);
+        }
+        (step / decoding.max(1)).saturating_sub(1).min(self.spec_max())
     }
 
     /// Most drafts per sequence and step.
@@ -1109,9 +1213,18 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         let mut takes: Vec<usize>;
         let mut spec: Vec<usize>;
         let mut drafts = true;
+        let decoding = self.running.iter().filter(|s| s.todo().len() == 1).count();
+        // MTP: the tuner picks the step's draft length; otherwise as many as fit.
+        let mut step_k = match (self.speculates(), self.mtp_drafts > 0) {
+            (false, _) => 0,
+            (true, true) => self.tuner.choose(decoding, self.spec_fit(decoding)),
+            (true, false) => usize::MAX,
+        };
         loop {
-            let decoding = self.running.iter().filter(|s| s.todo().len() == 1).count();
-            spec = self.running.iter().map(|s| if drafts { self.spec_len(s, decoding) } else { 0 }).collect();
+            if !drafts {
+                step_k = 0;
+            }
+            spec = self.running.iter().map(|s| if drafts { self.spec_len(s, decoding, step_k) } else { 0 }).collect();
             let mut budget = self.cfg.prefill_chunk.max(1);
             takes = self
                 .running
@@ -1161,6 +1274,12 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
             Metrics::add(&self.metrics.preemptions, 1);
             anyhow::ensure!(!self.running.is_empty(), "KV cache too small for one sequence");
         }
+        // A decode-only step: (sequences decoding, drafts each) for the tuner.
+        let step_k_used = {
+            let dec = self.running.iter().zip(&takes).filter(|(s, t)| s.todo().len() == 1 && **t > 0).count();
+            let prefill = self.running.iter().zip(&takes).any(|(s, t)| s.todo().len() > 1 && *t > 0);
+            (!prefill && dec > 0).then_some((dec, step_k))
+        };
         for (s, &t) in self.running.iter_mut().zip(&takes) {
             s.spec_pause = s.spec_pause.saturating_sub(1);
             if s.todo().len() > 1 {
@@ -1373,6 +1492,8 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         // Finished sequences: how, or None if they failed.
         let mut done: Vec<(usize, Option<Finish>)> = Vec::new();
         let spec_max = self.spec_max();
+        // Tokens this step produced (each sequence's, plus kept drafts).
+        let mut emitted = step_k_used.map_or(0, |(d, _)| d);
         let device_results = device_results.into_iter().map(|(i, n, kept)| (i, Some((n, kept))));
         for (i, r) in results.into_iter().chain(device_results) {
             let Some((next, kept)) = r else {
@@ -1384,6 +1505,7 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
                 // the draft cache keeps what it shares with them.
                 let c = if lookup[i] { &self.metrics.lookup_accepted } else { &self.metrics.draft_accepted };
                 Metrics::add(c, kept);
+                emitted += kept;
                 let keep = start_of[i] + 1 + kept;
                 let s = &mut self.running[i];
                 s.spec_k = (kept + 1).min(spec_max);
@@ -1411,6 +1533,10 @@ impl<'a, 'm, B: Backend> Scheduler<'a, 'm, B> {
         rllm_model::recycle_rows(out);
         self.timing.sample += t_sample.elapsed();
         self.timing.total += t_start.elapsed();
+        // Decode-only steps teach the tuner what each draft length costs.
+        if let Some((d, k)) = step_k_used.filter(|_| self.mtp_drafts > 0) {
+            self.tuner.record(d, k, emitted, t_start.elapsed().as_secs_f64() * 1e3);
+        }
         self.timing.report();
         // Remove from the back so indices stay valid.
         done.sort_by_key(|d| std::cmp::Reverse(d.0));

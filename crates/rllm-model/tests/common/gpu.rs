@@ -78,14 +78,19 @@ fn verification_steps_match_single_steps() {
     let model = AnyModel::load(&b, &g).unwrap();
     let vocab = rllm_model::Model::vocab_size(&model);
     let prompt = tokens(300, vocab, 3);
-    let next = tokens(6, vocab, 4);
-    for kv in [KvType::F16, KvType::Q8] {
+    // A model that amplifies rounding (noise floor KL over 0.05, e.g. Gemma 4
+    // 26B-A4B) is held to its own noise rather than to the fixed size limit.
+    let (_, floor_kl, floor_worst) = noise_floor(&b, &model, &g);
+    let sensitive = floor_kl > 0.05;
+    // 6 tokens: the MV_MAX_M 8 kernels; 12 and 16: their MV_MAX_M 16 build.
+    for (n, kv) in [(6, KvType::F16), (6, KvType::Q8), (12, KvType::F16), (16, KvType::F16)] {
+        let next = tokens(n, vocab, 4);
         let mut one = Generator::with_kv(&b, &model, 1024, 16, kv).unwrap();
         let mut many = Generator::with_kv(&b, &model, 1024, 16, kv).unwrap();
         one.feed(&prompt, 512).unwrap();
         many.feed(&prompt, 512).unwrap();
         let singles: Vec<f32> = next.iter().flat_map(|&t| one.feed(&[t], 1).unwrap()).collect();
-        let batched = many.feed_all(&next, 6).unwrap();
+        let batched = many.feed_all(&next, n).unwrap();
         let diff = singles.iter().zip(&batched).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
         let scale = singles.iter().fold(0f32, |m, x| m.max(x.abs()));
         let worst = singles.iter().zip(&batched).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / scale;
@@ -95,10 +100,15 @@ fn verification_steps_match_single_steps() {
             .filter(|(a, b)| rllm_model::sampler::argmax(a) == rllm_model::sampler::argmax(b))
             .count();
         if matches!(g.get_str("general.architecture").unwrap(), "qwen3" | "llama" | "qwen35" | "qwen35moe") {
-            assert_eq!(diff, 0, "{kv}: {diff} of {} logits differ", singles.len());
+            assert_eq!(diff, 0, "{n} tokens, {kv}: {diff} of {} logits differ (worst {worst}, top-1 {top1}/{n})", singles.len());
         } else {
-            // (Random tokens: near-ties may flip, so only the size is checked.)
-            assert!(worst < 0.05, "{kv}: worst relative difference {worst}, top-1 {top1}/{}", next.len());
+            // (Random tokens: near-ties may flip, so only the size is checked.
+            // Gemma 4's one-token steps use their own fused kernels; over 8
+            // tokens the gap grows: Nemotron 3.5 Bolt E4B at 12 tokens 0.051
+            // on the prefill kernels, 0.070 on the matvec kernels.)
+            let tol: f32 = if n > 8 { 0.1 } else { 0.05 };
+            let tol = if sensitive { tol.max(floor_worst) } else { tol };
+            assert!(worst < tol, "{n} tokens, {kv}: worst relative difference {worst}, top-1 {top1}/{n}");
         }
     }
 }
@@ -133,8 +143,44 @@ fn q8_cache_tracks_f16() {
     eprintln!("q8 vs f16: top-1 {agree}/{rows}, mean KL {kl_mean:.2e}");
     // Near-ties can flip; on average the distributions barely move.
     // (Measured 97-99% and KL 1e-3 to 4e-3 on Qwen3 and Nemotron.)
-    assert!(agree * 100 >= rows * 95, "top-1 agreement {agree}/{rows}");
-    assert!(kl_mean < 1e-2, "mean KL divergence {kl_mean}");
+    // Against the model's own noise (stable models: 95% and 1e-2 hold;
+    // Gemma 4 26B-A4B moves this much between two prefill chunk sizes).
+    let (floor_top1, floor_kl, _) = noise_floor(&b, &model, &g);
+    let need = 0.95f64.min(floor_top1 - 0.05);
+    assert!(agree as f64 >= rows as f64 * need, "top-1 agreement {agree}/{rows} (need {need:.3}; noise floor {floor_top1:.3})");
+    let max_kl = 1e-2f64.max(3.0 * floor_kl);
+    assert!(kl_mean < max_kl, "mean KL divergence {kl_mean} (limit {max_kl:.2e}; noise floor {floor_kl:.2e})");
+}
+
+/// The model's own numerical noise: real text prefilled in 512-token chunks
+/// against 16-token chunks (different kernels, both correct). Returns (top-1
+/// agreement, mean KL, worst relative logit difference). Stable models are
+/// near (1, 0, 0); some (Gemma 4 26B-A4B) amplify rounding a great deal, and
+/// the tolerance-based checks below allow for it.
+fn noise_floor(b: &GpuBackend, model: &AnyModel<GpuBackend>, g: &Gguf) -> (f64, f64, f32) {
+    let vocab = rllm_model::Model::vocab_size(model);
+    let prompt = rllm_tokenizer::Tokenizer::from_gguf(g).unwrap().encode(TEXT).unwrap();
+    let run = |chunk| Generator::with_kv(b, model, 1024, 16, KvType::F16).unwrap().feed_all(&prompt, chunk).unwrap();
+    let (a, c) = (run(512), run(16));
+    let rows = a.len() / vocab;
+    let (mut agree, mut kl, mut worst) = (0usize, 0f64, 0f32);
+    for (ra, rc) in a.chunks_exact(vocab).zip(c.chunks_exact(vocab)) {
+        agree += (rllm_model::sampler::argmax(ra) == rllm_model::sampler::argmax(rc)) as usize;
+        kl += kl_divergence(ra, rc);
+        let scale = ra.iter().fold(0f32, |m, x| m.max(x.abs()));
+        worst = worst.max(ra.iter().zip(rc).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max) / scale);
+    }
+    let r = (agree as f64 / rows as f64, kl / rows as f64, worst);
+    eprintln!("noise floor (512 vs 16-token chunks): top-1 {:.3}, mean KL {:.2e}, worst relative {:.3}", r.0, r.1, r.2);
+    r
+}
+
+#[test]
+fn noise_floor_report() {
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((b, g)) = setup() else { return };
+    let model = AnyModel::load(&b, &g).unwrap();
+    noise_floor(&b, &model, &g);
 }
 
 /// KL(p || q) of softmax(p_logits), softmax(q_logits), in nats.

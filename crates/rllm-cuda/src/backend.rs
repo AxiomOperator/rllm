@@ -11,7 +11,11 @@ use rllm_core::{Activation, AttnMeta, Backend, DType, Error, GdnShape, HostTenso
 
 const KERNELS: &str = include_str!("../kernels/kernels.cu");
 /// Must match MV_MAX_M in kernels.cu.
-const MATVEC_MAX_M: usize = 8;
+/// Most tokens in a step on the decode (matvec) path. Steps of up to
+/// MV_NARROW tokens use kernels.cu built with MV_MAX_M 8; longer ones (up
+/// to 16) the same kernels built with MV_MAX_M 16 (`name@16`).
+const MATVEC_MAX_M: usize = 16;
+const MV_NARROW: usize = 8;
 /// Per sequence: how many snapshots it writes and its first entry (zeros
 /// without snapshots); every sequence's entries must fit in `entries`.
 fn snap_index(runs: &SeqRuns, entries: usize) -> Result<(Vec<u32>, Vec<u32>)> {
@@ -260,9 +264,19 @@ struct KernelCode {
 /// several seconds. With `use_cache` false the cache is not read (but is
 /// still rewritten): for when a cached file failed to load.
 fn compile_kernels(arch: &str, use_cache: bool) -> Result<KernelCode> {
+    compile_source(KERNELS, arch, use_cache)
+}
+
+/// kernels.cu with MV_MAX_M 16: the matvec kernels for 9-16 token steps.
+fn wide_kernels() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("#define MV_MAX_M {MATVEC_MAX_M}\n{KERNELS}"))
+}
+
+fn compile_source(src: &str, arch: &str, use_cache: bool) -> Result<KernelCode> {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (KERNELS, arch, env!("CARGO_PKG_VERSION"), gpu::compiler_id()).hash(&mut h);
+    (src, arch, env!("CARGO_PKG_VERSION"), gpu::compiler_id()).hash(&mut h);
     let cache_dir = std::env::var_os("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".cache")))
@@ -274,7 +288,7 @@ fn compile_kernels(arch: &str, use_cache: bool) -> Result<KernelCode> {
     {
         return Ok(KernelCode { code, cached: true });
     }
-    let code = gpu::compile(KERNELS, arch).map_err(|e| Error::Backend(format!("kernel compile failed: {e}")))?;
+    let code = gpu::compile(src, arch).map_err(|e| Error::Backend(format!("kernel compile failed: {e}")))?;
     if let (Some(dir), Some(file)) = (cache_dir, cache_file) {
         // Best effort: write and fsync a temp file, then rename it into place,
         // so a crash never leaves a truncated file under the real name.
@@ -340,6 +354,8 @@ struct Flags {
     mmq: Option<bool>,
     mmq_min: usize,
     no_fused_quant: bool,
+    /// RLLM_NO_F16_COPY: F32 matrices aren't given an f16 copy (matvecs read f32).
+    no_f16_copy: bool,
     /// RLLM_MOE_GROUP=1: multi-token MoE decode grouped by expert (an
     /// expert chosen by several tokens streamed once). Off by default: on
     /// gfx1151 (Qwen3.6-35B-A3B) the sorting launches cost more than the
@@ -365,6 +381,7 @@ static FLAGS: std::sync::LazyLock<Flags> = std::sync::LazyLock::new(|| {
         },
         mmq_min: std::env::var("RLLM_MMQ_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(4 << 20),
         no_fused_quant: set("RLLM_NO_FUSED_QUANT"),
+        no_f16_copy: set("RLLM_NO_F16_COPY"),
         moe_group: set("RLLM_MOE_GROUP"),
         no_moe_tile32: set("RLLM_NO_MOE_TILE32"),
         no_glu_mmq: set("RLLM_NO_GLU_MMQ"),
@@ -400,6 +417,15 @@ macro_rules! launch {
             r
         }
     }};
+}
+
+/// The index-cache key of attention tiles of `tile_tokens` tokens: one per
+/// size, since one step may attend with several (Gemma 4 26B-A4B: 8 KV heads
+/// on sliding-window layers, 2 on global ones, so different head groups).
+fn attn_tiles_key(tile_tokens: usize) -> &'static str {
+    static KEYS: std::sync::OnceLock<Mutex<HashMap<usize, &'static str>>> = std::sync::OnceLock::new();
+    let mut keys = KEYS.get_or_init(Default::default).lock().unwrap();
+    keys.entry(tile_tokens).or_insert_with(|| Box::leak(format!("attn_tiles_{tile_tokens}").into_boxed_str()))
 }
 
 /// Opt-in per-kernel timing (`RLLM_PROFILE=1`). Records a CUDA event pair
@@ -733,7 +759,16 @@ impl CudaBackend {
     fn moe_ffn_impl(&self, x: &CudaBuf, logits: &CudaBuf, moe: &MoeFfn<CudaWeight>, shared: Option<(&CudaBuf, &CudaBuf)>, out: &mut CudaBuf, m: usize, fuse: Option<MoeFuse>) -> Result<()> {
         self.in_step(|| {
 
-            let MoeFfn { gate, up, down, n_expert: ne, n_used: k, n_ff, norm_topk, scale } = *moe;
+            let MoeFfn { gate, up, down, n_expert: ne, n_used: k, n_ff, norm_topk, scale, act, expert_scale } = *moe;
+            // The experts' activation: kernel name parts.
+            let (glu, act_name, act_mul) = match act {
+                Activation::Silu => ("", "silu", "silu_mul"),
+                Activation::GeluTanh => ("_gelu", "gelu", "gelu_mul"),
+            };
+            let escale = match expert_scale {
+                Some(w) => w.dense.as_ref().filter(|v| v.len() == ne).map(|v| v.device_ptr(&self.stream).0).ok_or_else(|| Error::Shape(format!("moe_ffn: expert scale must be {ne} f32 values")))?,
+                None => 0u64,
+            };
             let d = gate.cols;
             if k == 0 || k > ne.min(32) || ne > 1024 || gate.rows != ne * n_ff || up.rows != ne * n_ff || up.cols != d || down.rows != ne * d || down.cols != n_ff {
                 return Err(Error::Shape(format!(
@@ -777,7 +812,7 @@ impl CudaBackend {
             // Routing: one warp per token.
             let (ids, wts) = (self.alloc(np)?, self.alloc(np)?);
             let (norm, one) = (norm_topk as i32, 1i32);
-            launch!(self, "moe_route", grid_1d(m * WARP as usize, 128)?, [logits, &mi, &nei, &ki, &norm, &scale, &ids, &wts])?;
+            launch!(self, "moe_route", grid_1d(m * WARP as usize, 128)?, [logits, &mi, &nei, &ki, &norm, &scale, &escale, &ids, &wts])?;
             // Each projection runs on int8 activations (quantized experts) or
             // on f32 ones (float experts); the hidden rows feed the down
             // projection as int8 or f32 to match it.
@@ -832,7 +867,7 @@ impl CudaBackend {
                     // SAFETY: `counts` holds `ne` 4-byte values.
                     unsafe { gpu::memset_zero_async(counts.ptr, ne * 4, &self.stream) }.map_err(err)?;
                 }
-                let (npi, rows_per_tile) = (np as i32, MATVEC_MAX_M as i32);
+                let (npi, rows_per_tile) = (np as i32, Self::mv_rows(m) as i32);
                 launch!(self, "moe_count", grid_1d(np, 256)?, [&ids, &npi, &counts])?;
                 let scan = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (ne.next_power_of_two().max(32) as u32, 1, 1), shared_mem_bytes: 0 };
                 launch!(self, "moe_scan", scan, [&counts, &nei, &rows_per_tile, &offsets, &cursor, &tiles])?;
@@ -844,11 +879,11 @@ impl CudaBackend {
                 let (tg, tu) = (target(gate), target(up));
                 let cfg = LaunchConfig { grid_dim: ((n_ff / 32) as u32, max_tiles as u32, 1), block_dim: (MOE_GLU_THREADS, 1, 1), shared_mem_bytes: 0 };
                 let null_out = 0u64;
-                launch!(self, format!("moe_matvec_glu_grp_{}", gate.fmt.suffix()), cfg, [&tg, &tu, &tiles, &xg, &xdg, &di, &nffi, &qo, &null_out, &write_h])?;
+                launch!(self, self.mv(format!("moe_matvec_glu_grp{glu}_{}", gate.fmt.suffix()), m), cfg, [&tg, &tu, &tiles, &xg, &xdg, &di, &nffi, &qo, &null_out, &write_h])?;
                 let td = target(down);
                 let (hq_p, hd_p) = (ptr(&hq), ptr(&hd));
                 let dcfg = LaunchConfig { grid_dim: (d.div_ceil(MATVEC_WARPS as usize) as u32, max_tiles as u32, 1), block_dim: (MATVEC_WARPS * WARP, 1, 1), shared_mem_bytes: 0 };
-                launch!(self, format!("moe_matvec_grp_{}", down.fmt.suffix()), dcfg, [&td, &tiles, &hq_p, &hd_p, &nffi, &di, &y])?;
+                launch!(self, self.mv(format!("moe_matvec_grp_{}", down.fmt.suffix()), m), dcfg, [&td, &tiles, &hq_p, &hd_p, &nffi, &di, &y])?;
                 return self.moe_finish(&y, &wts, Some(&pos), shared, out, m, k, d, fuse);
             }
             if !grouped {
@@ -861,7 +896,7 @@ impl CudaBackend {
                     let hp = ptr(&h);
                     let threads = std::env::var("RLLM_MOE_GLU_THREADS").ok().and_then(|v| v.parse::<u32>().ok()).filter(|t| [256, 512, 1024].contains(t)).unwrap_or(MOE_GLU_THREADS);
                     let cfg = LaunchConfig { grid_dim: ((n_ff / 32) as u32, np as u32, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
-                    launch!(self, format!("moe_matvec_glu_{}", gate.fmt.suffix()), cfg, [&tg, &tu, &ids, &xq_p, &xd_p, &di, &nffi, &ki, &qo, &hp, &write_h])?;
+                    launch!(self, format!("moe_matvec_glu{glu}_{}", gate.fmt.suffix()), cfg, [&tg, &tu, &ids, &xq_p, &xd_p, &di, &nffi, &ki, &qo, &hp, &write_h])?;
                     h32 = h;
                 } else {
                     let (g, u) = (self.alloc(np * n_ff)?, self.alloc(np * n_ff)?);
@@ -873,7 +908,7 @@ impl CudaBackend {
                             launch!(self, format!("moe_matvec_f_{}", w.fmt.suffix()), float_cfg(n_ff), [&t, &ids, x, &di, &nffi, &ki, o])?;
                         }
                     }
-                    launch!(self, "silu_mul", grid_1d(np * n_ff, 256)?, [&g, &u, &len, &qo, &write_h])?;
+                    launch!(self, act_mul, grid_1d(np * n_ff, 256)?, [&g, &u, &len, &qo, &write_h])?;
                     h32 = Some(g);
                 }
                 let td = target(down);
@@ -918,7 +953,7 @@ impl CudaBackend {
                 let cfg = LaunchConfig { grid_dim: (max_tiles as u32, n_ff.div_ceil(MMQ_BM / 2) as u32, 1), ..grid(n_ff) };
                 launch!(
                     self,
-                    format!("{id}_glu_silu_{}", gate.fmt.suffix()),
+                    format!("{id}_glu_{act_name}_{}", gate.fmt.suffix()),
                     cfg,
                     [&gate.qs, gate.qh(), gate.sc(), &xq_p, &xd_p, &xs_p, &hp, &nffi, &di, &sq, &sh, &ss, &up.qs, up.qh(), up.sc(), &qo, &write_h, &tiles, &rowmap]
                 )?;
@@ -933,7 +968,7 @@ impl CudaBackend {
                         launch!(self, format!("moe_gemm_f_{}", w.fmt.suffix()), float_grid(n_ff), [&w.qs, &sq, x, &rowmap, o, &nffi, &di, &tiles])?;
                     }
                 }
-                launch!(self, "silu_mul", grid_1d(np * n_ff, 256)?, [&g, &u, &len, &qo, &write_h])?;
+                launch!(self, act_mul, grid_1d(np * n_ff, 256)?, [&g, &u, &len, &qo, &write_h])?;
                 h32 = Some(g);
             }
             let (sq, sh, ss) = down.strides();
@@ -1148,6 +1183,7 @@ impl CudaBackend {
             for k in [
                 "mmq", "mmq_glu_silu", "mmq_glu_gelu", "matvec_glu_silu", "matvec_glu_gelu", "matvec_glu_norm_silu", "matvec_glu_norm_gelu", "moe_matvec_glu", "moe_matvec",
                 "moe_matvec_glu_grp", "moe_matvec_grp", "mmq_id", "mmq_id_glu_silu", "mmq_id32", "mmq_id32_glu_silu",
+                "moe_matvec_glu_gelu", "moe_matvec_glu_grp_gelu", "mmq_id_glu_gelu", "mmq_id32_glu_gelu",
             ] {
                 names.push(format!("{k}_{}", fmt.suffix()));
             }
@@ -1176,10 +1212,41 @@ impl CudaBackend {
         if arch.wmma {
             names.extend(WA_HEAD_DIMS.iter().map(|hd| format!("attn_wmma_d{hd}")));
         }
-        let funcs = names
+        let mut funcs = names
             .into_iter()
             .map(|n| module.load_function(&n).map(|f| (n.clone(), f)).map_err(|e| Error::Backend(format!("{n}: {e:?}"))))
             .collect::<Result<HashMap<_, _>>>()?;
+        // The matvec kernels again, built for 9-16 token steps (`name@16`).
+        {
+            let wide = compile_source(wide_kernels(), &arch.compile, true)?;
+            let module = match gpu::load_module(&ctx, wide.code) {
+                Ok(m) => m,
+                Err(_) if wide.cached => gpu::load_module(&ctx, compile_source(wide_kernels(), &arch.compile, false)?.code).map_err(err)?,
+                Err(e) => return Err(err(e)),
+            };
+            let mut wide_names: Vec<String> = Vec::new();
+            for fmt in Fmt::ALL {
+                wide_names.push(format!("matvec_{}", fmt.suffix()));
+            }
+            for a in ["silu", "gelu"] {
+                for fmt in Fmt::QUANT {
+                    wide_names.push(format!("matvec_glu_{a}_{}", fmt.suffix()));
+                    wide_names.push(format!("matvec_glu_norm_{a}_{}", fmt.suffix()));
+                }
+                for f in ["f32", "f16", "bf16"] {
+                    wide_names.push(format!("matvec_glu_{a}_{f}"));
+                }
+            }
+            for fmt in Fmt::QUANT {
+                wide_names.push(format!("moe_matvec_glu_grp_{}", fmt.suffix()));
+                wide_names.push(format!("moe_matvec_glu_grp_gelu_{}", fmt.suffix()));
+                wide_names.push(format!("moe_matvec_grp_{}", fmt.suffix()));
+            }
+            for n in wide_names {
+                let f = module.load_function(&n).map_err(|e| Error::Backend(format!("{n}@16: {e:?}")))?;
+                funcs.insert(format!("{n}@16"), f);
+            }
+        }
         let attn_smem_fns: Vec<String> = ["attn_prefill".to_string(), "attn_prefill_tc".to_string()]
             .into_iter()
             .chain(ATTN_DECODE_SHAPES.iter().flat_map(|(g, hd)| [format!("attn_decode_g{g}_d{hd}"), format!("attn_decode_q8_g{g}_d{hd}")]))
@@ -1322,6 +1389,17 @@ impl CudaBackend {
 
     fn f(&self, name: &str) -> &gpu::Function {
         &self.funcs[name]
+    }
+
+    /// A matvec-family kernel for an `m`-token step: the MV_MAX_M 16 build
+    /// past MV_NARROW tokens.
+    fn mv(&self, name: String, m: usize) -> String {
+        if m > MV_NARROW { format!("{name}@16") } else { name }
+    }
+
+    /// Pairs per moe_scan tile: the MV_MAX_M of the build `mv` picks.
+    fn mv_rows(m: usize) -> usize {
+        if m > MV_NARROW { MATVEC_MAX_M } else { MV_NARROW }
     }
 
     /// Make sure `cache[key]` holds `data` on the device.
@@ -1759,7 +1837,7 @@ impl CudaBackend {
                 }
             };
             let (tg, tu) = (target(gate), target(up));
-            let name = format!("matvec_glu_{a}_{}", gate.fmt.suffix());
+            let name = self.mv(format!("matvec_glu_{a}_{}", gate.fmt.suffix()), m);
             let prof = if self.profile.enabled { format!("{name} {n}x{k}") } else { String::new() };
             let cfg = LaunchConfig { grid_dim: ((n / 32) as u32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 };
             let (ki, mi, wo) = (k as i32, m as i32, write_out as i32);
@@ -2036,7 +2114,7 @@ impl Backend for CudaBackend {
             // be released from the page cache (`Gguf::release`).
             let qs = self.stream.clone_htod(&t.bytes.as_slice().to_vec()).map_err(err)?;
             const F16_COPY_MAX: usize = 16 << 20;
-            let f16_copy = if fmt == Fmt::F32 && t.shape.len() == 2 && rows * cols <= F16_COPY_MAX {
+            let f16_copy = if fmt == Fmt::F32 && t.shape.len() == 2 && rows * cols <= F16_COPY_MAX && !FLAGS.no_f16_copy {
                 let mut h = self.stream.alloc_zeros::<u16>(rows * cols).map_err(err)?;
                 let (n_i, k_i) = (rows as i32, cols as i32);
                 let (sq, sh, ss) = Fmt::F32.strides(cols);
@@ -2363,7 +2441,7 @@ impl Backend for CudaBackend {
                     };
                     blocks += w.rows.div_ceil(rows_per_block);
                 }
-                let name = format!("matvec_{}", fmt.suffix());
+                let name = self.mv(format!("matvec_{}", fmt.suffix()), m);
                 let prof = if self.profile.enabled {
                     let rows: Vec<String> = group.iter().map(|&wi| ws[wi].rows.to_string()).collect();
                     format!("{name} {}x{k}", rows.join("+"))
@@ -2441,7 +2519,7 @@ impl Backend for CudaBackend {
                     };
                     blocks += w.rows.div_ceil(rows_per_block);
                 }
-                let name = format!("matvec_{}", fmt.suffix());
+                let name = self.mv(format!("matvec_{}", fmt.suffix()), m);
                 let prof = if self.profile.enabled {
                     let rows: Vec<String> = group.iter().map(|&wi| ws[wi].rows.to_string()).collect();
                     format!("{name} {}x{k}", rows.join("+"))
@@ -2499,7 +2577,7 @@ impl Backend for CudaBackend {
                     Activation::Silu => "silu",
                     Activation::GeluTanh => "gelu",
                 };
-                let name = format!("matvec_glu_{a}_{}", gate.fmt.suffix());
+                let name = self.mv(format!("matvec_glu_{a}_{}", gate.fmt.suffix()), m);
                 let prof = if self.profile.enabled { format!("{name} {n}x{k}") } else { String::new() };
                 // Rows split over warps as in matvec_many's float path.
                 let kw = if (gpu::MATVEC_SPLIT_K || n < self.n_sms * 8) && k >= 1024 { MATVEC_WARPS as usize } else { 1 };
@@ -2886,7 +2964,7 @@ impl Backend for CudaBackend {
                     Activation::Silu => "silu",
                     Activation::GeluTanh => "gelu",
                 };
-                let name = format!("matvec_glu_norm_{a}_{}", gate.fmt.suffix());
+                let name = self.mv(format!("matvec_glu_norm_{a}_{}", gate.fmt.suffix()), rows);
                 let prof = if self.profile.enabled { format!("{name} {n_ffn}x{width}") } else { String::new() };
                 let cfg = LaunchConfig { grid_dim: ((n_ffn / 32) as u32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 };
                 let di = width as i32;
@@ -3364,7 +3442,8 @@ impl Backend for CudaBackend {
                 if group <= rows && smem <= self.max_smem {
                     let tile_tokens = rows / group;
                     let tiles = build_tiles(tile_tokens);
-                    self.sync_index(&mut cache, "attn_tiles", &tiles)?;
+                    let tiles_key = attn_tiles_key(tile_tokens);
+                    self.sync_index(&mut cache, tiles_key, &tiles)?;
                     let cfg = LaunchConfig {
                         grid_dim: ((tiles.len() / 2) as u32, meta.n_kv_heads as u32, 1),
                         block_dim: ((rg * dw) as u32 * WARP, 1, 1),
@@ -3374,7 +3453,7 @@ impl Backend for CudaBackend {
                     let (kc, vc) = (pkc, pvc);
                     let name = format!("attn_fa_d{hdim}");
                     let (pos, seq, tab, til) =
-                        (&cache["positions"].dev, &cache["token_seq"].dev, &cache[tab_key].dev, &cache["attn_tiles"].dev);
+                        (&cache["positions"].dev, &cache["token_seq"].dev, &cache[tab_key].dev, &cache[tiles_key].dev);
                     // int8 copy of the output for the output projection (when a
                     // quantized consumer will use it; see fuse_quant_useful). The
                     // epilogue work only pays off on big GPUs: measured +2% Nemotron
@@ -3394,9 +3473,10 @@ impl Backend for CudaBackend {
                 if smem <= self.max_smem {
                     let tile_tokens = wa_rows / group;
                     let tiles = build_tiles(tile_tokens);
-                    self.sync_index(&mut cache, "attn_tiles", &tiles)?;
+                    let tiles_key = attn_tiles_key(tile_tokens);
+                    self.sync_index(&mut cache, tiles_key, &tiles)?;
                     let (pos, seq, tab, til) =
-                        (&cache["positions"].dev, &cache["token_seq"].dev, &cache[tab_key].dev, &cache["attn_tiles"].dev);
+                        (&cache["positions"].dev, &cache["token_seq"].dev, &cache[tab_key].dev, &cache[tiles_key].dev);
                     let cfg = LaunchConfig {
                         grid_dim: ((tiles.len() / 2) as u32, meta.n_kv_heads as u32, 1),
                         block_dim: (8 * WARP, 1, 1),
@@ -3426,9 +3506,10 @@ impl Backend for CudaBackend {
                 let smem = smem_for(row_groups);
                 if smem <= self.max_smem {
                     let tiles = build_tiles(tile_tokens);
-                    self.sync_index(&mut cache, "attn_tiles", &tiles)?;
+                    let tiles_key = attn_tiles_key(tile_tokens);
+                    self.sync_index(&mut cache, tiles_key, &tiles)?;
                     let (pos, seq, tab, til) =
-                        (&cache["positions"].dev, &cache["token_seq"].dev, &cache[tab_key].dev, &cache["attn_tiles"].dev);
+                        (&cache["positions"].dev, &cache["token_seq"].dev, &cache[tab_key].dev, &cache[tiles_key].dev);
                     let cfg = LaunchConfig {
                         grid_dim: ((tiles.len() / 2) as u32, meta.n_kv_heads as u32, 1),
                         block_dim: ((row_groups * dw) as u32 * WARP, 1, 1),
@@ -3452,9 +3533,10 @@ impl Backend for CudaBackend {
                 }
                 if smem_for(bk) <= self.max_smem {
                     let tiles = build_tiles(tile_tokens);
-                    self.sync_index(&mut cache, "attn_tiles", &tiles)?;
+                    let tiles_key = attn_tiles_key(tile_tokens);
+                    self.sync_index(&mut cache, tiles_key, &tiles)?;
                     let (pos, seq, tab, til) =
-                        (&cache["positions"].dev, &cache["token_seq"].dev, &cache[tab_key].dev, &cache["attn_tiles"].dev);
+                        (&cache["positions"].dev, &cache["token_seq"].dev, &cache[tab_key].dev, &cache[tiles_key].dev);
                     let cfg = LaunchConfig {
                         grid_dim: ((tiles.len() / 2) as u32, meta.n_kv_heads as u32, 1),
                         block_dim: (rows as u32 * WARP, 1, 1),

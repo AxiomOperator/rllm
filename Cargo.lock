@@ -1049,8 +1049,10 @@ dependencies = [
  "rayon",
  "rllm-core",
  "rllm-gguf",
+ "rllm-tokenizer",
  "serde_json",
  "thiserror",
+ "tokenizers",
 ]
 
 [[package]]

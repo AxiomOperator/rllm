@@ -142,8 +142,9 @@ fn matmul_all_dtypes_both_paths() {
     for dtype in [DType::F32, DType::F16, DType::BF16, DType::Q8_0, DType::Q3K, DType::Q4K, DType::Q6K, DType::Q5K, DType::IQ4XS] {
         let w = random_weight(&mut rng, dtype, n, k);
         let (wc, wg) = (cpu.upload(&w).unwrap(), gpu.upload(&w).unwrap());
-        // m <= 8 uses the matvec kernel, larger m the f16 cuBLAS path.
-        for m in [1, 3, 8, 9, 33] {
+        // m <= 16 uses the matvec kernels (9-16: their MV_MAX_M 16 build),
+        // larger m the prefill path.
+        for m in [1, 3, 8, 9, 12, 16, 17, 33] {
             let x = rng.vec(m * k);
             let (xc, xg) = (upload(&cpu, &x), upload(&gpu, &x));
             let (mut oc, mut og) = (cpu.alloc(m * n).unwrap(), gpu.alloc(m * n).unwrap());
@@ -324,6 +325,49 @@ fn attention_case(head_dim: usize, window: usize, step: Step, kv: KvType) {
 
 /// Query-head groups beyond 4 (Qwen3.5-27B: 6) have decode kernels too.
 #[test]
+fn moe_ffn_gemma4_26b_shapes() {
+    // Gemma 4 26B-A4B's experts: 128 of width 704 (top 8) on a 2816-wide
+    // hidden state, Q8_0, GELU and a per-expert scale.
+    let Some(gpu) = gpu_backend() else { return };
+    let cpu = CpuBackend::new();
+    let mut rng = Rng(0x2616_a4b0);
+    let (ne, f, d) = (128, 704, 2816);
+    let es: Vec<f32> = (0..ne).map(|e| 0.5 + e as f32 / ne as f32).collect();
+    let (esc, esg) = (cpu.upload(&f32_tensor("es", &es)).unwrap(), gpu.upload(&f32_tensor("es", &es)).unwrap());
+    let (gate, up, down) = (random_weight(&mut rng, DType::Q8_0, ne * f, d), random_weight(&mut rng, DType::Q8_0, ne * f, d), random_weight(&mut rng, DType::Q8_0, ne * d, f));
+    let wc = [&gate, &up, &down].map(|w| cpu.upload(w).unwrap());
+    let wg = [&gate, &up, &down].map(|w| gpu.upload(w).unwrap());
+    fn moe<'a, W>(w: &'a [W; 3], s: &'a W) -> rllm_core::MoeFfn<'a, W> {
+        rllm_core::MoeFfn { gate: &w[0], up: &w[1], down: &w[2], n_expert: 128, n_used: 8, n_ff: 704, norm_topk: true, scale: 1.0, act: rllm_core::Activation::GeluTanh, expert_scale: Some(s) }
+    }
+    let (mc, mg) = (moe(&wc, &esc), moe(&wg, &esg));
+    for m in [1, 3, 12, 40, 200] {
+        let x = rng.vec(m * d);
+        let logits: Vec<f32> = rng.vec(m * ne).iter().map(|v| 4.0 * v).collect();
+        let want = {
+            let (xc, lc, mut out) = (upload(&cpu, &x), upload_any(&cpu, &logits), cpu.alloc(m * d).unwrap());
+            cpu.moe_ffn(&xc, &lc, &mc, None, &mut out, m).unwrap();
+            download(&cpu, &out, m * d)
+        };
+        let (xg, lg, mut out) = (upload(&gpu, &x), upload_any(&gpu, &logits), gpu.alloc(m * d).unwrap());
+        gpu.moe_ffn(&xg, &lg, &mg, None, &mut out, m).unwrap();
+        assert_close(&format!("moe_ffn 26B shapes m={m}"), &want, &download(&gpu, &out, m * d), 5e-2);
+    }
+}
+
+#[test]
+fn paged_attention_gemma4_26b_shapes() {
+    // Gemma 4 26B-A4B: sliding-window layers 16 heads over 8 KV heads of 256
+    // (window 1024), global layers 16 over 2 of 512.
+    for kv in [KvType::F16, KvType::Q8] {
+        for step in [Step::Decode, Step::Mixed, Step::Long] {
+            attention_case_heads(256, 1024, step, kv, 16, 8);
+            attention_case_heads(512, 0, step, kv, 16, 2);
+        }
+    }
+}
+
+#[test]
 fn paged_attention_wide_groups() {
     for (heads, hd) in [(12, 256), (12, 128), (16, 128), (16, 256)] {
         for kv in [KvType::F16, KvType::Q8] {
@@ -485,9 +529,9 @@ fn gated_ffn_fused_prefill_and_decode() {
     let cpu = CpuBackend::new();
     let mut rng = Rng(0x0bad_cafe);
     let (d, f) = (2048, 2048);
-    // m = 1 and 3 take the decode form (matvec_glu, then the down matvec reads
-    // its int8 output).
-    for (dtype, m) in [DType::Q8_0, DType::Q3K, DType::Q4K, DType::Q6K, DType::Q5K, DType::IQ4XS].into_iter().flat_map(|t| [(t, 70), (t, 1), (t, 3)]) {
+    // m = 1, 3 and 12 take the decode form (matvec_glu, then the down matvec
+    // reads its int8 output; 12: the MV_MAX_M 16 build).
+    for (dtype, m) in [DType::Q8_0, DType::Q3K, DType::Q4K, DType::Q6K, DType::Q5K, DType::IQ4XS].into_iter().flat_map(|t| [(t, 70), (t, 1), (t, 3), (t, 12)]) {
         let (gate, up, down) = (random_weight(&mut rng, dtype, f, d), random_weight(&mut rng, dtype, f, d), random_weight(&mut rng, dtype, d, f));
         let wc = [&gate, &up, &down].map(|w| cpu.upload(w).unwrap());
         let wg = [&gate, &up, &down].map(|w| gpu.upload(w).unwrap());
@@ -530,7 +574,7 @@ fn matvec_float_split_k() {
     for dtype in [DType::F32, DType::F16, DType::BF16] {
         let w = random_weight(&mut rng, dtype, n, k);
         let (wc, wg) = (cpu.upload(&w).unwrap(), gpu.upload(&w).unwrap());
-        for m in [1, 2, 8] {
+        for m in [1, 2, 8, 12, 16] {
             let x = rng.vec(m * k);
             let (xc, xg) = (upload(&cpu, &x), upload(&gpu, &x));
             let (mut oc, mut og) = (cpu.alloc(m * n).unwrap(), gpu.alloc(m * n).unwrap());
@@ -580,7 +624,7 @@ fn gated_ffn_float_decode_fused() {
         let (gate, up, down) = (random_weight(&mut rng, dtype, f, d), random_weight(&mut rng, dtype, f, d), random_weight(&mut rng, dtype, d, f));
         let wc = [&gate, &up, &down].map(|w| cpu.upload(w).unwrap());
         let wg = [&gate, &up, &down].map(|w| gpu.upload(w).unwrap());
-        for m in [1, 3] {
+        for m in [1, 3, 12] {
             let x = rng.vec(m * d);
             let (xc, xg) = (upload(&cpu, &x), upload(&gpu, &x));
             for act in [rllm_core::Activation::Silu, rllm_core::Activation::GeluTanh] {
@@ -610,7 +654,7 @@ fn norm_add_gated_ffn_matches() {
         let (n1, n2) = (norm(&mut rng, "n1"), norm(&mut rng, "n2"));
         let wc = [&gate, &up, &down, &n1, &n2].map(|w| cpu.upload(w).unwrap());
         let wg = [&gate, &up, &down, &n1, &n2].map(|w| gpu.upload(w).unwrap());
-        for rows in [1, 70] {
+        for rows in [1, 12, 70] {
             let (src, x) = (rng.vec(rows * d), rng.vec(rows * d));
             let act = rllm_core::Activation::GeluTanh;
             let run_cpu = || {
@@ -871,10 +915,10 @@ fn moe_ffn_matches() {
         let wc = [&gate, &up, &down].map(|w| cpu.upload(w).unwrap());
         let wg = [&gate, &up, &down].map(|w| gpu.upload(w).unwrap());
         fn moe<W>(w: &[W; 3], ne: usize, k: usize, f: usize) -> rllm_core::MoeFfn<'_, W> {
-            rllm_core::MoeFfn { gate: &w[0], up: &w[1], down: &w[2], n_expert: ne, n_used: k, n_ff: f, norm_topk: true, scale: 1.0 }
+            rllm_core::MoeFfn { gate: &w[0], up: &w[1], down: &w[2], n_expert: ne, n_used: k, n_ff: f, norm_topk: true, scale: 1.0, act: rllm_core::Activation::Silu, expert_scale: None }
         }
         let (mc, mg) = (moe(&wc, ne, k, f), moe(&wg, ne, k, f));
-        for (m, with_shared) in [(1, false), (3, true), (8, false), (9, true), (70, false), (70, true)] {
+        for (m, with_shared) in [(1, false), (3, true), (8, false), (9, true), (12, false), (16, true), (17, false), (70, false), (70, true)] {
             let x = rng.vec(m * d);
             let logits: Vec<f32> = rng.vec(m * ne).iter().map(|v| 4.0 * v).collect();
             let (sy, sg) = (rng.vec(m * d), rng.vec(m).iter().map(|v| 4.0 * v).collect::<Vec<_>>());
@@ -916,6 +960,30 @@ fn moe_ffn_matches() {
                 let one = run_gpu(&r(&x, d), &r(&logits, ne), &r(&sy, d), &r(&sg, 1), 1);
                 assert!(one == got[t * d..(t + 1) * d], "moe_ffn {fg}/{fu}/{fd}: token {t} of {m} differs from a 1-token step");
             }
+        }
+    }
+    // Gemma 4's experts: GELU, and a per-expert output scale.
+    let es: Vec<f32> = (0..ne).map(|e| 0.5 + e as f32 / ne as f32).collect();
+    let (esc, esg) = (cpu.upload(&f32_tensor("es", &es)).unwrap(), gpu.upload(&f32_tensor("es", &es)).unwrap());
+    for (fg, fu, fd) in [(DType::Q8_0, DType::Q8_0, DType::Q8_0), (DType::Q4K, DType::Q4K, DType::Q6K), (DType::BF16, DType::BF16, DType::BF16)] {
+        let (gate, up, down) = (random_weight(&mut rng, fg, ne * f, d), random_weight(&mut rng, fu, ne * f, d), random_weight(&mut rng, fd, ne * d, f));
+        let wc = [&gate, &up, &down].map(|w| cpu.upload(w).unwrap());
+        let wg = [&gate, &up, &down].map(|w| gpu.upload(w).unwrap());
+        fn gelu<'a, W>(w: &'a [W; 3], s: &'a W, ne: usize, k: usize, f: usize) -> rllm_core::MoeFfn<'a, W> {
+            rllm_core::MoeFfn { gate: &w[0], up: &w[1], down: &w[2], n_expert: ne, n_used: k, n_ff: f, norm_topk: true, scale: 1.0, act: rllm_core::Activation::GeluTanh, expert_scale: Some(s) }
+        }
+        let (mc, mg) = (gelu(&wc, &esc, ne, k, f), gelu(&wg, &esg, ne, k, f));
+        for m in [1, 3, 12, 70] {
+            let x = rng.vec(m * d);
+            let logits: Vec<f32> = rng.vec(m * ne).iter().map(|v| 4.0 * v).collect();
+            let want = {
+                let (xc, lc, mut out) = (upload(&cpu, &x), upload_any(&cpu, &logits), cpu.alloc(m * d).unwrap());
+                cpu.moe_ffn(&xc, &lc, &mc, None, &mut out, m).unwrap();
+                download(&cpu, &out, m * d)
+            };
+            let (xg, lg, mut out) = (upload(&gpu, &x), upload_any(&gpu, &logits), gpu.alloc(m * d).unwrap());
+            gpu.moe_ffn(&xg, &lg, &mg, None, &mut out, m).unwrap();
+            assert_close(&format!("moe_ffn gelu+scale {fg}/{fu}/{fd} m={m}"), &want, &download(&gpu, &out, m * d), 5e-2);
         }
     }
 }

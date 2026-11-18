@@ -477,7 +477,12 @@ __device__ __forceinline__ int q6_to_s8x4(int q) {
 // ---------------------------------------------------------------------------
 // Matrix-vector product for small batches: out[m, n] = x[m, k] . W[n, k]^T
 // One warp per output row; weights are read once for all m (<= MV_MAX_M) rows.
+// 8 for steps of up to 8 tokens; the backend also builds this file with
+// MV_MAX_M 16 for steps of 9-16 tokens (wider accumulators cost 1-token
+// decode a few percent, so the narrow build stays the common path).
+#ifndef MV_MAX_M
 #define MV_MAX_M 8
+#endif
 
 // Unrolling the unit loops keeps more weight loads in flight on RDNA (+1%
 // decode); on NVIDIA it cost registers (-6% Qwen3-8B decode on sm_89).
@@ -867,7 +872,7 @@ INSTANTIATE_QUANT(iq4, FMT_IQ4)
 // if norm, times scale. As rllm_core::moe_route.
 #define MOE_MAX_EXPERTS 1024
 extern "C" __global__ void moe_route(const float* __restrict__ logits, int m, int ne, int k, int norm, float scale,
-                                     int* __restrict__ ids, float* __restrict__ wts) {
+                                     const float* __restrict__ escale, int* __restrict__ ids, float* __restrict__ wts) {
     const int t = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
     if (t >= m) return;  // whole warps
     const float* l = logits + (long)t * ne;
@@ -911,14 +916,22 @@ extern "C" __global__ void moe_route(const float* __restrict__ logits, int m, in
     const float div = norm ? fmaxf(total, 6.103515625e-5f) : 1.f;
     if (lane < k) {
         ids[(long)t * k + lane] = my_id;
-        wts[(long)t * k + lane] = my_w / div * scale;
+        // escale: a per-expert output scale (Gemma 4), or null.
+        wts[(long)t * k + lane] = my_w / div * scale * (escale ? escale[my_id] : 1.f);
     }
 }
 
-// Expert gate/up + SiLU for decode: block (32-row unit, pair). Writes
-// silu(x . gate_r) * (x . up_r) for the unit's rows as pair p's hidden row
+__device__ __forceinline__ float gelu_tanh(float x);
+// The gated activation of an expert row: ACT 0 SiLU, 1 GELU (tanh).
+template <int ACT>
+__device__ __forceinline__ float moe_act(float g) {
+    return ACT == 0 ? g / (1.f + __expf(-g)) : gelu_tanh(g);
+}
+
+// Expert gate/up + activation for decode: block (32-row unit, pair). Writes
+// act(x . gate_r) * (x . up_r) for the unit's rows as pair p's hidden row
 // (f32 if write_out, and int8 for the down projection).
-template <int F>
+template <int F, int ACT>
 __device__ void moe_matvec_glu(const MvTarget& g, const MvTarget& u, const int* __restrict__ ids,
                                const i8* __restrict__ xq, const float* __restrict__ xd, int k, int n_ff, int in_div,
                                QOut qo, float* __restrict__ out, int write_out) {
@@ -939,7 +952,7 @@ __device__ void moe_matvec_glu(const MvTarget& g, const MvTarget& u, const int* 
         mv_dot<F>(g.qs + r * g.qs_row, g.qh + r * g.qh_row, g.sc + r * g.sc_row, xr, dr, k, 1, lane, WARP_SIZE, ag);
         mv_dot<F>(u.qs + r * u.qs_row, u.qh + r * u.qh_row, u.sc + r * u.sc_row, xr, dr, k, 1, lane, WARP_SIZE, au);
         const float gs = warp_sum(ag[0]), us = warp_sum(au[0]);
-        if (lane == 0) v[rw] = gs / (1.f + __expf(-gs)) * us;
+        if (lane == 0) v[rw] = moe_act<ACT>(gs) * us;
     }
     __syncthreads();
     if (warp == 0) {
@@ -967,7 +980,7 @@ __device__ void moe_matvec(const MvTarget& w, const int* __restrict__ ids, const
 // tile's pairs. Each row's sums run as in moe_matvec_glu (per row, in the
 // same order), so the results are the same; hidden rows go to the sorted
 // position.
-template <int F>
+template <int F, int ACT>
 __device__ void moe_matvec_glu_grp(const MvTarget& g, const MvTarget& u, const int* __restrict__ tiles, const i8* __restrict__ xg,
                                    const float* __restrict__ xdg, int k, int n_ff, QOut qo, float* __restrict__ out, int write_out) {
     __shared__ float v[MV_MAX_M][WARP_SIZE];
@@ -990,7 +1003,7 @@ __device__ void moe_matvec_glu_grp(const MvTarget& g, const MvTarget& u, const i
         for (int j = 0; j < MV_MAX_M; j++)
             if (j < m) {
                 const float gs = warp_sum(ag[j]), us = warp_sum(au[j]);
-                if (lane == 0) v[j][rw] = gs / (1.f + __expf(-gs)) * us;
+                if (lane == 0) v[j][rw] = moe_act<ACT>(gs) * us;
             }
     }
     __syncthreads();
@@ -1030,7 +1043,12 @@ extern "C" __global__ void gather_q8_rows(const i8* __restrict__ xq, const float
     extern "C" __global__ void __launch_bounds__(1024)                                                        \
         moe_matvec_glu_##NAME(MvTarget g, MvTarget u, const int* ids, const i8* xq, const float* xd, int k,   \
                               int n_ff, int in_div, QOut qo, float* out, int write_out) {                     \
-        moe_matvec_glu<F>(g, u, ids, xq, xd, k, n_ff, in_div, qo, out, write_out);                            \
+        moe_matvec_glu<F, 0>(g, u, ids, xq, xd, k, n_ff, in_div, qo, out, write_out);                         \
+    }                                                                                                         \
+    extern "C" __global__ void __launch_bounds__(1024)                                                        \
+        moe_matvec_glu_gelu_##NAME(MvTarget g, MvTarget u, const int* ids, const i8* xq, const float* xd, int k, \
+                                   int n_ff, int in_div, QOut qo, float* out, int write_out) {                \
+        moe_matvec_glu<F, 1>(g, u, ids, xq, xd, k, n_ff, in_div, qo, out, write_out);                         \
     }                                                                                                         \
     extern "C" __global__ void moe_matvec_##NAME(MvTarget w, const int* ids, const i8* xq, const float* xd,   \
                                                  int k, int n, int in_div, float* out) {                      \
@@ -1039,7 +1057,12 @@ extern "C" __global__ void gather_q8_rows(const i8* __restrict__ xq, const float
     extern "C" __global__ void __launch_bounds__(1024)                                                        \
         moe_matvec_glu_grp_##NAME(MvTarget g, MvTarget u, const int* tiles, const i8* xg, const float* xdg, int k, \
                                   int n_ff, QOut qo, float* out, int write_out) {                             \
-        moe_matvec_glu_grp<F>(g, u, tiles, xg, xdg, k, n_ff, qo, out, write_out);                             \
+        moe_matvec_glu_grp<F, 0>(g, u, tiles, xg, xdg, k, n_ff, qo, out, write_out);                          \
+    }                                                                                                         \
+    extern "C" __global__ void __launch_bounds__(1024)                                                        \
+        moe_matvec_glu_grp_gelu_##NAME(MvTarget g, MvTarget u, const int* tiles, const i8* xg, const float* xdg, \
+                                       int k, int n_ff, QOut qo, float* out, int write_out) {                 \
+        moe_matvec_glu_grp<F, 1>(g, u, tiles, xg, xdg, k, n_ff, qo, out, write_out);                          \
     }                                                                                                         \
     extern "C" __global__ void moe_matvec_grp_##NAME(MvTarget w, const int* tiles, const i8* hq, const float* hd, int k, \
                                                      int n, float* out) {                                     \
@@ -3979,6 +4002,13 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
         mmq<F, true, 0, true>(qs, qh, sc, xq, xd, xs, out, nullptr, n, k, 0, qs_row, qh_row, sc_row, qs2, qh2, \
                               sc2, qo, write_out, tiles, rowmap);                                              \
     }                                                                                                          \
+    extern "C" __global__ void mmq_id_glu_gelu_##NAME(                                                         \
+        const u8* qs, const u8* qh, const u8* sc, const i8* xq, const float* xd, const float* xs, float* out,  \
+        int n, int k, long qs_row, long qh_row, long sc_row, const u8* qs2, const u8* qh2, const u8* sc2,      \
+        QOut qo, int write_out, const int* tiles, const int* rowmap) {                                         \
+        mmq<F, true, 1, true>(qs, qh, sc, xq, xd, xs, out, nullptr, n, k, 0, qs_row, qh_row, sc_row, qs2, qh2, \
+                              sc2, qo, write_out, tiles, rowmap);                                              \
+    }                                                                                                          \
     extern "C" __global__ void mmq_id32_##NAME(const u8* qs, const u8* qh, const u8* sc, const i8* xq,         \
                                                const float* xd, const float* xs, float* out, int n, int k,    \
                                                long qs_row, long qh_row, long sc_row, const int* tiles,       \
@@ -3991,6 +4021,13 @@ __device__ void mmq(const u8* __restrict__ qs, const u8* __restrict__ qh, const 
         int n, int k, long qs_row, long qh_row, long sc_row, const u8* qs2, const u8* qh2, const u8* sc2,      \
         QOut qo, int write_out, const int* tiles, const int* rowmap) {                                         \
         mmq<F, true, 0, true, 32>(qs, qh, sc, xq, xd, xs, out, nullptr, n, k, 0, qs_row, qh_row, sc_row, qs2,  \
+                                  qh2, sc2, qo, write_out, tiles, rowmap);                                     \
+    }                                                                                                          \
+    extern "C" __global__ void mmq_id32_glu_gelu_##NAME(                                                       \
+        const u8* qs, const u8* qh, const u8* sc, const i8* xq, const float* xd, const float* xs, float* out,  \
+        int n, int k, long qs_row, long qh_row, long sc_row, const u8* qs2, const u8* qh2, const u8* sc2,      \
+        QOut qo, int write_out, const int* tiles, const int* rowmap) {                                         \
+        mmq<F, true, 1, true, 32>(qs, qh, sc, xq, xd, xs, out, nullptr, n, k, 0, qs_row, qh_row, sc_row, qs2,  \
                                   qh2, sc2, qo, write_out, tiles, rowmap);                                     \
     }
 INSTANTIATE_MMQ(q8, FMT_Q8)
@@ -4011,6 +4048,10 @@ RLLM_STUB(mmq_id_glu_silu_q5) RLLM_STUB(mmq_id_glu_silu_iq4)
 RLLM_STUB(mmq_id32_q8) RLLM_STUB(mmq_id32_q4) RLLM_STUB(mmq_id32_q6) RLLM_STUB(mmq_id32_q5) RLLM_STUB(mmq_id32_iq4)
 RLLM_STUB(mmq_id32_glu_silu_q8) RLLM_STUB(mmq_id32_glu_silu_q4) RLLM_STUB(mmq_id32_glu_silu_q6)
 RLLM_STUB(mmq_id32_glu_silu_q5) RLLM_STUB(mmq_id32_glu_silu_iq4)
+RLLM_STUB(mmq_id_glu_gelu_q8) RLLM_STUB(mmq_id_glu_gelu_q4) RLLM_STUB(mmq_id_glu_gelu_q6)
+RLLM_STUB(mmq_id_glu_gelu_q5) RLLM_STUB(mmq_id_glu_gelu_iq4)
+RLLM_STUB(mmq_id32_glu_gelu_q8) RLLM_STUB(mmq_id32_glu_gelu_q4) RLLM_STUB(mmq_id32_glu_gelu_q6)
+RLLM_STUB(mmq_id32_glu_gelu_q5) RLLM_STUB(mmq_id32_glu_gelu_iq4)
 #endif
 
 // out[i] = part[0][i] + part[1][i] + ... in split order (see mmq's split-K).

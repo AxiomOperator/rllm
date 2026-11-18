@@ -16,13 +16,23 @@
 //! - Final logits are soft-capped: `cap * tanh(logits / cap)`.
 
 use anyhow::{Context, Result, bail};
-use rllm_core::{Activation, AttnMeta, Backend, HostTensor, KvLayout, KvType};
+use rllm_core::{Activation, AttnMeta, Backend, HostTensor, KvLayout, KvType, MoeFfn};
 use rllm_gguf::{Gguf, Value};
 
 use crate::loader::{
-    MAX_CONTEXT, MAX_DIM, check_same_as_head_dim, check_shape, check_shape_opt, host_tensor, load_weight, meta_usize, meta_usize_or,
+    MAX_CONTEXT, MAX_DIM, check_same_as_head_dim, check_shape, check_shape_opt, host_tensor, load_weight, load_weight_rows, meta_usize, meta_usize_or,
+    read_vector,
 };
 use crate::{Batch, Model, StepOut};
+
+/// Gemma 4's routed experts (each MoE layer also keeps its dense FFN).
+#[derive(Debug, Clone, Copy)]
+pub struct Gemma4Moe {
+    pub n_expert: usize,
+    pub n_used: usize,
+    /// Hidden width of one expert.
+    pub n_ff: usize,
+}
 
 #[derive(Debug, Clone)]
 pub struct Gemma4Config {
@@ -34,7 +44,11 @@ pub struct Gemma4Config {
     /// the KV-sharing layers of Gemma 4 E2B/E4B are twice as wide).
     pub ffn_layers: Vec<usize>,
     pub n_heads: usize,
-    pub n_kv_heads: usize,
+    /// KV heads of the sliding-window and the global layers (26B-A4B: 8 / 2).
+    pub n_kv_heads_swa: usize,
+    pub n_kv_heads_global: usize,
+    /// Mixture-of-experts layers (26B-A4B): the routed experts' shape.
+    pub moe: Option<Gemma4Moe>,
     pub head_dim_global: usize,
     pub head_dim_swa: usize,
     pub rope_theta_global: f32,
@@ -88,14 +102,39 @@ impl Gemma4Config {
         if ffn_layers.len() != n_layers {
             bail!("feed_forward_length has {} entries for {n_layers} layers", ffn_layers.len());
         }
-        for key in ["attention.head_count", "attention.head_count_kv"] {
-            if g.get(&k(key)).is_some_and(|v| v.as_array().is_some()) {
-                bail!("per-layer {key} not supported yet");
+        if g.get(&k("attention.head_count")).is_some_and(|v| v.as_array().is_some()) {
+            bail!("per-layer attention.head_count not supported yet");
+        }
+        // head_count_kv: one value, or one per layer that must agree within
+        // each kind of layer (26B-A4B: 8 sliding, 2 global).
+        let (n_kv_heads_swa, n_kv_heads_global) = match g.get(&k("attention.head_count_kv")).and_then(|v| v.as_array()) {
+            Some(a) => {
+                anyhow::ensure!(a.len() == n_layers, "head_count_kv has {} entries for {n_layers} layers", a.len());
+                let kind = |swa: bool| -> Result<usize> {
+                    let vals: Vec<u64> = a.iter().zip(&is_swa).filter(|(_, s)| **s == swa).filter_map(|(v, _)| v.as_u64()).collect();
+                    match vals.first() {
+                        Some(&v) if vals.iter().all(|&x| x == v) => Ok(v as usize),
+                        Some(_) => bail!("head_count_kv differs between {} layers", if swa { "sliding" } else { "global" }),
+                        None => Ok(1),
+                    }
+                };
+                (kind(true)?, kind(false)?)
             }
-        }
-        if g.tensor("blk.0.ffn_gate_inp.weight").is_some() {
-            bail!("Gemma 4 MoE variants not supported yet");
-        }
+            None => {
+                let v = u("attention.head_count_kv")?;
+                (v, v)
+            }
+        };
+        let moe = match g.get_u64(&k("expert_count")).ok().filter(|&n| n > 0) {
+            Some(n_expert) => {
+                let n_ff = match g.get(&k("expert_feed_forward_length")).and_then(|v| v.as_array()) {
+                    Some(a) => a.iter().filter_map(|v| v.as_u64()).find(|&v| v > 0).context("expert_feed_forward_length")? as usize,
+                    None => u("expert_feed_forward_length")?,
+                };
+                Some(Gemma4Moe { n_expert: n_expert as usize, n_used: u("expert_used_count")?, n_ff })
+            }
+            None => None,
+        };
         let embd = g.require_tensor("token_embd.weight")?;
         let [_, vocab] = embd.dims[..] else { bail!("token_embd.weight has shape {:?}, expected 2 dims", embd.dims) };
         let vocab = usize::try_from(vocab).ok().filter(|&v| (1..=MAX_DIM).contains(&v)).context("token_embd.weight: vocabulary size out of range")?;
@@ -119,7 +158,9 @@ impl Gemma4Config {
             ffn: ffn_layers.iter().copied().max().unwrap_or(0),
             ffn_layers,
             n_heads: u("attention.head_count")?,
-            n_kv_heads: u("attention.head_count_kv")?,
+            n_kv_heads_swa,
+            n_kv_heads_global,
+            moe,
             head_dim_global,
             head_dim_swa,
             rope_theta_global: f("rope.freq_base")?,
@@ -147,7 +188,8 @@ impl Gemma4Config {
             ("embedding_length", c.hidden),
             ("feed_forward_length", c.ffn),
             ("head_count", c.n_heads),
-            ("head_count_kv", c.n_kv_heads),
+            ("head_count_kv", c.n_kv_heads_swa),
+            ("head_count_kv (global)", c.n_kv_heads_global),
             ("key_length", c.head_dim_global),
             ("key_length_swa", c.head_dim_swa),
             ("sliding_window", c.sliding_window),
@@ -156,12 +198,13 @@ impl Gemma4Config {
         ] {
             anyhow::ensure!(v > 0, "{what} must be positive");
         }
-        anyhow::ensure!(
-            c.n_heads.is_multiple_of(c.n_kv_heads),
-            "head_count {} is not a multiple of head_count_kv {}",
-            c.n_heads,
-            c.n_kv_heads
-        );
+        for kv in [c.n_kv_heads_swa, c.n_kv_heads_global] {
+            anyhow::ensure!(c.n_heads.is_multiple_of(kv), "head_count {} is not a multiple of head_count_kv {kv}", c.n_heads);
+        }
+        if let Some(m) = c.moe {
+            anyhow::ensure!(m.n_expert <= 1024 && (1..=m.n_expert.min(32)).contains(&m.n_used) && m.n_ff > 0, "invalid experts: {} (top {}) of {}", m.n_expert, m.n_used, m.n_ff);
+            anyhow::ensure!(c.per_layer_dim == 0, "Gemma 4 with both experts and per-layer embeddings isn't supported");
+        }
         anyhow::ensure!(
             c.head_dim_global.is_multiple_of(2) && c.head_dim_swa.is_multiple_of(2),
             "head sizes {}/{} must be even (RoPE rotates pairs)",
@@ -198,7 +241,7 @@ impl Gemma4Config {
         for i in 0..c.n_layers {
             let p = |s: &str| format!("blk.{i}.{s}.weight");
             let hd = c.head_dim(i);
-            let (qw, kvw) = (c.n_heads * hd, c.n_kv_heads * hd);
+            let (qw, kvw) = (c.n_heads * hd, c.kv_heads(i) * hd);
             let f = c.ffn_layers[i];
             for (name, dims) in [
                 ("attn_norm", &[d][..]),
@@ -225,8 +268,29 @@ impl Gemma4Config {
                 check_shape(g, &p("post_norm"), &[d])?;
             }
             check_shape_opt(g, &p("layer_output_scale"), &[1])?;
+            if let (Some(m), true) = (c.moe, g.tensor(&p("ffn_gate_inp")).is_some()) {
+                let (e, f) = (m.n_expert, m.n_ff);
+                check_shape(g, &p("ffn_gate_inp"), &[d, e])?;
+                check_shape(g, &format!("blk.{i}.ffn_gate_inp.scale"), &[d])?;
+                check_shape(g, &format!("blk.{i}.ffn_down_exps.scale"), &[e])?;
+                for n in ["pre_ffw_norm_2", "post_ffw_norm_1", "post_ffw_norm_2"] {
+                    check_shape(g, &p(n), &[d])?;
+                }
+                if g.tensor(&p("ffn_gate_up_exps")).is_some() {
+                    check_shape(g, &p("ffn_gate_up_exps"), &[d, 2 * f, e])?;
+                } else {
+                    check_shape(g, &p("ffn_gate_exps"), &[d, f, e])?;
+                    check_shape(g, &p("ffn_up_exps"), &[d, f, e])?;
+                }
+                check_shape(g, &p("ffn_down_exps"), &[f, d, e])?;
+            }
         }
         Ok(())
+    }
+
+    /// KV heads of `layer` (sliding-window and global layers may differ).
+    fn kv_heads(&self, layer: usize) -> usize {
+        if self.is_swa[layer] { self.n_kv_heads_swa } else { self.n_kv_heads_global }
     }
 
     /// Layers with their own sliding-window and global KV cache.
@@ -273,6 +337,23 @@ struct Layer<B: Backend> {
     ple_proj: Option<B::Weight>,
     ple_post_norm: Option<B::Weight>,
     out_scale: f32,
+    /// Routed experts (MoE layers), beside the dense FFN.
+    moe: Option<MoeLayer<B>>,
+}
+
+struct MoeLayer<B: Backend> {
+    /// Router `[n_expert, hidden]`, on rms_norm(x) * `router_norm`.
+    router: B::Weight,
+    /// The router input's per-channel scale / sqrt(hidden).
+    router_norm: B::Weight,
+    pre_norm: B::Weight,
+    post_norm_dense: B::Weight,
+    post_norm_moe: B::Weight,
+    gate: B::Weight,
+    up: B::Weight,
+    down: B::Weight,
+    /// Per-expert output scale `[n_expert]`.
+    expert_scale: B::Weight,
 }
 
 struct PerLayerEmbed<B: Backend> {
@@ -323,8 +404,8 @@ impl<B: Backend> Gemma4<B> {
     /// sizes differ). Both use the same block ids.
     fn kv_layouts(&self, n_blocks: usize, block_size: usize, kv: KvType) -> [KvLayout; 2] {
         let c = &self.cfg;
-        let layout = |n_layers, head_dim| KvLayout { n_layers, n_blocks, block_size, n_kv_heads: c.n_kv_heads, head_dim, dtype: kv };
-        [layout(self.n_swa_kv.max(1), c.head_dim_swa), layout(self.n_global_kv.max(1), c.head_dim_global)]
+        let layout = |n_layers, n_kv_heads, head_dim| KvLayout { n_layers, n_blocks, block_size, n_kv_heads, head_dim, dtype: kv };
+        [layout(self.n_swa_kv.max(1), c.n_kv_heads_swa, c.head_dim_swa), layout(self.n_global_kv.max(1), c.n_kv_heads_global, c.head_dim_global)]
     }
 
     pub fn load(backend: &B, g: &Gguf) -> Result<Self> {
@@ -358,6 +439,35 @@ impl<B: Backend> Gemma4<B> {
                 ple_proj: if has_ple { Some(w(&p("proj"))?) } else { None },
                 ple_post_norm: if has_ple { Some(w(&p("post_norm"))?) } else { None },
                 out_scale: scalar_f32(g, &p("layer_output_scale"))?.unwrap_or(1.0),
+                moe: match cfg.moe.filter(|_| g.tensor(&p("ffn_gate_inp")).is_some()) {
+                    None => None,
+                    Some(m) => {
+                        let (gate, up) = if g.tensor(&p("ffn_gate_up_exps")).is_some() {
+                            // Per expert: n_ff gate rows, then n_ff up rows.
+                            let f = m.n_ff;
+                            let rows = |off: usize| -> Vec<usize> { (0..m.n_expert).flat_map(|e| (0..f).map(move |r| e * 2 * f + off + r)).collect() };
+                            let name = p("ffn_gate_up_exps");
+                            (load_weight_rows(backend, g, &name, &rows(0))?, load_weight_rows(backend, g, &name, &rows(f))?)
+                        } else {
+                            (w(&p("ffn_gate_exps"))?, w(&p("ffn_up_exps"))?)
+                        };
+                        let vector = |name: &str, scale: f32| -> Result<B::Weight> {
+                            let v: Vec<f32> = read_vector(g, name)?.iter().map(|x| x * scale).collect();
+                            backend.upload(&HostTensor::from_f32(name, vec![v.len()], &v)).with_context(|| format!("uploading {name}"))
+                        };
+                        Some(MoeLayer {
+                            router: w(&p("ffn_gate_inp"))?,
+                            router_norm: vector(&format!("blk.{i}.ffn_gate_inp.scale"), 1.0 / (cfg.hidden as f32).sqrt())?,
+                            pre_norm: w(&p("pre_ffw_norm_2"))?,
+                            post_norm_dense: w(&p("post_ffw_norm_1"))?,
+                            post_norm_moe: w(&p("post_ffw_norm_2"))?,
+                            gate,
+                            up,
+                            down: w(&p("ffn_down_exps"))?,
+                            expert_scale: vector(&format!("blk.{i}.ffn_down_exps.scale"), 1.0)?,
+                        })
+                    }
+                },
             });
         }
 
@@ -412,7 +522,7 @@ impl<B: Backend> Gemma4<B> {
         let d = c.hidden;
         b.begin_step(batch.graph_key(self as *const Self as usize))?;
         let hd_max = c.head_dim_global.max(c.head_dim_swa);
-        let (qw_max, kvw_max) = (c.n_heads * hd_max, c.n_kv_heads * hd_max);
+        let (qw_max, kvw_max) = (c.n_heads * hd_max, c.n_kv_heads_swa.max(c.n_kv_heads_global) * hd_max);
         let (n_l, p_dim) = (c.n_layers, c.per_layer_dim);
 
         let mut x = b.alloc(n * d)?;
@@ -453,9 +563,14 @@ impl<B: Backend> Gemma4<B> {
         let mut xn = if p_dim > 0 { Some(b.alloc(n * d)?) } else { None };
         let mut ple_slice = b.alloc(n * p_dim.max(1))?;
 
+        // MoE layers' scratch: dense branch, expert input and output, logits.
+        let mut moe_bufs = match c.moe {
+            Some(m) => Some((b.alloc(n * d)?, b.alloc(n * d)?, b.alloc(n * d)?, b.alloc(n * m.n_expert)?)),
+            None => None,
+        };
         let meta = |swa: bool| AttnMeta {
             n_heads: c.n_heads,
-            n_kv_heads: c.n_kv_heads,
+            n_kv_heads: if swa { c.n_kv_heads_swa } else { c.n_kv_heads_global },
             head_dim: if swa { c.head_dim_swa } else { c.head_dim_global },
             scale: 1.0,
             window: if swa { c.sliding_window } else { 0 },
@@ -487,7 +602,7 @@ impl<B: Backend> Gemma4<B> {
                 let kv = if swa { &mut cache.swa } else { &mut cache.global };
                 b.qkv_norm_rope_store(
                     &q, &k, &v, Some((&l.q_norm, k_norm)), Some(ones), &mut qn, kv, idx, batch.positions, batch.slots,
-                    c.n_heads, c.n_kv_heads, hd, c.rms_eps, theta, factors,
+                    c.n_heads, c.kv_heads(li), hd, c.rms_eps, theta, factors,
                 )?;
             } else {
                 b.matmul(&h, &l.wq, &mut q, n)?;
@@ -508,6 +623,30 @@ impl<B: Backend> Gemma4<B> {
             } else {
                 b.rms_norm_add(&h, &l.post_attn_norm, &mut x, n, d, c.rms_eps, 1.0, Some((&l.ffn_norm, &mut q, &[&l.gate, &l.up])))?;
                 b.gated_ffn(&q, &l.gate, &l.up, &l.down, Activation::GeluTanh, &mut attn, &mut gate, &mut up, n, c.ffn_layers[li])?;
+            }
+            // MoE layers: attn (the dense branch) becomes
+            //   post_norm_1(dense) + post_norm_2(experts(pre_norm_2(x)))
+            // routed on rms_norm(x) * scale / sqrt(d).
+            if let (Some(ml), Some(m), Some((dense, ein, eout, logits))) = (&l.moe, c.moe, moe_bufs.as_mut()) {
+                b.rms_norm(&attn, &ml.post_norm_dense, dense, n, c.rms_eps)?;
+                b.rms_norm(&x, &ml.pre_norm, ein, n, c.rms_eps)?;
+                b.rms_norm(&x, &ml.router_norm, eout, n, c.rms_eps)?;
+                b.matmul(eout, &ml.router, logits, n)?;
+                let moe = MoeFfn {
+                    gate: &ml.gate,
+                    up: &ml.up,
+                    down: &ml.down,
+                    n_expert: m.n_expert,
+                    n_used: m.n_used,
+                    n_ff: m.n_ff,
+                    norm_topk: true,
+                    scale: 1.0,
+                    act: Activation::GeluTanh,
+                    expert_scale: Some(&ml.expert_scale),
+                };
+                b.moe_ffn(ein, logits, &moe, None, eout, n)?;
+                b.rms_norm(eout, &ml.post_norm_moe, &mut attn, n, c.rms_eps)?;
+                b.add(&mut attn, dense, n * d)?;
             }
 
             // Per-layer embedding branch:
@@ -596,17 +735,19 @@ impl<B: Backend> Model<B> for Gemma4<B> {
     fn summary(&self) -> String {
         let c = &self.cfg;
         format!(
-            "gemma4: {} layers ({} sliding / {} global, KV shared after layer {}), hidden {}, {} heads / {} kv, head {}/{}, PLE {}",
+            "gemma4: {} layers ({} sliding / {} global, KV shared after layer {}), hidden {}, {} heads / {} kv ({} global), head {}/{}, PLE {}{}",
             c.n_layers,
             c.is_swa.iter().filter(|s| **s).count(),
             c.is_swa.iter().filter(|s| !**s).count(),
             c.n_kv_layers - 1,
             c.hidden,
             c.n_heads,
-            c.n_kv_heads,
+            c.n_kv_heads_swa,
+            c.n_kv_heads_global,
             c.head_dim_swa,
             c.head_dim_global,
             c.per_layer_dim,
+            c.moe.map_or(String::new(), |m| format!(", {} experts (top {}) of {}", m.n_expert, m.n_used, m.n_ff)),
         )
     }
 }

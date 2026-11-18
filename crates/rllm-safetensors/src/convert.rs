@@ -831,6 +831,26 @@ fn permute_qk(bytes: &[u8], rows: usize, row_bytes: usize, heads: usize) -> Vec<
     out
 }
 
+/// The `tokenizer.ggml.pre` of a byte-level BPE tokenizer.json, from its
+/// pre-tokenizer regex (llama.cpp hashes the tokenizer's output instead; the
+/// regex names the same split and fails loudly on unknown ones).
+fn bpe_pre(tj: &Json) -> Result<&'static str> {
+    const LLAMA3: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+    const TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+    let pt = tj.get("pre_tokenizer").cloned().unwrap_or(Json::Null);
+    let steps = match pt.get("type").and_then(Json::as_str) {
+        Some("Sequence") => pt.get("pretokenizers").and_then(Json::as_array).cloned().unwrap_or_default(),
+        _ => vec![pt],
+    };
+    let regex = steps.iter().find_map(|p| p.get("pattern")?.get("Regex")?.as_str().map(str::to_owned));
+    match regex.as_deref() {
+        Some(LLAMA3) => Ok("llama-bpe"),
+        Some(TEKKEN) => Ok("tekken"),
+        Some(other) => Err(bad(format!("tokenizer.json: unknown pre-tokenizer regex {other:?}"))),
+        None => Err(bad("tokenizer.json: no pre-tokenizer regex")),
+    }
+}
+
 /// Llama 3 (`llama`): Q/K permuted as llama.cpp does; Llama 3.1+ RoPE
 /// scaling as a generated `rope_freqs` tensor.
 fn llama(c: Checkpoint, cfg: &serde_json::Map<String, Json>) -> Result<Gguf> {
@@ -894,7 +914,13 @@ fn llama(c: Checkpoint, cfg: &serde_json::Map<String, Json>) -> Result<Gguf> {
         // Llama 2, Mistral 7B, TinyLlama: SentencePiece, as llama.cpp prefers.
         spm_tokenizer(&c, cfg, vocab, &mut meta)?;
     } else {
-        tokenizer(&c, cfg, vocab, "llama-bpe", &mut meta)?;
+        // Byte-level BPE: Llama 3's, or Mistral's Tekken (Nemo, Small 3).
+        let tj = c.json("tokenizer.json")?.ok_or_else(|| bad("no tokenizer.json"))?;
+        tokenizer(&c, cfg, vocab, bpe_pre(&tj)?, &mut meta)?;
+        // As llama.cpp's LlamaModel.set_vocab, for any tokenizer.
+        if let Some(p) = c.json("tokenizer_config.json")?.and_then(|t| t.get("add_prefix_space").and_then(Json::as_bool)) {
+            meta.push(("tokenizer.ggml.add_space_prefix".into(), Value::Bool(p)));
+        }
     }
     let tied = cfg.get("tie_word_embeddings").and_then(Json::as_bool).unwrap_or(false);
     b.plan((0..n_layers as usize).collect(), n_layers as usize, tied);
@@ -947,9 +973,6 @@ fn llama(c: Checkpoint, cfg: &serde_json::Map<String, Json>) -> Result<Gguf> {
 /// (no +1, unlike Gemma 1–3), `rope_freqs` generated for the global layers'
 /// partial rotary, a SentencePiece-style BPE vocabulary.
 fn gemma4(c: Checkpoint, cfg: &serde_json::Map<String, Json>) -> Result<Gguf> {
-    if cfg.get("enable_moe_block").and_then(Json::as_bool).unwrap_or(false) || int(cfg, &["num_experts"]).is_some_and(|n| n > 0) {
-        return Err(bad("Gemma 4 MoE checkpoints aren't supported yet"));
-    }
     let k = |s: &str| format!("gemma4.{s}");
     let need = |keys: &[&str]| int(cfg, keys).ok_or_else(|| bad(format!("config.json: no {}", keys[0])));
     let n_layers = need(&["num_hidden_layers"])? as usize;
@@ -1010,6 +1033,16 @@ fn gemma4(c: Checkpoint, cfg: &serde_json::Map<String, Json>) -> Result<Gguf> {
     if let Some(cap) = float(cfg, &["final_logit_softcapping"]).filter(|&v| v != 0.0) {
         meta.push((k("final_logit_softcapping"), Value::F32(cap as f32)));
     }
+    // 26B-A4B: routed experts beside each layer's dense FFN.
+    if let Some(n) = int(cfg, &["num_local_experts", "num_experts", "n_routed_experts"]) {
+        meta.push((k("expert_count"), Value::U32(n as u32)));
+    }
+    if let Some(n) = int(cfg, &["num_experts_per_tok", "num_experts_per_token", "top_k_experts"]) {
+        meta.push((k("expert_used_count"), Value::U32(n as u32)));
+    }
+    if let Some(n) = int(cfg, &["expert_intermediate_size", "moe_intermediate_size"]) {
+        meta.push((k("expert_feed_forward_length"), Value::U32(n as u32)));
+    }
     gemma4_tokenizer(&c, cfg, &mut meta)?;
 
     let tied = cfg.get("tie_word_embeddings").and_then(Json::as_bool).unwrap_or(true);
@@ -1054,12 +1087,21 @@ fn gemma4(c: Checkpoint, cfg: &serde_json::Map<String, Json>) -> Result<Gguf> {
                     "per_layer_projection.weight" => "proj.weight",
                     "post_per_layer_input_norm.weight" => "post_norm.weight",
                     "layer_scalar" => "layer_output_scale.weight",
+                    // MoE (26B-A4B); the fused gate_up stays fused.
+                    "router.proj.weight" => "ffn_gate_inp.weight",
+                    "router.scale" => "ffn_gate_inp.scale",
+                    "router.per_expert_scale" => "ffn_down_exps.scale",
+                    "experts.gate_up_proj" | "experts.gate_up_proj.weight" => "ffn_gate_up_exps.weight",
+                    "experts.down_proj" | "experts.down_proj.weight" => "ffn_down_exps.weight",
+                    "pre_feedforward_layernorm_2.weight" => "pre_ffw_norm_2.weight",
+                    "post_feedforward_layernorm_1.weight" => "post_ffw_norm_1.weight",
+                    "post_feedforward_layernorm_2.weight" => "post_ffw_norm_2.weight",
                     _ => return Err(bad(format!("unexpected tensor {:?} for Gemma 4", t.name))),
                 };
                 format!("blk.{n}.{g}")
             }
         };
-        if t.shape.len() <= 1 || gguf.ends_with("norm.weight") {
+        if t.shape.len() <= 1 || gguf.ends_with("norm.weight") || gguf.ends_with(".scale") {
             b.f32(&gguf, t, c.data(t))?;
         } else {
             b.view(&gguf, t, c.data(t))?;

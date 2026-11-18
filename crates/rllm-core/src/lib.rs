@@ -250,6 +250,11 @@ pub struct MoeFfn<'a, W> {
     pub norm_topk: bool,
     /// Multiplier on the expert weights (1 = none).
     pub scale: f32,
+    /// The experts' gated activation (Qwen: SiLU, Gemma 4: GELU).
+    pub act: Activation,
+    /// Per-expert output scale (`[n_expert]`, F32), multiplied into each
+    /// chosen expert's weight after routing (Gemma 4's `ffn_down_exps.scale`).
+    pub expert_scale: Option<&'a W>,
 }
 
 /// Top-`k` expert selection for one token: softmax over `logits`, the `k`

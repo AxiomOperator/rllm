@@ -24,7 +24,7 @@ mod decision;
 mod embeddings;
 mod engine;
 
-pub use engine::{DRAFT_MAX_CONTEXT, draft_pool_tokens};
+pub use engine::{DRAFT_MAX_CONTEXT, SPEC_STEP_TOKENS, draft_pool_tokens};
 mod error;
 mod extras;
 mod generation;
@@ -107,6 +107,8 @@ pub struct ServeConfig {
     pub quantize: Option<rllm_core::DType>,
     /// Batch-invariant mode: decode steps per prompt chunk while both wait.
     pub decode_per_prefill: usize,
+    /// Most tokens in a step that verifies drafts (outside batch-invariant mode).
+    pub spec_step_tokens: usize,
     /// Seconds a generation may run, from submission, before it is ended
     /// with finish reason `length` (0: no limit).
     pub request_timeout_secs: u64,
@@ -169,6 +171,7 @@ where
         host_cache_bytes: if cfg.prefix_cache && !batch_invariant { cfg.host_cache_bytes } else { 0 },
         // A decision model only embeds (no prefix cache): no checkpoints.
         decode_per_prefill: cfg.decode_per_prefill.max(1),
+        spec_step_tokens: cfg.spec_step_tokens.clamp(1, 64),
         state_checkpoints: if decision.is_some() { 0 } else { cfg.state_checkpoints.unwrap_or(parallel) },
         host_sampling: cfg.host_sampling,
         max_queue: cfg.max_queue,
